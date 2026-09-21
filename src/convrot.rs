@@ -329,9 +329,7 @@ impl ConvRotLinear {
         let m: usize = dims[..dims.len() - 1].iter().product();
         let x2 = x.reshape((m, k))?;
         let xr = crate::model::rotation::rotate(&x2, &self.hadamard)?; // (M,K) bf16
-        // Fused amax + int8 quantize in one kernel pass (was abs + max_keepdim +
-        // recip + QuantizeRows).
-        let (x_i8, row_scale) = quantize_rows_fused(&xr)?; // (M,K) u8 + (M,) f32
+        let (x_i8, row_scale) = quantize_rows_fused(&xr)?; // fused amax+quantize
         let c = int8_gemm(&x_i8, &self.w_i8)?; // (M,N) i32
         let n = self.col_scale.dim(0)?;
         let out = c.apply_op3(&row_scale, &self.col_scale, Dequant)?; // (M,N) bf16
