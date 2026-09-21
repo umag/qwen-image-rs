@@ -72,6 +72,13 @@ enum Command {
         /// (~tile²) so it fits alongside co-resident models. Try 32.
         #[arg(long, default_value_t = 0)]
         vae_tile: usize,
+        /// True-CFG guidance scale. 1.0 = single forward (fast); >1 runs the DiT
+        /// twice per step (cond + negative) for stronger prompt adherence.
+        #[arg(long, default_value_t = 1.0)]
+        guidance: f32,
+        /// Negative prompt for CFG (used only when --guidance > 1).
+        #[arg(long, default_value = "")]
+        negative: String,
         #[arg(long)]
         out: std::path::PathBuf,
     },
@@ -107,6 +114,12 @@ enum Command {
         /// VAE tiled decode: latent tile size (0 = off). Try 32 for resident.
         #[arg(long, default_value_t = 0)]
         vae_tile: usize,
+        /// True-CFG guidance scale (1.0 = single forward; >1 = two forwards/step).
+        #[arg(long, default_value_t = 1.0)]
+        guidance: f32,
+        /// Negative prompt for CFG (used only when --guidance > 1).
+        #[arg(long, default_value = "")]
+        negative: String,
         /// Output directory (writes 000.png, 001.png, ...).
         #[arg(long)]
         out_dir: std::path::PathBuf,
@@ -231,10 +244,12 @@ fn main() -> Result<()> {
             resident,
             text_gguf,
             vae_tile,
+            guidance,
+            negative,
             out_dir,
         } => batch(
             &model, &prompts, size, steps, seed, quant, convrot, quant_text, resident,
-            text_gguf.as_deref(), vae_tile, &out_dir,
+            text_gguf.as_deref(), vae_tile, guidance, &negative, &out_dir,
         ),
         Command::Info { weights } => info(&weights),
         Command::Generate {
@@ -248,10 +263,12 @@ fn main() -> Result<()> {
             quant_text,
             text_gguf,
             vae_tile,
+            guidance,
+            negative,
             out,
         } => generate(
             &model, &prompt, size, steps, seed, quant, convrot, quant_text,
-            text_gguf.as_deref(), vae_tile, &out,
+            text_gguf.as_deref(), vae_tile, guidance, &negative, &out,
         ),
         Command::PrequantizeText { weights, out } => prequantize_text(&weights, &out),
         Command::PrequantizeConvrot { weights, out } => prequantize_convrot(&weights, &out),
@@ -284,6 +301,36 @@ fn main() -> Result<()> {
             out,
         } => denoise(&weights, &noise, &embeds, steps, quant, convrot, &out),
     }
+}
+
+/// Guided noise prediction. Runs the DiT on the conditional prompt; when
+/// `guidance > 1` and a negative embedding is present, also runs it on the
+/// negative and combines `v = v_uncond + guidance·(v_cond − v_uncond)` (true
+/// CFG — ~2× the DiT cost). Returns the f32 noise prediction over the image
+/// tokens. `guidance ≤ 1` keeps the single-forward fast path.
+#[allow(clippy::too_many_arguments)]
+fn guided_noise_pred(
+    dit: &qwen_image_rs::model::dit::QwenImageDit,
+    latents_dt: &Tensor,
+    cond: &Tensor,
+    neg: Option<&Tensor>,
+    guidance: f32,
+    tt: &Tensor,
+    hw: usize,
+    img_seq: usize,
+) -> Result<Tensor> {
+    let joint = dit.forward(latents_dt, cond, tt, hw, hw)?;
+    let (_b, jl, _) = joint.dims3()?;
+    let v_cond = joint.narrow(1, jl - img_seq, img_seq)?.to_dtype(DType::F32)?;
+    if guidance > 1.0 {
+        if let Some(neg) = neg {
+            let ju = dit.forward(latents_dt, neg, tt, hw, hw)?;
+            let (_b, jlu, _) = ju.dims3()?;
+            let v_uncond = ju.narrow(1, jlu - img_seq, img_seq)?.to_dtype(DType::F32)?;
+            return Ok((&v_uncond + ((&v_cond - &v_uncond)? * guidance as f64)?)?);
+        }
+    }
+    Ok(v_cond)
 }
 
 /// Load the text encoder, preferring a pre-quantized GGUF (`--text-gguf`) which
@@ -322,6 +369,8 @@ fn generate(
     quant_text: bool,
     text_gguf: Option<&std::path::Path>,
     vae_tile: usize,
+    guidance: f32,
+    negative: &str,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -344,28 +393,35 @@ fn generate(
     // Tokenize the t2i chat template; drop = system-prefix token count.
     let tok = Tokenizer::from_file(model.join("processor/tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
-    let ids: Vec<u32> = tok
-        .encode(tmpl::t2i_template(prompt), false)
-        .map_err(|e| anyhow::anyhow!("encode: {e}"))?
-        .get_ids()
-        .to_vec();
     let sysp = format!("<|im_start|>system\n{}<|im_end|>\n", tmpl::SYS_PROMPT);
     let drop = tok
         .encode(sysp, false)
         .map_err(|e| anyhow::anyhow!("encode sys: {e}"))?
         .get_ids()
         .len();
-    let seq = ids.len();
-    tracing::info!(seq, drop, "tokenized");
 
-    // 1. Text encoder -> prompt embeddings (freed after).
-    let embeds = {
+    // 1. Text encoder -> prompt embeddings (+ negative, for CFG). Freed after.
+    let (embeds, neg_embeds) = {
         let te = load_text_encoder(model, &dev, dtype, quant_text, text_gguf.as_deref())?;
-        let ids_t = Tensor::from_vec(ids, (1, seq), &dev)?;
-        let hidden = te.forward(&ids_t)?;
-        hidden.narrow(1, drop, seq - drop)?.contiguous()?
+        let encode = |p: &str| -> Result<Tensor> {
+            let ids: Vec<u32> = tok
+                .encode(tmpl::t2i_template(p), false)
+                .map_err(|e| anyhow::anyhow!("encode: {e}"))?
+                .get_ids()
+                .to_vec();
+            let seq = ids.len();
+            let hidden = te.forward(&Tensor::from_vec(ids, (1, seq), &dev)?)?;
+            Ok(hidden.narrow(1, drop, seq - drop)?.contiguous()?)
+        };
+        let cond = encode(prompt)?;
+        let neg = if guidance > 1.0 {
+            Some(encode(negative)?)
+        } else {
+            None
+        };
+        (cond, neg)
     };
-    tracing::info!(shape = ?embeds.dims(), "prompt embeddings");
+    tracing::info!(shape = ?embeds.dims(), guidance, "prompt embeddings");
 
     // 2. DiT + flow-match denoise -> final latent (freed after).
     let hw = size / 16; // vae spatial compression
@@ -378,11 +434,16 @@ fn generate(
         let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
         for (i, t) in sched.timesteps().iter().enumerate() {
             let tt = Tensor::from_vec(vec![(*t / 1000.0) as f32], (1,), &dev)?;
-            let joint = dit.forward(&latents.to_dtype(dtype)?, &embeds, &tt, hw, hw)?;
-            let (_b, jl, _) = joint.dims3()?;
-            let np = joint
-                .narrow(1, jl - img_seq, img_seq)?
-                .to_dtype(DType::F32)?;
+            let np = guided_noise_pred(
+                &dit,
+                &latents.to_dtype(dtype)?,
+                &embeds,
+                neg_embeds.as_ref(),
+                guidance,
+                &tt,
+                hw,
+                img_seq,
+            )?;
             latents = (latents + (np * sched.dt(i))?)?;
             if i % 10 == 0 || i + 1 == steps {
                 tracing::info!(step = i, "denoising");
@@ -435,6 +496,8 @@ fn batch(
     resident: bool,
     text_gguf: Option<&std::path::Path>,
     vae_tile: usize,
+    guidance: f32,
+    negative: &str,
     out_dir: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -504,6 +567,22 @@ fn batch(
             load_vb(model.join("vae"), DType::F32)?,
         )?;
         let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
+        // Negative embedding (encoded once; shared by every prompt) for CFG.
+        let neg_embeds = if guidance > 1.0 {
+            let ids: Vec<u32> = tok
+                .encode(tmpl::t2i_template(negative), false)
+                .map_err(|e| anyhow::anyhow!("encode neg: {e}"))?
+                .get_ids()
+                .to_vec();
+            let seq = ids.len();
+            Some(
+                te.forward(&Tensor::from_vec(ids, (1, seq), &dev)?)?
+                    .narrow(1, drop, seq - drop)?
+                    .contiguous()?,
+            )
+        } else {
+            None
+        };
         tracing::info!("resident: all three models loaded, streaming prompts");
         for (i, p) in prompts.iter().enumerate() {
             let t_enc = std::time::Instant::now();
@@ -525,9 +604,16 @@ fn batch(
                 Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?.to_dtype(DType::F32)?;
             for (si, t) in sched.timesteps().iter().enumerate() {
                 let tt = Tensor::from_vec(vec![(*t / 1000.0) as f32], (1,), &dev)?;
-                let joint = dit.forward(&latents.to_dtype(dtype)?, &emb, &tt, hw, hw)?;
-                let (_b, jl, _) = joint.dims3()?;
-                let np = joint.narrow(1, jl - img_seq, img_seq)?.to_dtype(DType::F32)?;
+                let np = guided_noise_pred(
+                    &dit,
+                    &latents.to_dtype(dtype)?,
+                    &emb,
+                    neg_embeds.as_ref(),
+                    guidance,
+                    &tt,
+                    hw,
+                    img_seq,
+                )?;
                 latents = (latents + (np * sched.dt(si))?)?;
             }
             dev.synchronize()?;
@@ -552,11 +638,13 @@ fn batch(
         return Ok(());
     }
 
-    // Phase 1: encode every prompt (text encoder loaded once, then freed).
+    // Phase 1: encode every prompt (+ the shared negative). Text encoder loaded
+    // once, then freed.
     let mut embeds_list = Vec::with_capacity(prompts.len());
+    let mut neg_embeds = None;
     {
         let te = load_text_encoder(model, &dev, dtype, quant_text, text_gguf.as_deref())?;
-        for p in &prompts {
+        let encode = |p: &str| -> Result<Tensor> {
             let ids: Vec<u32> = tok
                 .encode(tmpl::t2i_template(p), false)
                 .map_err(|e| anyhow::anyhow!("encode: {e}"))?
@@ -564,7 +652,13 @@ fn batch(
                 .to_vec();
             let seq = ids.len();
             let hidden = te.forward(&Tensor::from_vec(ids, (1, seq), &dev)?)?;
-            embeds_list.push(hidden.narrow(1, drop, seq - drop)?.contiguous()?);
+            Ok(hidden.narrow(1, drop, seq - drop)?.contiguous()?)
+        };
+        for p in &prompts {
+            embeds_list.push(encode(p)?);
+        }
+        if guidance > 1.0 {
+            neg_embeds = Some(encode(negative)?);
         }
     }
     tracing::info!("encoded {} prompts", embeds_list.len());
@@ -580,11 +674,16 @@ fn batch(
                 Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?.to_dtype(DType::F32)?;
             for (si, t) in sched.timesteps().iter().enumerate() {
                 let tt = Tensor::from_vec(vec![(*t / 1000.0) as f32], (1,), &dev)?;
-                let joint = dit.forward(&latents.to_dtype(dtype)?, emb, &tt, hw, hw)?;
-                let (_b, jl, _) = joint.dims3()?;
-                let np = joint
-                    .narrow(1, jl - img_seq, img_seq)?
-                    .to_dtype(DType::F32)?;
+                let np = guided_noise_pred(
+                    &dit,
+                    &latents.to_dtype(dtype)?,
+                    emb,
+                    neg_embeds.as_ref(),
+                    guidance,
+                    &tt,
+                    hw,
+                    img_seq,
+                )?;
                 latents = (latents + (np * sched.dt(si))?)?;
             }
             latents_list.push(latents);
