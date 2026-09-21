@@ -20,13 +20,69 @@ reference. ~36 commits. This doc = pick-up point for a fresh session.
 - **CUTLASS:** fresh clone at `~/dev_tmp/cutlass` (host). The flash-attn-vendored
   checkout has a `matrix.h` bug CUDA 13.3 rejects — DO NOT use it. `CUTLASS_DIR=~/dev_tmp/cutlass/include`.
 
-## Status: DONE + validated
-Pipeline works end-to-end: `generate --model <snapshot> --prompt "..." --out x.png`
-(~48 s/image, 1024², 40 steps). Components vs oracle: VAE 51–53 dB · text encoder
-cos 0.9993 · DiT cos 0.99996 · full image PSNR 30.85 dB.
+## Status: DONE + heavily optimized (all accuracy-neutral vs oracle)
+End-to-end works: `generate --model <snapshot> --prompt "..." --out x.png`.
+**Recommended fast build: `--features convrot,sage,fusednorm`** (bf16 VAE is the
+CUDA default; `--convrot --text-gguf <gguf> --vae-tile 32`). Oracle parity held
+at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 dB.
 
-CLI verbs (all in `src/main.rs`): `generate`, `batch`, `denoise`, `dit-forward`,
-`text-encode`, `vae-decode`, `smoke`, `bench`, `convrot-test`.
+### Speed today (1024², RTX 4090, measured 2026-09-21)
+- **Denoise: 0.27 s/step** (was bf16+flash 0.62) — **~2.3×**. VAE tiled bf16
+  decode **1.15 s** (was f32 1.84).
+- **Single `generate` (loads all 3 models each run): ~25.8 s** (40 steps); the
+  ~14 s beyond compute is one-time model load (8 GB text GGUF mmap + DiT + VAE).
+- **`batch --resident` (models loaded once): ~12 s/image @40 steps, ~7.8 s/image
+  @25 steps** (enc ~25 ms + denoise 25×0.264 s + tiled decode ~1.15 s). Steady,
+  no VRAM drift — a serve loop yields a new image every ~8 s.
+
+### The optimization scoreboard (all via issue-lifecycle, all oracle-neutral)
+| lever | feature | denoise s/step |
+|---|---|---|
+| bf16 + FlashAttention-2 (start) | flash-attn | 0.62 |
+| ConvRot W8A8 INT8 linears | convrot | 0.51 |
+| SageAttention INT8-QK/FP16-PV | sage | 0.48 |
+| fused LayerNorm+AdaLN | fusednorm | 0.445 |
+| fused activation quantizer | convrot | 0.38 |
+| dequant→CUTLASS-EVT epilogue | convrot | 0.34 |
+| fused RMSNorm×weight + gated residual | fusednorm | **0.27** |
+
+Plus (not per-step): bf16 VAE decode 1.57×; text encoder Q8_0 GGUF (resident
+VRAM); VAE tiling (constant decode memory); true CFG (`--guidance`/`--negative`,
+2× denoise when >1).
+
+CLI verbs (all in `src/main.rs`): `generate`, `batch` (has `--resident`,
+`--vae-tile`, `--guidance`/`--negative`, `--text-gguf`, `--quant-text`),
+`denoise`, `dit-forward`, `text-encode`, `vae-decode` (`--bf16`), `smoke`,
+`bench`, `convrot-test`, `sage-test`, `fusednorm-test`, `prequantize-convrot`,
+`prequantize-text`.
+
+### NEXT SESSION — remaining optimization backlog (ranked; latest nsys below)
+The denoise is now a **flat tail — no dominant kernel** (10-step trace, bf16 VAE):
+`im2col_bf16` 10.1% (VAE convs) · `ucopy_bf16` 8.4% (attention-layout copies) ·
+sage attn 8.0% · bf16 GEMMs ~11% (non-convrot linears + VAE) · our 4 fused
+kernels ~11% total (each 1.8–3.6%, efficient) · silu 3% · one-time load
+weight-quant ~6.6% (224-inst kernels — NOT per-step). Remaining levers, by
+impact/effort:
+1. **BSHD-native fused attention** (biggest single target). Rewrite the sage
+   bridge (src/sage.rs + the `#[cfg(feature="sage")] attend` in dit.rs) to ingest
+   `(B,S,H,D)` directly, eliminating the ~8.4% `ucopy_bf16` transpose→contiguous
+   copies + the per-step V bf16→f16 cast, and tightening sage. LARGE rewrite,
+   but the only lever that kills the structural copies (the copy-reduction audit
+   proved they can't be removed at the Rust level — see that section).
+2. **VAE conv algorithm** (`im2col_bf16` ~10%). bf16 already; further needs
+   implicit-GEMM / Winograd convs or a fused decoder — large.
+3. **Per-warp sage quant** (accuracy/speed refinement) + **SageAttention on
+   attention-heavier configs** (condition images / higher res) where S² matters
+   more — sage's win grows there.
+4. **Convrot the remaining ≥256-dim bf16 linears** (`txt_in` 4096→4096,
+   `modulation` 4096→12288, `norm_out` 4096→4096) — small; `img_in` (in=64) /
+   `proj_out` (out=64) can't (dims <256).
+5. Pre-quantized convrot DiT file already exists (`prequantize-convrot`) to cut
+   the ~14 s single-`generate` load; the residual is the 8 GB text-GGUF cold mmap.
+Re-profile after each: `nsys profile -o /tmp/p --trace=cuda <bin> generate ...
+--steps 10 ...` then `nsys stats --report cuda_gpu_kern_sum --format table
+/tmp/p.nsys-rep`. Diminishing returns — each remaining lever is substantial work
+for a single-digit-% or structural slice.
 
 Optimizations, each measured:
 - **FlashAttention-2** (`--features flash-attn`): 1.85× denoise (1.15→0.62 s/step),
@@ -372,13 +428,54 @@ attn: 4096 OK). ConvRotLinear input dim K = the linear's in_features.
   script file + copy it, or keep commands quote-free.
 - CUDA 13.3 is strict: fresh CUTLASS only; flash-attn compiles fine (just ~19 min).
 - Two model snapshots exist (b3179ad3 full, 790c9263 partial) — glob carefully.
+- New `.cu`: `#include <cassert>` BEFORE any cuda_fp8/fp6/fp4 headers (CUDA 13
+  `__assert_fail`). Name every `extern "C"` launcher distinctly from Rust fns
+  (a `..._launch` suffix — a same-name collision is a compile error).
+- **INT8 CUTLASS mma needs `arch::OpMultiplyAddSaturate`** (no plain-`OpMultiplyAdd`
+  s8 16×8×32); `device::Gemm` defaults it, `DefaultGemmWithVisitor` (EVT) does not.
+- **EVT scale vectors pack col-first** (`cat(col_scale,row_scale)`): the vectorized
+  RowBroadcast base must be 32-B aligned; row-first faulted MISALIGNED at M=4117.
+  Build the convrot .cu with `--expt-extended-lambda` (EVT visitors).
+- **Fused-norm parity: pass the weight as f32** (ZeroCenter bakes `weight+1` in f32
+  at load) to match candle's `weight.to_dtype(F32)`.
 
-## Issue-lifecycle issues (state in swamp)
-`qwen-image-rs-oracle` (complete), `-vae` (complete), `-text-encoder` (complete),
-`-dit` (complete), `-convrot` (planned — the DiT-wiring work above goes under it),
-`-reduce-copies` (negative result — all fast-path `.contiguous()` load-bearing, no
-code change; see "Copy-reduction audit" above).
-Resume any: `swamp model method run <issue> hydrate`.
+### Session/tooling workflow (host, verify runner, issue-lifecycle)
+- **Build/run on the 4090 ONLY via `scripts/host.sh`** (git-archive→copy→build over
+  the `wsl-drills` @swamp/ssh model). COMMIT before `sync` (uses `git archive HEAD`).
+  Host build: `export CUTLASS_DIR=$HOME/dev_tmp/cutlass/include; cargo build
+  --release --features convrot,sage,fusednorm`. Read stdout via the host.sh `run`
+  wrapper; filter noise with `grep -viE "WRN|system │|Source path|seaweedfs|Committed|Syncing|Wrote|Preparing|Running|warning|cutlass|cute|include"`.
+- **Mac cargo: ALWAYS `CARGO_TARGET_DIR=$HOME/.cache/qwen-image-rs-target`** — else a
+  stray in-tree `target/` appears and `scripts/check.sh` fails exit 3 ("a target/
+  directory appeared"); fix `rm -rf target`. Default (no-feature) build must always
+  compile on the Mac.
+- **`--repo-dir` is a swamp SUBCOMMAND option** (after `model method run`/`data get`),
+  NOT global. Run swamp from `/Users/mag1/dev_tmp/swamp`.
+- **Issue-lifecycle Phase-4b `verify` runner** (Mac, `runner:"local"`): use
+  `command:"bash", args:["-c","export PATH=$HOME/.cargo/bin:$PATH; export
+  QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh <stage>"]`,
+  `cwd:"."` (relative), `repoDir` absolute; one `verify` call with all 4 controls
+  (fmt/lint/check/test). (~/.bash_profile was fixed this session; toolchain pins
+  rustfmt/clippy.)
+- **IL method arg quirks:** `implement --input branch="main"`; `iterate_verification
+  --input source=auto --input reason=...`; `record_review reviewer/verdict/--input-file`;
+  `resolve_findings --input-file` (`resolutions:` map); `approve_plan` no inputs;
+  `attest --input '{commitSha,repoDir,configPaths:[agent-constraints/*.md,Cargo.toml],producedBy}'`.
+  Standing PRE-APPROVAL (agent-constraints/iteration-limits.md): approve plans +
+  resolve findings yourself. Attestation `data get` writes ~empty (cosmetic; model
+  state is authoritative). Then `.attestations/<sha>.json` + `complete`.
+- **Subagents:** run optimization lifecycles SEQUENTIALLY (parallel forks clobber the
+  shared host build dir `~/dev_tmp/qwen-image-rs`, the out-of-tree target, and the
+  `main` branch; `wsl-drills` model lock serializes GPU work anyway).
+
+## Issue-lifecycle issues (state in swamp) — resume: `swamp model method run <issue> hydrate`
+Phase ports (complete): `-oracle`, `-vae`, `-text-encoder`, `-dit`.
+Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
+`-dequant-epilogue` (CUTLASS EVT), `-fused-rmsnorm-gate` (RMSNorm+gated residual),
+`-vae-bf16`.
+Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path
+`.contiguous()` load-bearing; see "Copy-reduction audit"); `-fused-dequant`
+(closed — superseded by `-dequant-epilogue` which shipped it).
 
 ## Also-planned / future levers
 Pre-quantized GGUF *file* (cut ~24 s load); SageAttention INT8 attention; prefix
