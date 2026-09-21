@@ -282,3 +282,12 @@ Pre-quantized GGUF *file* (cut ~24 s load); SageAttention INT8 attention; prefix
 KV cache (helps most with condition images); resident serve mode.
 
 Memory: `[[project_qwen_image_rs]]`, `[[lesson_qwen_image_rs_attention_bound_profile]]`.
+
+### VAE bf16 decode (DONE — `vae-bf16` issue)
+VAE decoder runs in bf16 on CUDA by default (was F32 — the top GPU-time bucket).
+`QwenImageVae` got a `dtype` field; decode unnormalizes z*std+mean in f32 then
+casts to the conv dtype; `RmsNorm` (F.normalize over C) f32-accumulates.
+`--vae-f32` fallback; `vae-decode --bf16`.
+- **Quality-neutral: bf16 vs f32 53.6 dB; bf16 vs oracle 55.2 dB** (f32 was
+  53.3 — bf16 is marginally closer to the bf16 diffusers oracle).
+- **Decode 1.84 s -> 1.17 s (~1.57x)** tiled, resident 40 steps. Per-image ~16.3 s.
