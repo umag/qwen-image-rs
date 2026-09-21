@@ -211,6 +211,46 @@ pre-allocated input (fresh zeros, no aliasing/autograd — safe in inference);
   0.62 -> 0.38 s/step.
 - Remaining fusion levers: RMSNorm variants; the dequant is cheap and left as-is.
 
+### Copy-reduction audit (`qwen-image-rs-reduce-copies` issue — NEGATIVE RESULT, no code change)
+nsys of the fast path (`convrot,sage,fusednorm`, bf16 VAE) showed `ucopy_bf16` at
+6.9% (2785 instances / 10-step denoise ≈ 278/step) — plain `.contiguous()` memory
+copies. Audited every fast-path `.contiguous()` for redundant (already-contiguous)
+or avoidable (consumer tolerates a view) removal **without changing numerics**.
+**Conclusion: all are load-bearing; nothing safely removable at the Rust level.**
+
+Grounded in candle 0.11 source (verified, not assumed):
+- `rope_i` **bails** on non-contiguous input (`rotary_emb.rs:278`). So the
+  `qh`/`kh` `transpose(1,2)?.contiguous()?` at `dit.rs` 255/260 are REQUIRED — the
+  transpose makes them strided and rope over the full sequence needs contiguous.
+- `Tensor::contiguous()` on an already-contiguous tensor is a **free clone**, no
+  copy kernel (`tensor.rs:2466`). So an already-contiguous `.contiguous()` emits
+  ZERO `ucopy` — it is never part of the 6.9%.
+- `Tensor::reshape` on a **non-contiguous** tensor **copies** (`copy_strided_src`,
+  `tensor.rs` else-branch); on contiguous it is a free view. So `dit.rs:302`
+  `out.transpose(1,2)?.contiguous()?` is not redundant: dropping it just moves the
+  identical single copy into the `reshape((b,s,INNER))` at `dit.rs:266`.
+  **Empirically confirmed** (test-removed 302, rebuilt): `overall_cos` 0.999934
+  UNCHANGED, denoise 15333 ms vs 15394 ms baseline = −0.4% (noise, no win). Reverted.
+- `to_dtype` output is **always contiguous** (`cuda_backend to_dtype` writes linear
+  output). So `sage.rs:163` `.contiguous()` after `to_dtype(F16)` is a no-op today —
+  but it is a **defensive raw-pointer FFI guard** (the sage kernel reads a bare
+  device ptr assuming contiguous; if `v` ever arrives already-F16 non-contiguous it
+  would silently corrupt). Same for `fusednorm.rs:89-90`. **Kept as guards.**
+- `sage_attention` already contiguizes its inputs internally, and `attend()` passes
+  **views** (`vv.transpose(1,2)` at `dit.rs:288`, narrows) — a prior pass removed the
+  double-copies; none remain. `ConvRotLinear::forward` has **no** `.contiguous()`
+  (rotate uses matmul + reshape on contiguous views).
+
+The 6.9% `ucopy_bf16` is **structural**: per block ≈ qh + kh full-S contiguizations
+(for rope_i) + sage narrow→contiguous (text q/k, image q; whole-k is a no-op) + the
+`ot||oi` cat + the out linearization. Reducing it needs a fused attention kernel that
+ingests (B,S,H,D) and does rope/transpose internally — **out of scope** (Rust-only).
+- **Considered & rejected:** move `rope_i` into `attend()` per-narrow to drop the
+  full-S `q` pre-contiguous (255). Ceiling ~≤1% denoise (only `q`'s full-S copy goes;
+  `k` still needs the whole-S contiguize for the image call), and it touches all
+  THREE `attend` variants (sage/flash/naive) + narrowed cos/sin correctness, with no
+  way to validate flash/naive on the fast-path build. High-risk / low-reward — not done.
+
 ### Future levers
 - **Faster resident encode** — the Q8 te forward dominates resident per-image
   time; cache dequantized bf16 weights once after load (trades VRAM), or use a
@@ -274,7 +314,9 @@ attn: 4096 OK). ConvRotLinear input dim K = the linear's in_features.
 
 ## Issue-lifecycle issues (state in swamp)
 `qwen-image-rs-oracle` (complete), `-vae` (complete), `-text-encoder` (complete),
-`-dit` (complete), `-convrot` (planned — the DiT-wiring work above goes under it).
+`-dit` (complete), `-convrot` (planned — the DiT-wiring work above goes under it),
+`-reduce-copies` (negative result — all fast-path `.contiguous()` load-bearing, no
+code change; see "Copy-reduction audit" above).
 Resume any: `swamp model method run <issue> hydrate`.
 
 ## Also-planned / future levers
