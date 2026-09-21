@@ -37,6 +37,17 @@ impl QLinear {
         if convrot {
             if let Some(r) = rot {
                 if in_c % crate::model::rotation::GROUP == 0 {
+                    // Pre-quantized weights on disk (from `prequantize-convrot`):
+                    // load the rotated INT8 weight + col scale directly, skipping
+                    // the load-time rotate+quant. Detected by `weight_i8` next to
+                    // the usual `weight`.
+                    if vb.contains_tensor("weight_i8") {
+                        let w_i8 = vb.get_unchecked_dtype("weight_i8", DType::U8)?;
+                        let col_scale = vb.get_unchecked_dtype("col_scale", DType::F32)?;
+                        return Ok(QLinear::Convrot(
+                            crate::convrot::ConvRotLinear::from_prequantized(w_i8, col_scale, r)?,
+                        ));
+                    }
                     let w = vb.get((out_c, in_c), "weight")?;
                     return Ok(QLinear::Convrot(crate::convrot::ConvRotLinear::from_weight(
                         &w, r,

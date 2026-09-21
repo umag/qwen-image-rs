@@ -141,6 +141,18 @@ enum Command {
         #[arg(long)]
         out: std::path::PathBuf,
     },
+    /// Pre-quantize the DiT's ConvRot linears to a weights file (rotated INT8 +
+    /// col scale), so `generate --convrot` on that file skips the load-time
+    /// rotate+quant and mmaps ~half the bytes. Requires the `convrot` feature.
+    PrequantizeConvrot {
+        /// The transformer/ directory (bf16 config.json + *.safetensors shards).
+        #[arg(long)]
+        weights: std::path::PathBuf,
+        /// Output .safetensors file (drop it in a dir and point --model's
+        /// transformer at that dir, or pass the dir to dit-forward --weights).
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
     /// Decode a saved latent (.pt) through the VAE to an RGBA PNG (Phase 2).
     VaeDecode {
         /// The vae/ directory (holds config.json + *.safetensors).
@@ -187,6 +199,7 @@ fn main() -> Result<()> {
             convrot,
             out,
         } => generate(&model, &prompt, size, steps, seed, quant, convrot, &out),
+        Command::PrequantizeConvrot { weights, out } => prequantize_convrot(&weights, &out),
         Command::VaeDecode {
             weights,
             latent,
@@ -782,6 +795,85 @@ fn smoke(n: usize) -> Result<()> {
         gflop / elapsed.as_secs_f64(),
     );
     Ok(())
+}
+
+/// The DiT linears that ConvRot quantizes (per transformer block): attention
+/// q/k/v/o and the SwiGlu proj/gate/out. Matched by name suffix.
+#[cfg(feature = "convrot")]
+fn is_convrot_target(name: &str) -> bool {
+    const SUFFIXES: [&str; 7] = [
+        ".attn.to_q.weight",
+        ".attn.to_k.weight",
+        ".attn.to_v.weight",
+        ".attn.to_out.0.weight",
+        ".img_mlp.proj.weight",
+        ".img_mlp.gate_layer.weight",
+        ".img_mlp.out.weight",
+    ];
+    name.starts_with("transformer_blocks.") && SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// Pre-quantize the DiT's ConvRot linears to a single safetensors file: each
+/// target `<prefix>.weight` (bf16) becomes `<prefix>.weight_i8` (rotated INT8,
+/// U8 bytes) + `<prefix>.col_scale` (f32); all other tensors are copied bf16.
+/// `QwenImageDit::load` auto-detects `weight_i8` and skips the load-time
+/// rotate+quant. The heavy math runs on the GPU (QuantizeRows is CUDA-only).
+#[cfg(feature = "convrot")]
+fn prequantize_convrot(weights: &std::path::Path, out: &std::path::Path) -> Result<()> {
+    use qwen_image_rs::convrot::ConvRotLinear;
+    use qwen_image_rs::model::rotation::regular_hadamard_256;
+    use std::collections::HashMap;
+
+    let dev = device::best_device()?;
+    if !matches!(dev, candle_core::Device::Cuda(_)) {
+        anyhow::bail!("prequantize-convrot needs CUDA (the quantize kernel is CUDA-only)");
+    }
+    let set = WeightSet::resolve(weights)?;
+    tracing::info!(files = set.files.len(), "loading bf16 transformer (CPU)");
+    let mut full: HashMap<String, Tensor> = HashMap::new();
+    for f in &set.files {
+        for (k, v) in candle_core::safetensors::load(f, &candle_core::Device::Cpu)? {
+            full.insert(k, v);
+        }
+    }
+
+    let r = regular_hadamard_256(&dev)?;
+    let mut outmap: HashMap<String, Tensor> = HashMap::new();
+    let mut n_quant = 0usize;
+    for (name, t) in &full {
+        if is_convrot_target(name) {
+            let w = t.to_device(&dev)?.to_dtype(DType::BF16)?; // (N,K) bf16 on GPU
+            let cr = ConvRotLinear::from_weight(&w, &r)?;
+            let (wi8, cs) = cr.export();
+            let base = name.strip_suffix(".weight").unwrap();
+            outmap.insert(
+                format!("{base}.weight_i8"),
+                wi8.to_device(&candle_core::Device::Cpu)?,
+            );
+            outmap.insert(
+                format!("{base}.col_scale"),
+                cs.to_device(&candle_core::Device::Cpu)?,
+            );
+            n_quant += 1;
+        } else {
+            outmap.insert(name.clone(), t.clone());
+        }
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    candle_core::safetensors::save(&outmap, out)?;
+    println!(
+        "prequantized {n_quant} convrot linears + copied {} bf16 tensors -> {}",
+        outmap.len() - 2 * n_quant,
+        out.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "convrot"))]
+fn prequantize_convrot(_: &std::path::Path, _: &std::path::Path) -> Result<()> {
+    anyhow::bail!("prequantize-convrot requires the `convrot` feature")
 }
 
 /// Resolve a weight directory and print format + shard count + total size.

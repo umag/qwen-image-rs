@@ -209,7 +209,6 @@ impl candle_core::CustomOp3 for Dequant {
 }
 
 use candle_core::D;
-use candle_nn::Module;
 
 /// A ConvRot W8A8 linear: rotated INT8 weight + per-channel scale. Forward
 /// rotates + per-token INT8-quantizes the activation, runs the INT8 GEMM, and
@@ -232,6 +231,22 @@ impl ConvRotLinear {
             .reshape(n)?;
         let w_i8 = wr.apply_op2(&inv, QuantizeRows)?; // (N,K) u8
         Ok(Self { w_i8, col_scale, hadamard: r.clone() })
+    }
+
+    /// Build from already-rotated-and-quantized tensors (loaded from a
+    /// pre-quantized weight file), skipping the rotate+quant done by
+    /// `from_weight`. `w_i8 (N,K)` is U8 holding int8; `col_scale (N,)` is f32.
+    pub fn from_prequantized(w_i8: Tensor, col_scale: Tensor, r: &Tensor) -> Result<Self> {
+        Ok(Self {
+            w_i8,
+            col_scale,
+            hadamard: r.clone(),
+        })
+    }
+
+    /// The stored INT8 weight and per-column scale, for serialization.
+    pub fn export(&self) -> (&Tensor, &Tensor) {
+        (&self.w_i8, &self.col_scale)
     }
 
     /// Forward on `x (..., K)` bf16 -> `(..., N)` bf16.

@@ -1875,6 +1875,7 @@ dependencies = [
  "candle-transformers",
  "cc",
  "clap",
+ "half",
  "image",
  "safetensors 0.4.5",
  "serde",
