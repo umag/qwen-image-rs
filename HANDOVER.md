@@ -134,12 +134,18 @@ Q8_0 (weight-only). Exposed as `--quant-text` (generate/batch) and `--quant`
   fine). `--text-gguf` never puts a bf16 weight on the GPU → **pool ~18.9 GB**,
   ~5.6 GB headroom, every prompt renders. Validated: mug→vase resident, both
   correct (was blank on vase).
-- **Caveat:** the Q8_0 text-encoder *forward* is slow (~35 s) — QMatMul
-  dequantizes each full weight per call, wasteful for the short one-shot encode
-  (few tokens). So resident is ~57 s/image (vs 27 s sequential convrot+sage with
-  a bf16 encoder that doesn't fit resident). It's a VRAM/residency tool; if the
-  encode latency matters, a dequant-once-cache-bf16 encoder path would fix it
-  (costs the VRAM back). embed quality: Q8 vs bf16 cosine 0.9977.
+- **Measured per-phase (resident, instrumented):** encode **0.2–1.4 s**,
+  denoise **20.3 s**, VAE decode **~35 s**. So resident 57 s/image is dominated
+  by the VAE DECODE, not the encode (the earlier "~35 s Q8 encode" caveat was a
+  MIS-ATTRIBUTION). The decode is slow ONLY in resident: sequential
+  `--text-gguf` is 35 s total because it frees te+DiT before decoding, giving
+  the VAE full VRAM; resident keeps all three co-resident (~18.9 GB), so the
+  VAE's 1024² upsampling feature maps thrash. embed quality: Q8 vs bf16 cosine
+  0.9977.
+- **So caching bf16 encoder weights is the WRONG fix** (encode is 0.2–1.4 s, ~1%
+  of the time) and would add ~7.5 GB → back over 24 GB (blank returns). The right
+  lever for fast resident is **VAE tiling/slicing** (low decode peak memory).
+  Otherwise sequential `--text-gguf` (35 s/img) already beats resident (57 s).
 
 ### Future levers
 - **Faster resident encode** — the Q8 te forward dominates resident per-image
