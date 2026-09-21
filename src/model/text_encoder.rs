@@ -11,12 +11,40 @@
 //! runs the layers and returns the pre-final-norm hidden states; it does NOT
 //! apply the final norm or the lm_head.
 
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{
     embedding, linear_b, rms_norm, Activation, Embedding, Linear, Module, RmsNorm, VarBuilder,
 };
 
 use crate::Result;
+
+/// A no-bias linear, full-precision or Q8_0-quantized (GGUF, weight-only). Q8_0
+/// halves the weight VRAM near-losslessly so the 8B text encoder fits alongside
+/// the DiT and VAE, resident in 24 GB.
+enum QLinear {
+    Full(Linear),
+    Quant(QMatMul),
+}
+
+impl QLinear {
+    fn load(in_c: usize, out_c: usize, quant: bool, vb: VarBuilder) -> Result<Self> {
+        if quant {
+            let w = vb.get((out_c, in_c), "weight")?;
+            let qt = QTensor::quantize(&w, GgmlDType::Q8_0)?;
+            Ok(QLinear::Quant(QMatMul::from_qtensor(qt)?))
+        } else {
+            Ok(QLinear::Full(linear_b(in_c, out_c, false, vb)?))
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            QLinear::Full(l) => Ok(l.forward(x)?),
+            QLinear::Quant(q) => Ok(q.forward(x)?),
+        }
+    }
+}
 
 /// Qwen3-VL text config (from `text_encoder/config.json` `text_config`).
 #[derive(Debug, Clone)]
@@ -98,10 +126,10 @@ fn repeat_kv(x: Tensor, groups: usize) -> Result<Tensor> {
 }
 
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: QLinear,
+    k_proj: QLinear,
+    v_proj: QLinear,
+    o_proj: QLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_heads: usize,
@@ -112,14 +140,14 @@ struct Attention {
 }
 
 impl Attention {
-    fn load(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &TextConfig, quant: bool, vb: VarBuilder) -> Result<Self> {
         let h = cfg.hidden_size;
         let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
         Ok(Self {
-            q_proj: linear_b(h, nh * hd, false, vb.pp("q_proj"))?,
-            k_proj: linear_b(h, nkv * hd, false, vb.pp("k_proj"))?,
-            v_proj: linear_b(h, nkv * hd, false, vb.pp("v_proj"))?,
-            o_proj: linear_b(nh * hd, h, false, vb.pp("o_proj"))?,
+            q_proj: QLinear::load(h, nh * hd, quant, vb.pp("q_proj"))?,
+            k_proj: QLinear::load(h, nkv * hd, quant, vb.pp("k_proj"))?,
+            v_proj: QLinear::load(h, nkv * hd, quant, vb.pp("v_proj"))?,
+            o_proj: QLinear::load(nh * hd, h, quant, vb.pp("o_proj"))?,
             q_norm: rms_norm(hd, cfg.rms_norm_eps, vb.pp("q_norm"))?,
             k_norm: rms_norm(hd, cfg.rms_norm_eps, vb.pp("k_norm"))?,
             num_heads: nh,
@@ -163,18 +191,18 @@ impl Attention {
 }
 
 struct Mlp {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    gate: QLinear,
+    up: QLinear,
+    down: QLinear,
 }
 
 impl Mlp {
-    fn load(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &TextConfig, quant: bool, vb: VarBuilder) -> Result<Self> {
         let (h, i) = (cfg.hidden_size, cfg.intermediate_size);
         Ok(Self {
-            gate: linear_b(h, i, false, vb.pp("gate_proj"))?,
-            up: linear_b(h, i, false, vb.pp("up_proj"))?,
-            down: linear_b(i, h, false, vb.pp("down_proj"))?,
+            gate: QLinear::load(h, i, quant, vb.pp("gate_proj"))?,
+            up: QLinear::load(h, i, quant, vb.pp("up_proj"))?,
+            down: QLinear::load(i, h, quant, vb.pp("down_proj"))?,
         })
     }
 
@@ -193,10 +221,10 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn load(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &TextConfig, quant: bool, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            attn: Attention::load(cfg, vb.pp("self_attn"))?,
-            mlp: Mlp::load(cfg, vb.pp("mlp"))?,
+            attn: Attention::load(cfg, quant, vb.pp("self_attn"))?,
+            mlp: Mlp::load(cfg, quant, vb.pp("mlp"))?,
             input_ln: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
             post_attn_ln: rms_norm(
                 cfg.hidden_size,
@@ -226,14 +254,17 @@ pub struct QwenTextEncoder {
 }
 
 impl QwenTextEncoder {
-    pub fn load(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+    /// Load the text encoder. When `quant` is set, the decoder linears are Q8_0
+    /// (weight-only) — ~half the VRAM, near-lossless — so all three models stay
+    /// resident in 24 GB. The token embedding stays full precision.
+    pub fn load(cfg: &TextConfig, quant: bool, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model").pp("language_model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rope = RotaryEmbedding::new(cfg, vb.device(), vb.dtype())?;
         let vb_l = vb_m.pp("layers");
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            layers.push(DecoderLayer::load(cfg, vb_l.pp(i))?);
+            layers.push(DecoderLayer::load(cfg, quant, vb_l.pp(i))?);
         }
         Ok(Self {
             embed_tokens,

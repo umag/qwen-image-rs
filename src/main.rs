@@ -61,6 +61,9 @@ enum Command {
         /// ConvRot W8A8 INT8 for the DiT attn/MLP linears (`convrot` feature).
         #[arg(long)]
         convrot: bool,
+        /// Q8_0-quantize the text encoder (weight-only, ~half VRAM).
+        #[arg(long)]
+        quant_text: bool,
         #[arg(long)]
         out: std::path::PathBuf,
     },
@@ -83,6 +86,9 @@ enum Command {
         /// ConvRot W8A8 INT8 for the DiT attn/MLP linears (`convrot` feature).
         #[arg(long)]
         convrot: bool,
+        /// Q8_0-quantize the text encoder (weight-only, ~half VRAM).
+        #[arg(long)]
+        quant_text: bool,
         /// Output directory (writes 000.png, 001.png, ...).
         #[arg(long)]
         out_dir: std::path::PathBuf,
@@ -98,6 +104,9 @@ enum Command {
         /// Number of leading system-prompt tokens to drop.
         #[arg(long, default_value_t = 0)]
         drop: usize,
+        /// Q8_0-quantize the text encoder (weight-only, ~half VRAM).
+        #[arg(long)]
+        quant: bool,
         /// Output embeddings safetensors path.
         #[arg(long)]
         out: std::path::PathBuf,
@@ -189,8 +198,11 @@ fn main() -> Result<()> {
             seed,
             quant,
             convrot,
+            quant_text,
             out_dir,
-        } => batch(&model, &prompts, size, steps, seed, quant, convrot, &out_dir),
+        } => batch(
+            &model, &prompts, size, steps, seed, quant, convrot, quant_text, &out_dir,
+        ),
         Command::Info { weights } => info(&weights),
         Command::Generate {
             model,
@@ -200,8 +212,11 @@ fn main() -> Result<()> {
             seed,
             quant,
             convrot,
+            quant_text,
             out,
-        } => generate(&model, &prompt, size, steps, seed, quant, convrot, &out),
+        } => generate(
+            &model, &prompt, size, steps, seed, quant, convrot, quant_text, &out,
+        ),
         Command::PrequantizeConvrot { weights, out } => prequantize_convrot(&weights, &out),
         Command::VaeDecode {
             weights,
@@ -212,8 +227,9 @@ fn main() -> Result<()> {
             weights,
             input_ids,
             drop,
+            quant,
             out,
-        } => text_encode(&weights, &input_ids, drop, &out),
+        } => text_encode(&weights, &input_ids, drop, quant, &out),
         Command::DitForward {
             weights,
             inputs,
@@ -245,6 +261,7 @@ fn generate(
     seed: u64,
     quant: bool,
     convrot: bool,
+    quant_text: bool,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -285,6 +302,7 @@ fn generate(
     let embeds = {
         let te = QwenTextEncoder::load(
             &TextConfig::default(),
+            quant_text,
             load_vb(model.join("text_encoder"), dtype)?,
         )?;
         let ids_t = Tensor::from_vec(ids, (1, seq), &dev)?;
@@ -353,6 +371,7 @@ fn batch(
     seed: u64,
     quant: bool,
     convrot: bool,
+    quant_text: bool,
     out_dir: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -394,6 +413,7 @@ fn batch(
     {
         let te = QwenTextEncoder::load(
             &TextConfig::default(),
+            quant_text,
             load_vb(model.join("text_encoder"), dtype)?,
         )?;
         for p in &prompts {
@@ -582,6 +602,7 @@ fn text_encode(
     weights: &std::path::Path,
     input_ids_path: &std::path::Path,
     drop: usize,
+    quant: bool,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::text_encoder::{QwenTextEncoder, TextConfig};
@@ -600,7 +621,7 @@ fn text_encode(
     };
     let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &dev)? };
     let cfg = TextConfig::default();
-    let model = QwenTextEncoder::load(&cfg, vb)?;
+    let model = QwenTextEncoder::load(&cfg, quant, vb)?;
 
     let ids_map = candle_core::safetensors::load(input_ids_path, &dev)?;
     let ids = ids_map
