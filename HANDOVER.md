@@ -101,14 +101,31 @@ Vendored thu-ml/SageAttention's sm80 fused kernel into `kernels/sage/vendor/`
   per-block indexing without padding. Per-warp is a later accuracy refinement
   (needs the padded ceil(N/128)*4 scale layout + their per-warp quant kernel).
 
+### Text encoder Q8_0 (DONE — enables resident VRAM)
+`src/model/text_encoder.rs` gained a `QLinear` (Full/Q8_0) mirroring the DiT;
+`QwenTextEncoder::load(cfg, quant, vb)` quantizes the Qwen3 decoder linears to
+Q8_0 (weight-only). Exposed as `--quant-text` (generate/batch) and `--quant`
+(text-encode). Token embedding stays bf16.
+- **VRAM: text-enc bf16 ~16 GB → Q8_0 ~9 GB** (embed 1.2 GB bf16 + linears ~7.4
+  GB Q8). All three resident: ~9 (text Q8) + ~7 (DiT convrot) + ~0.7 (VAE f32)
+  ≈ **16.7 GB < 24 GB** (bf16 text would be ~23.7 GB — too tight). So Q8_0 text
+  is what makes an all-resident pipeline fit.
+- **Quality: Q8 vs bf16 embeds cosine 0.9977** (bf16-vs-oracle was 0.9993; Q8
+  error accumulates over 36 layers). End-to-end `--convrot --quant-text` image
+  is coherent + on-prompt; PSNR 22.3 dB vs bf16 (the embed shift changes the
+  conditioning globally — same subject, different fine detail). A quality knob:
+  `--quant-text` for residency, bf16 for max fidelity.
+- **Load cost: ~58 s** (quantize-on-load, like the DiT `--quant`) — it's a VRAM
+  tool, not a speed one. A pre-quantized text-encoder file (mirror
+  `prequantize-convrot`, or a Q8_0 GGUF) would cut that; TODO.
+
 ### Future levers
-- **Quantize the TEXT ENCODER too (resident-VRAM mode).** Today `generate`
-  loads Qwen3-VL 8B (bf16 ~16 GB) → frees → DiT → frees → VAE, reloading each
-  per run. Quantize the text encoder (Q8_0/INT8) so text-enc + DiT (convrot ~7
-  GB) + VAE all fit in 24 GB **resident at once** — no reload between images,
-  big win for batch/serve. Mirrors the `--quant`/prequant work on the DiT;
-  apply Q8_0 (candle QMatMul) to the Qwen3 decoder linears in
-  `src/model/text_encoder.rs`, add a resident pipeline that loads all three once.
+- **Resident pipeline.** Now that all three fit (above), restructure `batch`
+  (and add a serve loop) to load text-enc + DiT + VAE ONCE and keep them
+  resident, running encode→denoise→decode per prompt without freeing — the big
+  batch/serve win. Blocked only on wanting the ~58 s load paid once.
+- **Pre-quantized text-encoder file** — cut the ~58 s quantize-on-load, mirroring
+  `prequantize-convrot`.
 - **CUDA-graph capture** — candle 0.11 exposes no stream-capture hook and its
   op path allocates fresh tensors per step (pointers move), so replay is fragile.
   Not viable without patching candle. Deprioritized.
