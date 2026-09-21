@@ -119,13 +119,33 @@ Q8_0 (weight-only). Exposed as `--quant-text` (generate/batch) and `--quant`
   tool, not a speed one. A pre-quantized text-encoder file (mirror
   `prequantize-convrot`, or a Q8_0 GGUF) would cut that; TODO.
 
+### Resident pipeline + pre-quantized text GGUF (DONE)
+- **`batch --resident`**: loads text-enc + DiT + VAE ONCE and streams prompts
+  through encode→denoise→decode without freeing. `src/main.rs` batch().
+- **`prequantize-text --weights <text_encoder> --out <file.gguf>`** writes a Q8_0
+  GGUF (decoder linears Q8_0, embed+norms F16, via `gguf_file::write`; text-only
+  tensors); **`--text-gguf <file>`** on generate/batch loads it via
+  `QwenTextEncoder::load_gguf` (candle quantized VarBuilder → QMatMul from
+  Arc<QTensor>). File 8.1 GB.
+- **Why the GGUF is REQUIRED for resident:** quantize-on-load (`--quant-text`)
+  materializes bf16 weights on the GPU transiently, which inflates candle's CUDA
+  pool to **~24 GB (at the limit)** — a differently-sized 2nd prompt then can't
+  allocate and renders BLANK (identical prompts reuse the pooled buffers and are
+  fine). `--text-gguf` never puts a bf16 weight on the GPU → **pool ~18.9 GB**,
+  ~5.6 GB headroom, every prompt renders. Validated: mug→vase resident, both
+  correct (was blank on vase).
+- **Caveat:** the Q8_0 text-encoder *forward* is slow (~35 s) — QMatMul
+  dequantizes each full weight per call, wasteful for the short one-shot encode
+  (few tokens). So resident is ~57 s/image (vs 27 s sequential convrot+sage with
+  a bf16 encoder that doesn't fit resident). It's a VRAM/residency tool; if the
+  encode latency matters, a dequant-once-cache-bf16 encoder path would fix it
+  (costs the VRAM back). embed quality: Q8 vs bf16 cosine 0.9977.
+
 ### Future levers
-- **Resident pipeline.** Now that all three fit (above), restructure `batch`
-  (and add a serve loop) to load text-enc + DiT + VAE ONCE and keep them
-  resident, running encode→denoise→decode per prompt without freeing — the big
-  batch/serve win. Blocked only on wanting the ~58 s load paid once.
-- **Pre-quantized text-encoder file** — cut the ~58 s quantize-on-load, mirroring
-  `prequantize-convrot`.
+- **Faster resident encode** — the Q8 te forward dominates resident per-image
+  time; cache dequantized bf16 weights once after load (trades VRAM), or use a
+  narrower activation-aware path.
+- **CUDA-graph capture** — not viable in candle 0.11 (no stream-capture hook).
 - **CUDA-graph capture** — candle 0.11 exposes no stream-capture hook and its
   op path allocates fresh tensors per step (pointers move), so replay is fragile.
   Not viable without patching candle. Deprioritized.
