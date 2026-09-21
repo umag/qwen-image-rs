@@ -22,6 +22,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 candle-flash-attn = { version = "0.11", optional = true }
 
+[build-dependencies]
+cc = { version = "1", optional = true }
+
 [features]
 default = []
 # CUDA path — only builds on the WSL 4090 host (needs CUDA toolkit + a GPU).
@@ -29,6 +32,8 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 cudnn = ["cuda", "candle-core/cudnn"]
 # FlashAttention-2 kernels (Ada/Ampere/Hopper only). ~19 min first build.
 flash-attn = ["cuda", "dep:candle-flash-attn"]
+# ConvRot INT8 W8A8: compiles kernels/convrot/int8_gemm.cu (needs CUTLASS_DIR).
+convrot = ["cuda", "dep:cc"]
 
 [profile.release]
 opt-level = 3

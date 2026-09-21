@@ -1873,6 +1873,7 @@ dependencies = [
  "candle-flash-attn",
  "candle-nn",
  "candle-transformers",
+ "cc",
  "clap",
  "image",
  "safetensors 0.4.5",

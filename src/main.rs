@@ -25,6 +25,8 @@ enum Command {
         #[arg(long, default_value_t = 1024)]
         n: usize,
     },
+    /// Self-test the ConvRot INT8 GEMM bridge (candle -> CUTLASS kernel -> candle).
+    ConvrotTest,
     /// Micro-benchmark the DiT's dominant ops (MLP GEMM vs attention) in bf16.
     Bench {
         #[arg(long, default_value_t = 4117)]
@@ -150,6 +152,7 @@ fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Smoke { n } => smoke(n),
+        Command::ConvrotTest => convrot_test(),
         Command::Bench { seq, iters } => bench(seq, iters),
         Command::Batch {
             model,
@@ -656,6 +659,25 @@ fn vae_decode(
     buf.save(out)?;
     println!("wrote {} ({w}x{h} RGBA)", out.display());
     Ok(())
+}
+
+/// Self-test the ConvRot INT8 GEMM bridge end to end.
+fn convrot_test() -> Result<()> {
+    #[cfg(feature = "convrot")]
+    {
+        let maxdiff = qwen_image_rs::convrot::self_test()?;
+        println!(
+            "convrot int8-gemm bridge: max abs diff vs f32 = {maxdiff} ({})",
+            if maxdiff == 0.0 {
+                "EXACT — bridge OK"
+            } else {
+                "MISMATCH"
+            }
+        );
+        Ok(())
+    }
+    #[cfg(not(feature = "convrot"))]
+    anyhow::bail!("build with --features convrot (needs CUTLASS_DIR)")
 }
 
 /// Micro-benchmark the DiT's per-layer dominant ops in bf16 on the active
