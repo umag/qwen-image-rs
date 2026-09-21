@@ -16,6 +16,7 @@ end-to-end before any optimization**; **GGUF supported alongside safetensors**;
 | 3 | Text encoder | `Qwen3VLForConditionalGeneration` (text-only) | embeds match within tol | `qwen-image-rs-text-encoder` | ✅ complete (cosine 0.9993) |
 | 4 | DiT + sampler | `QwenImage21Transformer2DModel` + FlowMatchEuler | first e2e image ≈ oracle @ bf16 | `qwen-image-rs-dit` | ✅ complete (DiT cos 0.99996; e2e img 30.85 dB) |
 | 5 | Optimization | FP8 → SageAttention → GGUF → VAE tiling → CUDA-graph | each ≥ bf16 quality, faster | `qwen-image-rs-optimize` | not started |
+| 4b | Standalone generate | tokenizer + VRAM sequencing | prompt → PNG, no dumps | (folded) | ✅ done (~69s, no OOM) |
 | 6 | Bench + package | CLI, latency/VRAM table vs ComfyUI | reproducible bench | `qwen-image-rs-bench` | not started |
 
 ## Findings so far

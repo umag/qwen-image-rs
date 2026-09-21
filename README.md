@@ -31,6 +31,19 @@ scripts/       check.sh (Mac CPU checks) · host.sh (drive the 4090 via swamp)
                setup-host.sh (latest Rust + oracle venv) · oracle.py (references)
 ```
 
+## Status: working end-to-end
+Prompt → 1024² PNG in **~69 s** on a 4090 (unoptimized bf16). All three model
+components ported to candle and numerically validated against a diffusers oracle:
+
+| Component | Match vs oracle |
+|-----------|-----------------|
+| VAE decoder | PSNR 51–53 dB |
+| Text encoder (Qwen3-VL) | per-token cosine 0.9993 |
+| DiT (single forward) | cosine 0.99996 |
+| Full pipeline (40 steps) | latent 0.9977 → image 30.85 dB |
+
+See `docs/generate_standalone.png` (a red mug, from the prompt below).
+
 ## Build / run
 ```sh
 # Mac: CPU-only checks (fmt, clippy, check, test)
@@ -38,7 +51,11 @@ scripts/check.sh
 
 # WSL 4090 (via the swamp wsl-drills ssh model — never raw ssh):
 scripts/host.sh smoke          # build --features cuda + GPU matmul smoke test
-scripts/host.sh build          # release build on the GPU host
+
+# Text-to-image (on the GPU host, --features cuda):
+qwen-image-rs generate --model <snapshot> \
+  --prompt "a red ceramic coffee mug on a wooden table, soft morning light" \
+  --steps 40 --seed 42 --out out.png
 ```
 Features: `cuda`, `cudnn`, `flash-attn`. Default build is CPU-only (macOS-safe).
 
