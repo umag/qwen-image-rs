@@ -157,6 +157,27 @@ memory scales with tile², not image². `--vae-tile <N>` on generate/batch
 - Recommended resident invocation:
   `batch --resident --convrot --text-gguf <gguf> --vae-tile 32 ...`
 
+### CFG + step count (DONE)
+- **`--steps` was already a param** (generate/batch/denoise). Denoise is a flat
+  ~0.5 s/step: 25 steps ≈ 12.6 s denoise (~14.5 s/image resident+tile), 40 steps
+  ≈ 19.9 s (~21.7 s/image).
+- **True CFG (`--guidance <scale>` + `--negative <prompt>`)**: `guided_noise_pred`
+  in main.rs. guidance ≤ 1 = single forward (fast path, default 1.0); guidance >
+  1 encodes the negative once and runs the DiT twice per step, combining
+  `v = v_uncond + g·(v_cond − v_uncond)`. Validated: denoise 12.6 s → 24.9 s
+  (1.98× at 25 steps) — exactly the expected 2×; images coherent, stronger
+  adherence at g=4. The oracle used pipeline defaults (guidance≈1), which is why
+  the single-forward port matched it.
+
+### Reference: comfy-kitchen (Comfy-Org, Apache-2.0)
+Python/CUDA/HIP diffusion kernel lib: FP8/NVFP4/MXFP8/INT8 quant, attention,
+RoPE, **AdaLN/RMS-AdaLN**, GEMM. torch-coupled (QuantizedTensor subclass) so not
+drop-in — its .cu kernels would need the same vendor-and-strip-torch-FFI as
+SageAttention. Interesting future source for a **fused AdaLN/RMS-AdaLN** kernel
+(our DiT does norm+modulation as separate candle ops) or an alt attention.
+NVFP4/MXFP8/MXFP4 are Blackwell (sm120) — no use on Ada; our INT8 convrot+sage
+already cover the 4090 wins. No model impls, no ConvRot scheme.
+
 ### Future levers
 - **Faster resident encode** — the Q8 te forward dominates resident per-image
   time; cache dequantized bf16 weights once after load (trades VRAM), or use a
