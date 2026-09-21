@@ -230,7 +230,11 @@ impl ConvRotLinear {
             .to_dtype(candle_core::DType::F32)?
             .reshape(n)?;
         let w_i8 = wr.apply_op2(&inv, QuantizeRows)?; // (N,K) u8
-        Ok(Self { w_i8, col_scale, hadamard: r.clone() })
+        Ok(Self {
+            w_i8,
+            col_scale,
+            hadamard: r.clone(),
+        })
     }
 
     /// Build from already-rotated-and-quantized tensors (loaded from a
@@ -281,7 +285,9 @@ pub fn self_test_linear() -> Result<f32> {
     let r = crate::model::rotation::regular_hadamard_256(&dev)?;
     let cr = ConvRotLinear::from_weight(&w, &r)?;
     let y_int8 = cr.forward(&x)?.to_dtype(DType::F32)?;
-    let y_ref = x.to_dtype(DType::F32)?.matmul(&w.to_dtype(DType::F32)?.t()?)?;
+    let y_ref = x
+        .to_dtype(DType::F32)?
+        .matmul(&w.to_dtype(DType::F32)?.t()?)?;
     let dot = (&y_int8 * &y_ref)?.sum_all()?.to_scalar::<f32>()?;
     let na = y_int8.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
     let nb = y_ref.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
@@ -329,8 +335,16 @@ pub fn self_test() -> Result<i64> {
     let (m, n, k) = (64usize, 128usize, 256usize);
     let ai: Vec<i8> = (0..m * k).map(|i| ((i * 7) % 15) as i8 - 7).collect();
     let bi: Vec<i8> = (0..n * k).map(|i| ((i * 13) % 15) as i8 - 7).collect();
-    let a_u8 = Tensor::from_vec(ai.iter().map(|&v| v as u8).collect::<Vec<u8>>(), (m, k), &dev)?;
-    let b_u8 = Tensor::from_vec(bi.iter().map(|&v| v as u8).collect::<Vec<u8>>(), (n, k), &dev)?;
+    let a_u8 = Tensor::from_vec(
+        ai.iter().map(|&v| v as u8).collect::<Vec<u8>>(),
+        (m, k),
+        &dev,
+    )?;
+    let b_u8 = Tensor::from_vec(
+        bi.iter().map(|&v| v as u8).collect::<Vec<u8>>(),
+        (n, k),
+        &dev,
+    )?;
     let c: Vec<i32> = int8_gemm(&a_u8, &b_u8)?.flatten_all()?.to_vec1::<i32>()?;
 
     let mut maxdiff = 0i64;

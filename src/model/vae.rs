@@ -383,7 +383,12 @@ impl QwenImageVae {
     /// fits alongside co-resident models (fixes the resident-mode VAE thrash).
     /// `overlap` (latent) is blended with a linear feather to hide seams.
     /// Scale factor latent→image is 16.
-    pub fn decode_tiled(&self, z_normalized: &Tensor, tile: usize, overlap: usize) -> Result<Tensor> {
+    pub fn decode_tiled(
+        &self,
+        z_normalized: &Tensor,
+        tile: usize,
+        overlap: usize,
+    ) -> Result<Tensor> {
         let (b, _c, h, w) = z_normalized.dims4()?;
         if tile == 0 || (tile >= h && tile >= w) {
             return self.decode(z_normalized); // one tile — no benefit
@@ -410,7 +415,10 @@ impl QwenImageVae {
             let mut j = 0;
             loop {
                 let tw = tile.min(w - j);
-                let ztile = z_normalized.narrow(2, i, th)?.narrow(3, j, tw)?.contiguous()?;
+                let ztile = z_normalized
+                    .narrow(2, i, th)?
+                    .narrow(3, j, tw)?
+                    .contiguous()?;
                 let dec = self.decode(&ztile)?.to_dtype(DType::F32)?; // (b,4,th*S,tw*S)
                 let (pi, pj, pth, ptw) = (i * SCALE, j * SCALE, th * SCALE, tw * SCALE);
                 let wy = Tensor::from_vec(feather(pth), (1, 1, pth, 1), &dev)?;

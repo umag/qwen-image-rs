@@ -186,7 +186,7 @@ impl Attention {
         let out = out
             .transpose(1, 2)?
             .reshape((b, s, self.num_heads * self.head_dim))?;
-        Ok(self.o_proj.forward(&out)?)
+        self.o_proj.forward(&out)
     }
 }
 
@@ -209,7 +209,7 @@ impl Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let lhs = self.gate.forward(xs)?.apply(&Activation::Silu)?;
         let rhs = self.up.forward(xs)?;
-        Ok(self.down.forward(&(lhs * rhs)?)?)
+        self.down.forward(&(lhs * rhs)?)
     }
 }
 
@@ -292,11 +292,16 @@ impl QwenTextEncoder {
             .to_dtype(dt)?;
         let embed_tokens = Embedding::new(embed_w, cfg.hidden_size);
         let rope = RotaryEmbedding::new(cfg, &dev, dt)?;
-        let rms = |dim: usize, vb: &candle_transformers::quantized_var_builder::VarBuilder| -> Result<RmsNorm> {
+        let rms = |dim: usize,
+                   vb: &candle_transformers::quantized_var_builder::VarBuilder|
+         -> Result<RmsNorm> {
             let w = vb.get(dim, "weight")?.dequantize(&dev)?.to_dtype(dt)?;
             Ok(RmsNorm::new(w, cfg.rms_norm_eps))
         };
-        let qlin = |ic: usize, oc: usize, vb: &candle_transformers::quantized_var_builder::VarBuilder| -> Result<QLinear> {
+        let qlin = |ic: usize,
+                    oc: usize,
+                    vb: &candle_transformers::quantized_var_builder::VarBuilder|
+         -> Result<QLinear> {
             Ok(QLinear::Quant(candle_core::quantized::QMatMul::from_arc(
                 vb.get((oc, ic), "weight")?,
             )?))

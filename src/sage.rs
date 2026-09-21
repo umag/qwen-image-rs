@@ -151,7 +151,13 @@ impl candle_core::CustomOp3 for SageAttn {
 /// INT8-QK / FP16-PV attention. `q,k,v` are `(B, H, S, D)` bf16 on CUDA;
 /// `scale` is the softmax scale (1/sqrt(D)); `causal` selects the causal mask.
 /// Returns `(B, H, S, D)` bf16. D must be a multiple of 64.
-pub fn sage_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32, causal: bool) -> Result<Tensor> {
+pub fn sage_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
     let q = q.contiguous()?;
     let k = k.contiguous()?;
     let vf = v.to_dtype(DType::F16)?.contiguous()?;

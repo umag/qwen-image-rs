@@ -13,13 +13,13 @@
 
 #[cfg(feature = "convrot")]
 pub mod convrot;
-#[cfg(feature = "sage")]
-pub mod sage;
+pub mod device;
 #[cfg(feature = "fusednorm")]
 pub mod fusednorm;
-pub mod device;
 pub mod loader;
 pub mod model;
+#[cfg(feature = "sage")]
+pub mod sage;
 
 /// Crate result alias.
 pub type Result<T> = anyhow::Result<T>;

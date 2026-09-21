@@ -49,9 +49,9 @@ impl QLinear {
                         ));
                     }
                     let w = vb.get((out_c, in_c), "weight")?;
-                    return Ok(QLinear::Convrot(crate::convrot::ConvRotLinear::from_weight(
-                        &w, r,
-                    )?));
+                    return Ok(QLinear::Convrot(
+                        crate::convrot::ConvRotLinear::from_weight(&w, r)?,
+                    ));
                 }
             }
         }
@@ -261,7 +261,7 @@ impl Attention {
         let kh = candle_nn::rotary_emb::rope_i(&kh, cos, sin)?;
         let scale = 1.0 / (HEAD_DIM as f64).sqrt();
         let out = self.attend(&qh, &kh, &vv, mask, txt_len, scale)?; // (B,S,H,D)
-        Ok(self.to_out.forward(&out.reshape((b, s, INNER))?)?)
+        self.to_out.forward(&out.reshape((b, s, INNER))?)
     }
 
     /// With `sage`: same block-causal split as the flash path, but each half
@@ -293,7 +293,7 @@ impl Attention {
             sc,
             true,
         )?; // (B,H,txt,D)
-        // image queries: full non-causal attention over the whole sequence
+            // image queries: full non-causal attention over the whole sequence
         let qi = qh.narrow(2, txt_len, s - txt_len)?;
         let oi = crate::sage::sage_attention(&qi, kh, &vh, sc, false)?; // (B,H,s-txt,D)
         let out = Tensor::cat(&[ot, oi], 2)?; // (B,H,S,D)
@@ -373,7 +373,7 @@ impl SwiGlu {
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = silu(&self.gate.forward(x)?)?;
-        Ok(self.out.forward(&(g * self.proj.forward(x)?)?)?)
+        self.out.forward(&(g * self.proj.forward(x)?)?)
     }
 }
 
@@ -393,6 +393,7 @@ impl Block {
     }
 
     /// `mod1`/`mod2` are the per-token (1,S,2*INNER) selected modulation slices.
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         h: &Tensor,

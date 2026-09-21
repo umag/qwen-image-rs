@@ -251,8 +251,20 @@ fn main() -> Result<()> {
             negative,
             out_dir,
         } => batch(
-            &model, &prompts, size, steps, seed, quant, convrot, quant_text, resident,
-            text_gguf.as_deref(), vae_tile, guidance, &negative, &out_dir,
+            &model,
+            &prompts,
+            size,
+            steps,
+            seed,
+            quant,
+            convrot,
+            quant_text,
+            resident,
+            text_gguf.as_deref(),
+            vae_tile,
+            guidance,
+            &negative,
+            &out_dir,
         ),
         Command::Info { weights } => info(&weights),
         Command::Generate {
@@ -270,8 +282,19 @@ fn main() -> Result<()> {
             negative,
             out,
         } => generate(
-            &model, &prompt, size, steps, seed, quant, convrot, quant_text,
-            text_gguf.as_deref(), vae_tile, guidance, &negative, &out,
+            &model,
+            &prompt,
+            size,
+            steps,
+            seed,
+            quant,
+            convrot,
+            quant_text,
+            text_gguf.as_deref(),
+            vae_tile,
+            guidance,
+            &negative,
+            &out,
         ),
         Command::PrequantizeText { weights, out } => prequantize_text(&weights, &out),
         Command::PrequantizeConvrot { weights, out } => prequantize_convrot(&weights, &out),
@@ -324,7 +347,9 @@ fn guided_noise_pred(
 ) -> Result<Tensor> {
     let joint = dit.forward(latents_dt, cond, tt, hw, hw)?;
     let (_b, jl, _) = joint.dims3()?;
-    let v_cond = joint.narrow(1, jl - img_seq, img_seq)?.to_dtype(DType::F32)?;
+    let v_cond = joint
+        .narrow(1, jl - img_seq, img_seq)?
+        .to_dtype(DType::F32)?;
     if guidance > 1.0 {
         if let Some(neg) = neg {
             let ju = dit.forward(latents_dt, neg, tt, hw, hw)?;
@@ -405,7 +430,7 @@ fn generate(
 
     // 1. Text encoder -> prompt embeddings (+ negative, for CFG). Freed after.
     let (embeds, neg_embeds) = {
-        let te = load_text_encoder(model, &dev, dtype, quant_text, text_gguf.as_deref())?;
+        let te = load_text_encoder(model, &dev, dtype, quant_text, text_gguf)?;
         let encode = |p: &str| -> Result<Tensor> {
             let ids: Vec<u32> = tok
                 .encode(tmpl::t2i_template(p), false)
@@ -430,7 +455,13 @@ fn generate(
     let hw = size / 16; // vae spatial compression
     let img_seq = hw * hw;
     let latent = {
-        let dit = QwenImageDit::load(32, 64, quant, convrot, load_vb(model.join("transformer"), dtype)?)?;
+        let dit = QwenImageDit::load(
+            32,
+            64,
+            quant,
+            convrot,
+            load_vb(model.join("transformer"), dtype)?,
+        )?;
         dev.set_seed(seed)?;
         let mut latents =
             Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?.to_dtype(DType::F32)?;
@@ -560,9 +591,14 @@ fn batch(
     // 8B encoder + DiT + VAE stay under 24 GB. Amortizes the one-time loads
     // across every prompt (the batch/serve win).
     if resident {
-        let te = load_text_encoder(model, &dev, dtype, quant_text, text_gguf.as_deref())?;
-        let dit =
-            QwenImageDit::load(32, 64, quant, convrot, load_vb(model.join("transformer"), dtype)?)?;
+        let te = load_text_encoder(model, &dev, dtype, quant_text, text_gguf)?;
+        let dit = QwenImageDit::load(
+            32,
+            64,
+            quant,
+            convrot,
+            load_vb(model.join("transformer"), dtype)?,
+        )?;
         let vmodel = vae::QwenImageVae::load(
             &VaeConfig::default(),
             &vae_cfg("latents_mean")?,
@@ -631,7 +667,13 @@ fn batch(
             dev.synchronize()?;
             let dec_ms = t_dec.elapsed().as_millis();
             save_png(&img, out_dir.join(format!("{i:03}.png")))?;
-            tracing::info!(image = i, enc_ms, denoise_ms = dn_ms, decode_ms = dec_ms, "done (resident)");
+            tracing::info!(
+                image = i,
+                enc_ms,
+                denoise_ms = dn_ms,
+                decode_ms = dec_ms,
+                "done (resident)"
+            );
         }
         println!(
             "wrote {} images to {} (resident)",
@@ -646,7 +688,7 @@ fn batch(
     let mut embeds_list = Vec::with_capacity(prompts.len());
     let mut neg_embeds = None;
     {
-        let te = load_text_encoder(model, &dev, dtype, quant_text, text_gguf.as_deref())?;
+        let te = load_text_encoder(model, &dev, dtype, quant_text, text_gguf)?;
         let encode = |p: &str| -> Result<Tensor> {
             let ids: Vec<u32> = tok
                 .encode(tmpl::t2i_template(p), false)
@@ -669,7 +711,13 @@ fn batch(
     // Phase 2: denoise every prompt (DiT loaded once, then freed).
     let mut latents_list = Vec::with_capacity(prompts.len());
     {
-        let dit = QwenImageDit::load(32, 64, quant, convrot, load_vb(model.join("transformer"), dtype)?)?;
+        let dit = QwenImageDit::load(
+            32,
+            64,
+            quant,
+            convrot,
+            load_vb(model.join("transformer"), dtype)?,
+        )?;
         let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
         for (i, emb) in embeds_list.iter().enumerate() {
             dev.set_seed(seed + i as u64)?;
@@ -969,11 +1017,15 @@ fn convrot_test() -> Result<()> {
             }
         );
         let cos = qwen_image_rs::convrot::self_test_linear()?;
-        println!("convrot INT8 linear vs bf16: cosine = {cos:.5} ({})",
-            if cos > 0.99 { "OK" } else { "TOO LOW" });
+        println!(
+            "convrot INT8 linear vs bf16: cosine = {cos:.5} ({})",
+            if cos > 0.99 { "OK" } else { "TOO LOW" }
+        );
         let (cr_ms, bf_ms) = qwen_image_rs::convrot::bench_linear(50)?;
-        println!("MLP-shape timing: convrot {cr_ms:.3} ms vs bf16 {bf_ms:.3} ms ({:.2}x)",
-            bf_ms / cr_ms);
+        println!(
+            "MLP-shape timing: convrot {cr_ms:.3} ms vs bf16 {bf_ms:.3} ms ({:.2}x)",
+            bf_ms / cr_ms
+        );
         Ok(())
     }
     #[cfg(not(feature = "convrot"))]
