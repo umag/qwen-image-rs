@@ -31,6 +31,11 @@ end-to-end before any optimization**; **GGUF supported alongside safetensors**;
 
 - **DiT + full pipeline validated** (candle vs oracle): single DiT forward cosine **0.99996** (MSE 2.7e-4); 32-layer MMDiT with complex 3-axis RoPE (via `rope_i`), block-causal attention (`allowed=(j≤i)∨both-image`), `causal_condition` modulation (image tokens use t, text t=0), ZeroCenterRMSNorm. FlowMatchEuler: sigmas linspace(1,1/N,N) → exp shift by `mu` → stretch to terminal 0.02 → Euler `x+=Δσ·v`. **End-to-end: 40-step denoise → latent cosine 0.9977 → VAE → image PSNR 30.85 dB vs oracle** (bf16 drift over 40 steps). First fully-Rust image: `docs/first_generated.png`. CLI: `dit-forward`, `denoise`.
 
+## Phase 5 progress
+- **Profiled** (`bench`): DiT is **attention-bound** — per layer attn 11.6ms (49%) > MLP 8.3ms (35%) > proj 3.6ms (16%). candle's naive attn materializes the ~1GB (32,4117,4117) S² matrix → memory-bound, dominates despite ~7% of FLOPs. So flash/sage > FP8-first (corrects the FLOP intuition).
+- **✅ FlashAttention-2** (`--features flash-attn`, candle-flash-attn 0.11, compiled clean on CUDA 13.3 in 19min): image queries → full flash over the joint seq, text prefix → causal flash (= the block-causal structure, no S² matrix). **1.15→0.62 s/step (~1.85×); 40-step denoise 46→25s; generate ~69→~48s.** Also MORE accurate: DiT 0.99996→0.99998, final latent 0.9977→**0.9998** (flash accumulates in fp32, less bf16 drift). Naive masked path kept for CPU/default build.
+- Next: FP8/GGUF on the MLP (the 8.3ms/layer); then SageAttention INT8 (FFI) for a further attention cut; prefix KV cache helps most with condition images.
+
 ## Phase 5 optimization order (4090-specific)
 1. **FP8 e4m3fn** weight-only on DiT + text-encoder linears (native Ada FP8 TC).
 2. **SageAttention INT8** QK (~2.1x over FA2 on 4090). FFI the upstream `.cu`; do not rewrite.
