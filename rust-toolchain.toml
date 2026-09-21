@@ -1,0 +1,6 @@
+# candle builds on stable. The host is kept on the latest stable via
+# `rustup update stable` (see scripts/setup-host.sh). No pinned nightly is
+# needed — unlike iris-rs, candle does not use cuda-oxide.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

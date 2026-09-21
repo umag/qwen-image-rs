@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+# The repo is scp'd to the GPU host on every build; target/ must never exist
+# in-tree (out-of-tree CARGO_TARGET_DIR — see scripts/check.sh).
+# Model weights and generated artifacts are never committed.
+/weights/
+/oracle_out/
+/out/
+*.safetensors
+*.gguf
+*.ckpt
+*.pt
+*.png
+!docs/**/*.png
+.venv/
+__pycache__/
+*.pyc
