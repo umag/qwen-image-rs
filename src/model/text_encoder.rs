@@ -290,3 +290,37 @@ pub fn cosine(a: &Tensor, b: &Tensor) -> Result<f32> {
     let nb = b.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
     Ok(dot / (na * nb + 1e-8))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_has_roles() {
+        let t = prompt::t2i_template("a cat");
+        assert!(t.contains("<|im_start|>system\nComprehend and analyze"));
+        assert!(t.contains("<|im_start|>user\na cat<|im_end|>"));
+        assert!(t.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn empty_prompt_becomes_space() {
+        assert!(prompt::t2i_template("").contains("user\n <|im_end|>"));
+    }
+
+    #[test]
+    fn repeat_kv_expands_heads() -> Result<()> {
+        let dev = Device::Cpu;
+        let x = Tensor::zeros((1, 8, 5, 128), DType::F32, &dev)?;
+        assert_eq!(repeat_kv(x, 4)?.dims(), &[1, 32, 5, 128]);
+        Ok(())
+    }
+
+    #[test]
+    fn cosine_identical_is_one() -> Result<()> {
+        let dev = Device::Cpu;
+        let a = Tensor::from_slice(&[1f32, 2., 3., 4.], (2, 2), &dev)?;
+        assert!((cosine(&a, &a)? - 1.0).abs() < 1e-5);
+        Ok(())
+    }
+}
