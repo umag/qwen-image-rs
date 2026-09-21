@@ -378,18 +378,18 @@ impl QwenImageVae {
     }
 }
 
-/// Unpack the pipeline's packed latent `(B, seq, z*4)` into `(B, z, H, W)`.
-/// Mirrors `QwenImagePipeline._unpack_latents` at T=1: `H = W = sqrt(seq)*2`.
-pub fn unpack_latents(packed: &Tensor, z_dim: usize) -> Result<Tensor> {
-    let (b, seq, cp) = packed.dims3()?;
-    let hw2 = (seq as f64).sqrt() as usize; // H/2 == W/2
-    debug_assert_eq!(hw2 * hw2, seq, "non-square latent");
-    debug_assert_eq!(cp, z_dim * 4);
-    // view (B, H/2, W/2, z, 2, 2)
-    let x = packed.reshape((b, hw2, hw2, z_dim, 2, 2))?;
-    // permute (0,3,1,4,2,5) -> (B, z, H/2, 2, W/2, 2)
-    let x = x.permute((0, 3, 1, 4, 2, 5))?.contiguous()?;
-    Ok(x.reshape((b, z_dim, hw2 * 2, hw2 * 2))?)
+/// Unpack the 2.1 pipeline's token latent `(B, seq, C)` into `(B, C, H, W)`.
+/// Mirrors `QwenImage21Pipeline._unpack_latents`: `transpose(1,2).reshape(B,C,H,W)`
+/// with `H = W = sqrt(seq)`.
+pub fn unpack_latents(packed: &Tensor, _z_dim: usize) -> Result<Tensor> {
+    let (b, seq, c) = packed.dims3()?;
+    let hw = (seq as f64).sqrt() as usize;
+    debug_assert_eq!(hw * hw, seq, "non-square latent");
+    let x = packed
+        .transpose(1, 2)?
+        .contiguous()?
+        .reshape((b, c, hw, hw))?;
+    Ok(x)
 }
 
 /// Convert a decoded `(B, 4, H, W)` image in [-1,1] to u8 RGBA bytes (row-major,
