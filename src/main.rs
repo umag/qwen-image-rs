@@ -677,6 +677,9 @@ fn convrot_test() -> Result<()> {
         let cos = qwen_image_rs::convrot::self_test_linear()?;
         println!("convrot INT8 linear vs bf16: cosine = {cos:.5} ({})",
             if cos > 0.99 { "OK" } else { "TOO LOW" });
+        let (cr_ms, bf_ms) = qwen_image_rs::convrot::bench_linear(50)?;
+        println!("MLP-shape timing: convrot {cr_ms:.3} ms vs bf16 {bf_ms:.3} ms ({:.2}x)",
+            bf_ms / cr_ms);
         Ok(())
     }
     #[cfg(not(feature = "convrot"))]

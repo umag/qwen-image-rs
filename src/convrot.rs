@@ -273,6 +273,38 @@ pub fn self_test_linear() -> Result<f32> {
     Ok(dot / (na * nb + 1e-8))
 }
 
+/// Time ConvRot INT8 vs bf16 at the DiT MLP shape (M=4117, K=4096, N=12288).
+/// Returns (convrot_ms, bf16_ms) per forward.
+pub fn bench_linear(iters: usize) -> Result<(f64, f64)> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let (m, n, k) = (4117usize, 12288usize, 4096usize);
+    let w = Tensor::randn(0f32, 1f32, (n, k), &dev)?.to_dtype(DType::BF16)?;
+    let x = Tensor::randn(0f32, 1f32, (m, k), &dev)?.to_dtype(DType::BF16)?;
+    let r = crate::model::rotation::regular_hadamard_256(&dev)?;
+    let cr = ConvRotLinear::from_weight(&w, &r)?;
+    let wt = w.t()?.contiguous()?;
+    let time = |f: &dyn Fn() -> Result<()>| -> Result<f64> {
+        f()?;
+        dev.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            f()?;
+        }
+        dev.synchronize()?;
+        Ok(t0.elapsed().as_secs_f64() * 1e3 / iters as f64)
+    };
+    let convrot_ms = time(&|| {
+        cr.forward(&x)?;
+        Ok(())
+    })?;
+    let bf16_ms = time(&|| {
+        x.matmul(&wt)?;
+        Ok(())
+    })?;
+    Ok((convrot_ms, bf16_ms))
+}
+
 /// End-to-end bridge self-test: candle U8(int8) tensors -> kernel -> candle I32,
 /// compared to a CPU int reference. Only the kernel runs on the GPU (host-side
 /// compare avoids needing candle cast kernels). Returns the max abs difference.
