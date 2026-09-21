@@ -105,6 +105,14 @@ extern "C" {
         n: i32,
         stream: *mut std::ffi::c_void,
     );
+    fn quantize_rows_fused_launch(
+        out: *mut u8,
+        x: *const std::ffi::c_void,
+        row_scale: *mut f32,
+        m: i32,
+        k: i32,
+        stream: *mut std::ffi::c_void,
+    );
 }
 
 /// Per-row INT8 quantize: `x (M,K) bf16`, `inv_scale (M,) f32` -> `u8 (M,K)` int8.
@@ -152,6 +160,67 @@ impl candle_core::CustomOp2 for QuantizeRows {
         }
         Ok((CudaStorage::wrap_cuda_slice(out, dev), (m, k).into()))
     }
+}
+
+/// Fused per-row activation quantize: `x (M,K) bf16` -> int8 `u8 (M,K)`, while
+/// writing the per-row scale (amax/127) IN PLACE into the pre-allocated
+/// `row_scale (M,) f32` second input. One CTA-per-row kernel does the
+/// `max(|x|)` reduction and the quantize in a single pass, replacing candle's
+/// abs + max_keepdim + recip. The in-place write is safe: `row_scale` is a
+/// fresh zeros buffer used only after this op, no aliasing, no autograd.
+struct QuantizeFused;
+impl candle_core::CustomOp2 for QuantizeFused {
+    fn name(&self) -> &'static str {
+        "quantize-rows-fused"
+    }
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda-only")
+    }
+    fn cuda_fwd(
+        &self,
+        x: &CudaStorage,
+        x_l: &Layout,
+        rs: &CudaStorage,
+        _rs_l: &Layout,
+    ) -> candle_core::Result<(CudaStorage, Shape)> {
+        let dev = x.device().clone();
+        let (m, k) = x_l.shape().dims2()?;
+        let x = x.as_cuda_slice::<half::bf16>()?;
+        let rs = rs.as_cuda_slice::<f32>()?; // pre-allocated (m,), written in place
+        let stream = dev.cuda_stream();
+        let out = unsafe { dev.alloc::<u8>(m * k)? };
+        {
+            let (xp, _a) = x.device_ptr(&stream);
+            let (rp, _b) = rs.device_ptr(&stream);
+            let (op, _c) = out.device_ptr(&stream);
+            unsafe {
+                quantize_rows_fused_launch(
+                    op as *mut u8,
+                    xp as *const std::ffi::c_void,
+                    rp as *mut f32,
+                    m as i32,
+                    k as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                );
+            }
+        }
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), (m, k).into()))
+    }
+}
+
+/// Fused activation quantize: `x (M,K) bf16` -> (`int8 (M,K) u8`, `row_scale (M,) f32`)
+/// in one kernel pass. `row_scale[m] = max(|x[m,:]|)/127`.
+fn quantize_rows_fused(x: &Tensor) -> Result<(Tensor, Tensor)> {
+    let (m, _k) = x.dims2()?;
+    let row_scale = Tensor::zeros(m, candle_core::DType::F32, x.device())?;
+    let x_i8 = x.apply_op2(&row_scale, QuantizeFused)?;
+    Ok((x_i8, row_scale))
 }
 
 /// Dequant: `c (M,N) i32`, `row_scale (M,)`, `col_scale (N,)` -> `bf16 (M,N)`.
@@ -260,12 +329,9 @@ impl ConvRotLinear {
         let m: usize = dims[..dims.len() - 1].iter().product();
         let x2 = x.reshape((m, k))?;
         let xr = crate::model::rotation::rotate(&x2, &self.hadamard)?; // (M,K) bf16
-        let amax = xr.abs()?.max_keepdim(D::Minus1)?; // (M,1)
-        let row_scale = (amax.to_dtype(candle_core::DType::F32)? / 127.0)?.reshape(m)?;
-        let inv = (amax.recip()? * 127.0)?
-            .to_dtype(candle_core::DType::F32)?
-            .reshape(m)?;
-        let x_i8 = xr.apply_op2(&inv, QuantizeRows)?; // (M,K) u8
+        // Fused amax + int8 quantize in one kernel pass (was: abs + max_keepdim
+        // + recip + QuantizeRows).
+        let (x_i8, row_scale) = quantize_rows_fused(&xr)?; // (M,K) u8 + (M,) f32
         let c = int8_gemm(&x_i8, &self.w_i8)?; // (M,N) i32
         let n = self.col_scale.dim(0)?;
         let out = c.apply_op3(&row_scale, &self.col_scale, Dequant)?; // (M,N) bf16
