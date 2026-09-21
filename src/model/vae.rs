@@ -1,28 +1,409 @@
-//! `AutoencoderKLQwenImage21` — 64-channel RGBA latent, 16x spatial
-//! compression, native transparency. **Phase 2** (first component ported;
-//! smallest, self-contained). Decode path validated against oracle latents
-//! before the encoder/DiT land.
+//! `AutoencoderKLQwenImage21` decoder, ported to candle. Decode-only (encode
+//! not needed for text-to-image). See docs/PHASES.md Phase 2.
 //!
-//! TODO(phase-2): port decoder blocks, match oracle `latents -> RGBA image`.
+//! The 2.1 VAE is a Wan-derived autoencoder specialized for images: its
+//! `QwenImage21CausalConv3d` subclasses `nn.Conv2d` and folds the single frame
+//! away (`squeeze(2) -> conv2d -> unsqueeze(2)`), so **every conv here is 2D**
+//! and candle's lack of conv3d is irrelevant. At T=1 the temporal cache is
+//! never populated and the temporal upsampling collapses to spatial-only, so
+//! the whole decode is a 2D convnet.
+//!
+//! Decode path (matches diffusers `_decode`, `first_chunk=True`, `feat_cache`
+//! all-None): unpack packed latent -> `z*std + mean` (per channel) ->
+//! `post_quant_conv` (1x1) -> `Decoder3d` -> clamp[-1,1].
+
+use candle_core::{DType, Tensor, D};
+use candle_nn::{conv2d, Conv2d, Conv2dConfig, Module, VarBuilder};
 
 use crate::model::config::VaeConfig;
+use crate::Result;
 
-/// RGBA VAE. Not yet implemented — see docs/PHASES.md, Phase 2.
-#[allow(dead_code)]
+fn silu(x: &Tensor) -> Result<Tensor> {
+    Ok(candle_nn::ops::silu(x)?)
+}
+
+/// `QwenImage21RMS_norm` over the channel dim of a `(B, C, H, W)` tensor.
+/// Replicates `F.normalize(x, dim=1) * sqrt(C) * gamma` (RMS norm; eps 1e-12).
+struct RmsNorm {
+    gamma: Tensor, // (1, C, 1, 1)
+    scale: f64,    // sqrt(C)
+}
+
+impl RmsNorm {
+    fn load(c: usize, images: bool, vb: VarBuilder) -> Result<Self> {
+        // gamma is stored (C,1,1) for images=True, (C,1,1,1) for images=False.
+        let gamma = if images {
+            vb.get((c, 1, 1), "gamma")?
+        } else {
+            vb.get((c, 1, 1, 1), "gamma")?
+        };
+        let gamma = gamma.reshape((1, c, 1, 1))?;
+        Ok(Self {
+            gamma,
+            scale: (c as f64).sqrt(),
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // F.normalize: x / max(||x||_2 over C, 1e-12)
+        let norm = x
+            .sqr()?
+            .sum_keepdim(1)?
+            .sqrt()?
+            .clamp(1e-12, f64::INFINITY)?;
+        let normalized = x.broadcast_div(&norm)?;
+        let scaled = (normalized * self.scale)?;
+        Ok(scaled.broadcast_mul(&self.gamma)?)
+    }
+}
+
+fn conv2d_k3(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
+    let cfg = Conv2dConfig {
+        padding: 1,
+        ..Default::default()
+    };
+    Ok(conv2d(in_c, out_c, 3, cfg, vb)?)
+}
+
+fn conv2d_k1(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
+    Ok(conv2d(in_c, out_c, 1, Conv2dConfig::default(), vb)?)
+}
+
+/// `QwenImage21ResidualBlock`: norm1->silu->conv1(k3)->norm2->silu->conv2(k3) + shortcut.
+struct ResidualBlock {
+    norm1: RmsNorm,
+    conv1: Conv2d,
+    norm2: RmsNorm,
+    conv2: Conv2d,
+    shortcut: Option<Conv2d>,
+}
+
+impl ResidualBlock {
+    fn load(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
+        let shortcut = if in_c != out_c {
+            Some(conv2d_k1(in_c, out_c, vb.pp("conv_shortcut"))?)
+        } else {
+            None
+        };
+        Ok(Self {
+            norm1: RmsNorm::load(in_c, false, vb.pp("norm1"))?,
+            conv1: conv2d_k3(in_c, out_c, vb.pp("conv1"))?,
+            norm2: RmsNorm::load(out_c, false, vb.pp("norm2"))?,
+            conv2: conv2d_k3(out_c, out_c, vb.pp("conv2"))?,
+            shortcut,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let h = match &self.shortcut {
+            Some(sc) => sc.forward(x)?,
+            None => x.clone(),
+        };
+        let x = self.norm1.forward(x)?;
+        let x = silu(&x)?;
+        let x = self.conv1.forward(&x)?;
+        let x = self.norm2.forward(&x)?;
+        let x = silu(&x)?;
+        let x = self.conv2.forward(&x)?;
+        Ok((x + h)?)
+    }
+}
+
+/// `QwenImage21AttentionBlock`: single-head self-attention over HW tokens.
+struct AttentionBlock {
+    norm: RmsNorm,
+    to_qkv: Conv2d,
+    proj: Conv2d,
+    dim: usize,
+}
+
+impl AttentionBlock {
+    fn load(dim: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            norm: RmsNorm::load(dim, true, vb.pp("norm"))?,
+            to_qkv: conv2d_k1(dim, dim * 3, vb.pp("to_qkv"))?,
+            proj: conv2d_k1(dim, dim, vb.pp("proj"))?,
+            dim,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let identity = x;
+        let (b, c, h, w) = x.dims4()?;
+        let xn = self.norm.forward(x)?;
+        let qkv = self.to_qkv.forward(&xn)?; // (B, 3C, H, W)
+                                             // (B, 3C, HW) -> (B, HW, 3C) -> chunk on last
+        let qkv = qkv.reshape((b, 3 * c, h * w))?.transpose(1, 2)?; // (B, HW, 3C)
+        let q = qkv.narrow(2, 0, c)?.contiguous()?;
+        let k = qkv.narrow(2, c, c)?.contiguous()?;
+        let v = qkv.narrow(2, 2 * c, c)?.contiguous()?;
+        // scaled dot-product attention, single head, scale 1/sqrt(C)
+        let scale = 1.0 / (self.dim as f64).sqrt();
+        let scores = (q.matmul(&k.transpose(1, 2)?)? * scale)?; // (B, HW, HW)
+        let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
+        let out = attn.matmul(&v)?; // (B, HW, C)
+        let out = out.transpose(1, 2)?.reshape((b, c, h, w))?; // (B, C, H, W)
+        let out = self.proj.forward(&out)?;
+        Ok((out + identity)?)
+    }
+}
+
+/// `QwenImage21MidBlock`: resnet -> attn -> resnet.
+struct MidBlock {
+    resnet0: ResidualBlock,
+    attn: AttentionBlock,
+    resnet1: ResidualBlock,
+}
+
+impl MidBlock {
+    fn load(dim: usize, vb: VarBuilder) -> Result<Self> {
+        let resnets = vb.pp("resnets");
+        Ok(Self {
+            resnet0: ResidualBlock::load(dim, dim, resnets.pp("0"))?,
+            attn: AttentionBlock::load(dim, vb.pp("attentions").pp("0"))?,
+            resnet1: ResidualBlock::load(dim, dim, resnets.pp("1"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = self.resnet0.forward(x)?;
+        let x = self.attn.forward(&x)?;
+        self.resnet1.forward(&x)
+    }
+}
+
+/// Nearest-exact 2x upsample (== nearest for integer scale) + conv2d(k3).
+/// The learned resample conv of `QwenImage21Resample` (upsample2d/3d at T=1).
+struct Upsampler {
+    conv: Conv2d,
+}
+
+impl Upsampler {
+    fn load(dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
+        // Sequential(Upsample[0], Conv2d[1]) -> weights under "resample.1".
+        Ok(Self {
+            conv: conv2d_k3(dim, out_dim, vb.pp("resample").pp("1"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (_, _, h, w) = x.dims4()?;
+        let up = x.upsample_nearest2d(h * 2, w * 2)?;
+        Ok(self.conv.forward(&up)?)
+    }
+}
+
+/// `QwenImage21DupUp3D` at T=1, `first_chunk=True`: parameter-free 2x spatial
+/// upsample that maps `in_c -> out_c` via channel repeat + pixel rearrange.
+fn dup_up(x: &Tensor, in_c: usize, out_c: usize, factor_t: usize) -> Result<Tensor> {
+    let factor = factor_t * 4; // fs*fs = 4
+    let repeats = out_c * factor / in_c;
+    let (b, _, h, w) = x.dims4()?;
+    // repeat_interleave over channels by `repeats` -> (B, out*factor, H, W)
+    let x = x
+        .reshape((b, in_c, 1, h, w))?
+        .broadcast_as((b, in_c, repeats, h, w))?
+        .contiguous()?
+        .reshape((b, in_c * repeats, h, w))?;
+    // Channel nesting is [out][factor_t][fs*fs]. Split, pick the kept temporal
+    // block (index factor_t-1, == first_chunk), then depth-to-space by 2.
+    let x = x.reshape((b, out_c, factor_t, 4, h, w))?; // 6-D
+    let x = x.narrow(2, factor_t - 1, 1)?; // (B, out, 1, 4, H, W)
+    let x = x.reshape((b, out_c, 2, 2, h, w))?; // fs, fs, H, W
+                                                // permute (B,out,fs_i,fs_j,H,W) -> (B,out,H,fs_i,W,fs_j)
+    let x = x.permute((0, 1, 4, 2, 5, 3))?.contiguous()?;
+    Ok(x.reshape((b, out_c, h * 2, w * 2))?)
+}
+
+/// `QwenImage21ResidualUpBlock`: (num_res_blocks+1) resnets, optional learned
+/// upsampler, optional param-free DupUp residual shortcut.
+struct ResidualUpBlock {
+    resnets: Vec<ResidualBlock>,
+    upsampler: Option<Upsampler>,
+    shortcut: Option<(usize, usize, usize)>, // (in_c, out_c, factor_t)
+}
+
+impl ResidualUpBlock {
+    #[allow(clippy::too_many_arguments)]
+    fn load(
+        in_c: usize,
+        out_c: usize,
+        num_res_blocks: usize,
+        up_flag: bool,
+        temporal_upsample: bool,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let rvb = vb.pp("resnets");
+        let mut resnets = Vec::new();
+        let mut cur = in_c;
+        for j in 0..num_res_blocks + 1 {
+            resnets.push(ResidualBlock::load(cur, out_c, rvb.pp(j.to_string()))?);
+            cur = out_c;
+        }
+        let (upsampler, shortcut) = if up_flag {
+            let up = Upsampler::load(out_c, out_c, vb.pp("upsampler"))?;
+            let factor_t = if temporal_upsample { 2 } else { 1 };
+            (Some(up), Some((in_c, out_c, factor_t)))
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            resnets,
+            upsampler,
+            shortcut,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x_copy = x.clone();
+        let mut x = x.clone();
+        for r in &self.resnets {
+            x = r.forward(&x)?;
+        }
+        if let Some(up) = &self.upsampler {
+            x = up.forward(&x)?;
+        }
+        if let Some((in_c, out_c, factor_t)) = self.shortcut {
+            let sc = dup_up(&x_copy, in_c, out_c, factor_t)?;
+            x = (x + sc)?;
+        }
+        Ok(x)
+    }
+}
+
+/// `QwenImage21Decoder3d`.
+struct Decoder3d {
+    conv_in: Conv2d,
+    mid_block: MidBlock,
+    up_blocks: Vec<ResidualUpBlock>,
+    norm_out: RmsNorm,
+    conv_out: Conv2d,
+}
+
+impl Decoder3d {
+    fn load(cfg: &VaeConfig, vb: VarBuilder) -> Result<Self> {
+        let dim = 144usize; // decoder_base_dim
+        let z = cfg.latent_channels; // 64
+        let out_c = cfg.in_channels; // 4 (RGBA)
+        let dim_mult = &cfg.dim_mult; // [1,2,4,8,8]
+        let num_res_blocks = 2usize;
+        // temperal_upsample = reversed(temperal_downsample=[F,T,T,T]) = [T,T,T,F]
+        let temporal_upsample = [true, true, true, false];
+
+        // dims = [dim*u for u in [dim_mult[-1]] + reversed(dim_mult)]
+        let mut mult = vec![*dim_mult.last().unwrap()];
+        mult.extend(dim_mult.iter().rev().copied());
+        let dims: Vec<usize> = mult.iter().map(|u| dim * u).collect();
+
+        let conv_in = conv2d_k3(z, dims[0], vb.pp("conv_in"))?;
+        let mid_block = MidBlock::load(dims[0], vb.pp("mid_block"))?;
+
+        let mut up_blocks = Vec::new();
+        let upvb = vb.pp("up_blocks");
+        for i in 0..dims.len() - 1 {
+            let in_c = dims[i];
+            let out_c = dims[i + 1];
+            let up_flag = i != dim_mult.len() - 1;
+            let tu = if up_flag { temporal_upsample[i] } else { false };
+            up_blocks.push(ResidualUpBlock::load(
+                in_c,
+                out_c,
+                num_res_blocks,
+                up_flag,
+                tu,
+                upvb.pp(i.to_string()),
+            )?);
+        }
+        let last = *dims.last().unwrap();
+        Ok(Self {
+            conv_in,
+            mid_block,
+            up_blocks,
+            norm_out: RmsNorm::load(last, false, vb.pp("norm_out"))?,
+            conv_out: conv2d_k3(last, out_c, vb.pp("conv_out"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut x = self.conv_in.forward(x)?;
+        x = self.mid_block.forward(&x)?;
+        for up in &self.up_blocks {
+            x = up.forward(&x)?;
+        }
+        x = self.norm_out.forward(&x)?;
+        x = silu(&x)?;
+        Ok(self.conv_out.forward(&x)?)
+    }
+}
+
+/// The decode half of `AutoencoderKLQwenImage21`.
 pub struct QwenImageVae {
-    config: VaeConfig,
+    post_quant_conv: Conv2d,
+    decoder: Decoder3d,
+    latents_mean: Tensor, // (1, z, 1, 1)
+    latents_std: Tensor,  // (1, z, 1, 1)
 }
 
 impl QwenImageVae {
-    /// Placeholder constructor; real loader lands in Phase 2.
-    #[allow(dead_code)]
-    pub fn new(config: VaeConfig) -> Self {
-        Self { config }
+    /// Load the decoder + post_quant_conv from a diffusers VarBuilder rooted at
+    /// the vae, plus the per-channel latents_mean/std from config.
+    pub fn load(
+        cfg: &VaeConfig,
+        latents_mean: &[f32],
+        latents_std: &[f32],
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let z = cfg.latent_channels;
+        let dev = vb.device().clone();
+        let mean = Tensor::from_slice(latents_mean, (1, z, 1, 1), &dev)?;
+        let std = Tensor::from_slice(latents_std, (1, z, 1, 1), &dev)?;
+        Ok(Self {
+            post_quant_conv: conv2d_k1(z, z, vb.pp("post_quant_conv"))?,
+            decoder: Decoder3d::load(cfg, vb.pp("decoder"))?,
+            latents_mean: mean,
+            latents_std: std,
+        })
     }
 
-    /// Latent channels this VAE decodes from.
-    #[allow(dead_code)]
-    pub fn latent_channels(&self) -> usize {
-        self.config.latent_channels
+    /// Decode an already-unpacked, normalized latent `(B, z, H, W)` into an RGBA
+    /// image `(B, 4, H*16, W*16)` in [-1, 1] (pre postprocess).
+    pub fn decode(&self, z_normalized: &Tensor) -> Result<Tensor> {
+        // unnormalize: z = z_norm * std + mean  (diffusers stores latents_std as 1/std)
+        let z = z_normalized
+            .broadcast_mul(&self.latents_std)?
+            .broadcast_add(&self.latents_mean)?;
+        let x = self.post_quant_conv.forward(&z)?;
+        let out = self.decoder.forward(&x)?;
+        Ok(out.clamp(-1.0, 1.0)?)
     }
 }
+
+/// Unpack the pipeline's packed latent `(B, seq, z*4)` into `(B, z, H, W)`.
+/// Mirrors `QwenImagePipeline._unpack_latents` at T=1: `H = W = sqrt(seq)*2`.
+pub fn unpack_latents(packed: &Tensor, z_dim: usize) -> Result<Tensor> {
+    let (b, seq, cp) = packed.dims3()?;
+    let hw2 = (seq as f64).sqrt() as usize; // H/2 == W/2
+    debug_assert_eq!(hw2 * hw2, seq, "non-square latent");
+    debug_assert_eq!(cp, z_dim * 4);
+    // view (B, H/2, W/2, z, 2, 2)
+    let x = packed.reshape((b, hw2, hw2, z_dim, 2, 2))?;
+    // permute (0,3,1,4,2,5) -> (B, z, H/2, 2, W/2, 2)
+    let x = x.permute((0, 3, 1, 4, 2, 5))?.contiguous()?;
+    Ok(x.reshape((b, z_dim, hw2 * 2, hw2 * 2))?)
+}
+
+/// Convert a decoded `(B, 4, H, W)` image in [-1,1] to u8 RGBA bytes (row-major,
+/// HWC) for the first batch item.
+pub fn to_rgba_u8(img: &Tensor) -> Result<(usize, usize, Vec<u8>)> {
+    let img = ((img.clamp(-1.0, 1.0)? + 1.0)? * 0.5)?; // [0,1]
+    let img = img.clamp(0.0, 1.0)?.to_dtype(DType::F32)?;
+    let (_, c, h, w) = img.dims4()?;
+    // (1,C,H,W) -> (H,W,C)
+    let hwc = img.i(0)?.permute((1, 2, 0))?.contiguous()?;
+    let data = (hwc * 255.0)?.round()?.to_dtype(DType::U8)?;
+    let bytes = data.flatten_all()?.to_vec1::<u8>()?;
+    debug_assert_eq!(c, 4);
+    Ok((w, h, bytes))
+}
+
+use candle_core::IndexOp;

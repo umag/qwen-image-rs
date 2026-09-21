@@ -36,6 +36,18 @@ enum Command {
         #[arg(long)]
         prompt: String,
     },
+    /// Decode a saved latent (.pt) through the VAE to an RGBA PNG (Phase 2).
+    VaeDecode {
+        /// The vae/ directory (holds config.json + *.safetensors).
+        #[arg(long)]
+        weights: std::path::PathBuf,
+        /// A packed latent saved by scripts/oracle.py (`*.latent.pt`).
+        #[arg(long)]
+        latent: std::path::PathBuf,
+        /// Output PNG path.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -51,7 +63,76 @@ fn main() -> Result<()> {
         Command::Generate { .. } => {
             anyhow::bail!("`generate` lands in Phase 4 (DiT + scheduler). See docs/PHASES.md.")
         }
+        Command::VaeDecode {
+            weights,
+            latent,
+            out,
+        } => vae_decode(&weights, &latent, &out),
     }
+}
+
+/// Phase 2: load the VAE decoder, decode a saved packed latent, save RGBA PNG.
+fn vae_decode(
+    weights: &std::path::Path,
+    latent: &std::path::Path,
+    out: &std::path::Path,
+) -> Result<()> {
+    use qwen_image_rs::model::{config::VaeConfig, vae};
+
+    let dev = device::best_device()?;
+    tracing::info!(device = device::label(&dev), "vae-decode");
+
+    // Read vae/config.json for latents_mean/std and shape params.
+    let cfg_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(weights.join("config.json"))?)
+            .context("parsing vae config.json")?;
+    let f32vec = |k: &str| -> Result<Vec<f32>> {
+        Ok(cfg_json[k]
+            .as_array()
+            .with_context(|| format!("config.{k} not an array"))?
+            .iter()
+            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+            .collect())
+    };
+    let latents_mean = f32vec("latents_mean")?;
+    let latents_std = f32vec("latents_std")?;
+    let cfg = VaeConfig::default();
+
+    // Resolve the safetensors shard(s) in the vae dir.
+    let set = WeightSet::resolve(weights)?;
+    let files: Vec<_> = set.files.clone();
+    let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, DType::F32, &dev)? };
+    let model = vae::QwenImageVae::load(&cfg, &latents_mean, &latents_std, vb)?;
+
+    // Load the packed latent (.pt pickle) and unpack.
+    let tensors = candle_core::pickle::read_all(latent)?;
+    let packed = tensors
+        .into_iter()
+        .next()
+        .context("no tensor in latent file")?
+        .1
+        .to_device(&dev)?
+        .to_dtype(DType::F32)?;
+    tracing::info!(?packed, shape = ?packed.dims(), "loaded latent");
+    let packed = if packed.dims().len() == 3 {
+        packed
+    } else {
+        anyhow::bail!(
+            "expected packed latent (B, seq, z*4), got {:?}",
+            packed.dims()
+        );
+    };
+    let z = vae::unpack_latents(&packed, cfg.latent_channels)?;
+    tracing::info!(shape = ?z.dims(), "unpacked latent");
+
+    let img = model.decode(&z)?;
+    tracing::info!(shape = ?img.dims(), "decoded image");
+    let (w, h, bytes) = vae::to_rgba_u8(&img)?;
+    let buf: image::RgbaImage =
+        image::ImageBuffer::from_raw(w as u32, h as u32, bytes).context("image buffer")?;
+    buf.save(out)?;
+    println!("wrote {} ({w}x{h} RGBA)", out.display());
+    Ok(())
 }
 
 /// Allocate two NxN matrices, matmul, and reduce — the minimal end-to-end
