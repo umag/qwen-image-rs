@@ -87,8 +87,16 @@ Vendored thu-ml/SageAttention's sm80 fused kernel into `kernels/sage/vendor/`
 - Wired into DiT `attend()` (sage feature takes precedence over flash-attn):
   causal SageAttention over the text prefix, non-causal over image queries —
   same block-causal split as the flash path. Benchmark build: `--features
-  convrot,sage` (INT8 linears + INT8 attention). [denoise speed / image PSNR:
-  measuring].
+  convrot,sage` (INT8 linears + INT8 attention).
+- **Measured (`convrot,sage`, 40 steps @1024²): denoise ~19.4s / 0.48 s/step;
+  dit-forward cosine 0.999924 vs oracle; image PSNR 34.7 dB vs bf16.** vs
+  `convrot,flash` 19.8s / 0.51 s/step → only ~2-4% faster.
+- **Why marginal:** the `bench` verb (seq 4117, bf16) shows attention S² 12.1ms
+  > mlp 8.4ms > attn_proj 3.6ms — attention-bound *before* flash. But once
+  flash/sage make attention cheap, the GEMMs (mlp+proj ≈ 12ms) dominate, and
+  those are convrot's target. So convrot is the big denoise lever here and
+  sage-over-flash is small AT THIS SHAPE. Sage will pay off more on
+  attention-heavier configs (condition images, higher resolution → larger S²).
 - Per-BLOCK granularity (not per-warp) so quant scale counts match the kernel's
   per-block indexing without padding. Per-warp is a later accuracy refinement
   (needs the padded ceil(N/128)*4 scale layout + their per-warp quant kernel).
