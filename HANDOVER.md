@@ -58,8 +58,30 @@ shared by handle clone. `--convrot` added to generate/batch/denoise/dit-forward.
   is far closer: **bf16-vs-convrot PSNR 38.2 dB** (naive-attn was only 20.8),
   because flash's stable attention keeps the INT8-perturbed 40-step trajectory
   near the bf16 one. dit-forward cosine 0.999942 (unchanged). This is the
-  recommended fast path. Next levers: pre-quantized GGUF file (cut load),
-  SageAttention INT8 attention, CUDA-graph capture of the denoise loop.
+  recommended fast path.
+
+### Pre-quantized convrot weights (commit adds `prequantize-convrot`)
+`prequantize-convrot --weights <transformer> --out <file.safetensors>` rotates+
+INT8-quantizes the 224 convrot linears ONCE, writing `<prefix>.weight_i8` (U8) +
+`<prefix>.col_scale` (f32) beside the 73 bf16 tensors. `QwenImageDit::load`
+auto-detects `weight_i8` (`VarBuilder::contains_tensor`/`get_unchecked_dtype`,
+native dtype, no cast) → `ConvRotLinear::from_prequantized`, skipping the load-
+time rotate+quant. No new flag; point a transformer dir at the file and use
+`--convrot`.
+- **Bit-exact:** prequant vs on-the-fly convrot cosine 1.000000, MSE 0.0;
+  prequant vs oracle 0.999942 (identical to on-the-fly).
+- **File 6.8 GB vs ~15 GB bf16 (~55% smaller);** rotate+quant eliminated at load.
+- Warm load ties (~3.5s both, cheap compute + hot cache) — the win is cold-start
+  I/O (halved), VRAM, and repeated loads (serve).
+
+### Remaining levers (spiked)
+- **SageAttention INT8 attention** — the one lever that still cuts *denoise*.
+  Needs a fused INT8 FLASH kernel (INT8 QKᵀ + online softmax + PV, per-block
+  scales/smoothing), a research-grade port, NOT a clean single-GEMM vendor like
+  `int8_gemm`. Scope as its own effort; expect multiple build cycles.
+- **CUDA-graph capture** — candle 0.11 exposes no stream-capture hook and its
+  op path allocates fresh tensors per step (pointers move), so replay is fragile.
+  Not viable without patching candle. Deprioritized.
 - Build: `cargo build --release --features convrot` (CUTLASS_DIR set), ~1m53s.
   Runtime compare needs the oracle venv python (`~/dev_tmp/qwen-image-oracle/.venv/bin/python`
   has safetensors/PIL/numpy; the system python3 does not).
