@@ -31,10 +31,21 @@ enum Command {
         #[arg(long)]
         weights: std::path::PathBuf,
     },
-    /// Text-to-image. Not yet implemented — see docs/PHASES.md (Phase 4).
+    /// Text-to-image: prompt -> PNG (tokenize -> text encode -> denoise -> VAE).
     Generate {
+        /// The model snapshot directory (contains processor/, text_encoder/, transformer/, vae/).
+        #[arg(long)]
+        model: std::path::PathBuf,
         #[arg(long)]
         prompt: String,
+        #[arg(long, default_value_t = 1024)]
+        size: usize,
+        #[arg(long, default_value_t = 40)]
+        steps: usize,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[arg(long)]
+        out: std::path::PathBuf,
     },
     /// Encode input_ids through the Qwen3-VL text encoder to prompt embeddings (Phase 3).
     TextEncode {
@@ -104,9 +115,14 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Smoke { n } => smoke(n),
         Command::Info { weights } => info(&weights),
-        Command::Generate { .. } => {
-            anyhow::bail!("`generate` lands in Phase 4 (DiT + scheduler). See docs/PHASES.md.")
-        }
+        Command::Generate {
+            model,
+            prompt,
+            size,
+            steps,
+            seed,
+            out,
+        } => generate(&model, &prompt, size, steps, seed, &out),
         Command::VaeDecode {
             weights,
             latent,
@@ -131,6 +147,111 @@ fn main() -> Result<()> {
             out,
         } => denoise(&weights, &noise, &embeds, steps, &out),
     }
+}
+
+/// Standalone text-to-image: prompt -> PNG. Loads the three models one at a
+/// time (text encoder -> DiT -> VAE), freeing each before the next so the
+/// pipeline fits in 24 GB.
+fn generate(
+    model: &std::path::Path,
+    prompt: &str,
+    size: usize,
+    steps: usize,
+    seed: u64,
+    out: &std::path::Path,
+) -> Result<()> {
+    use qwen_image_rs::model::dit::QwenImageDit;
+    use qwen_image_rs::model::scheduler::{FlowConfig, FlowMatchEuler};
+    use qwen_image_rs::model::text_encoder::{prompt as tmpl, QwenTextEncoder, TextConfig};
+    use qwen_image_rs::model::{config::VaeConfig, vae};
+    use tokenizers::Tokenizer;
+
+    let dev = device::best_device()?;
+    let dtype = if matches!(dev, candle_core::Device::Cuda(_)) {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    let load_vb = |dir: std::path::PathBuf, dt: DType| -> Result<candle_nn::VarBuilder> {
+        let files = WeightSet::resolve(&dir)?.files;
+        Ok(unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dt, &dev)? })
+    };
+
+    // Tokenize the t2i chat template; drop = system-prefix token count.
+    let tok = Tokenizer::from_file(model.join("processor/tokenizer.json"))
+        .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
+    let ids: Vec<u32> = tok
+        .encode(tmpl::t2i_template(prompt), false)
+        .map_err(|e| anyhow::anyhow!("encode: {e}"))?
+        .get_ids()
+        .to_vec();
+    let sysp = format!("<|im_start|>system\n{}<|im_end|>\n", tmpl::SYS_PROMPT);
+    let drop = tok
+        .encode(sysp, false)
+        .map_err(|e| anyhow::anyhow!("encode sys: {e}"))?
+        .get_ids()
+        .len();
+    let seq = ids.len();
+    tracing::info!(seq, drop, "tokenized");
+
+    // 1. Text encoder -> prompt embeddings (freed after).
+    let embeds = {
+        let te = QwenTextEncoder::load(
+            &TextConfig::default(),
+            load_vb(model.join("text_encoder"), dtype)?,
+        )?;
+        let ids_t = Tensor::from_vec(ids, (1, seq), &dev)?;
+        let hidden = te.forward(&ids_t)?;
+        hidden.narrow(1, drop, seq - drop)?.contiguous()?
+    };
+    tracing::info!(shape = ?embeds.dims(), "prompt embeddings");
+
+    // 2. DiT + flow-match denoise -> final latent (freed after).
+    let hw = size / 16; // vae spatial compression
+    let img_seq = hw * hw;
+    let latent = {
+        let dit = QwenImageDit::load(32, 64, load_vb(model.join("transformer"), dtype)?)?;
+        dev.set_seed(seed)?;
+        let mut latents =
+            Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?.to_dtype(DType::F32)?;
+        let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
+        for (i, t) in sched.timesteps().iter().enumerate() {
+            let tt = Tensor::from_vec(vec![(*t / 1000.0) as f32], (1,), &dev)?;
+            let joint = dit.forward(&latents.to_dtype(dtype)?, &embeds, &tt, hw, hw)?;
+            let (_b, jl, _) = joint.dims3()?;
+            let np = joint
+                .narrow(1, jl - img_seq, img_seq)?
+                .to_dtype(DType::F32)?;
+            latents = (latents + (np * sched.dt(i))?)?;
+            if i % 10 == 0 || i + 1 == steps {
+                tracing::info!(step = i, "denoising");
+            }
+        }
+        latents
+    };
+
+    // 3. VAE decode -> RGBA PNG.
+    let cfg_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(model.join("vae/config.json"))?)?;
+    let f32vec = |k: &str| -> Vec<f32> {
+        cfg_json[k].as_array().map_or(vec![], |a| {
+            a.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect()
+        })
+    };
+    let vmodel = vae::QwenImageVae::load(
+        &VaeConfig::default(),
+        &f32vec("latents_mean"),
+        &f32vec("latents_std"),
+        load_vb(model.join("vae"), DType::F32)?,
+    )?;
+    let z = vae::unpack_latents(&latent, 64)?;
+    let img = vmodel.decode(&z)?;
+    let (w, h, bytes) = vae::to_rgba_u8(&img)?;
+    let buf: image::RgbaImage =
+        image::ImageBuffer::from_raw(w as u32, h as u32, bytes).context("image buffer")?;
+    buf.save(out)?;
+    println!("wrote {} ({w}x{h})", out.display());
+    Ok(())
 }
 
 /// Phase 4: full flow-match denoise loop -> final latent.
