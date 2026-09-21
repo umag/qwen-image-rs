@@ -361,7 +361,6 @@ checksum = "3bcbbf7ff00ff6fe2af22b93600195917fe90e90ff48424a140d1a926c44b1c1"
 dependencies = [
  "byteorder",
  "candle-core",
- "candle-flash-attn",
  "candle-nn",
  "fancy-regex",
  "num-traits",
@@ -1871,6 +1870,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "candle-core",
+ "candle-flash-attn",
  "candle-nn",
  "candle-transformers",
  "clap",

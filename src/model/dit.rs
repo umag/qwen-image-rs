@@ -156,30 +156,90 @@ impl Attention {
         })
     }
 
-    fn forward(&self, x: &Tensor, mask: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        txt_len: usize,
+    ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let shape = (b, s, HEADS, HEAD_DIM);
-        let q = self
+        // (B,H,S,D) for RoPE (rope_i rotates per position across heads).
+        let qh = self
             .norm_q
-            .forward(&self.to_q.forward(x)?.reshape(shape)?)?;
-        let k = self
+            .forward(&self.to_q.forward(x)?.reshape(shape)?)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let kh = self
             .norm_k
-            .forward(&self.to_k.forward(x)?.reshape(shape)?)?;
-        let v = self.to_v.forward(x)?.reshape(shape)?;
-        // (B,H,S,D)
-        let q = q.transpose(1, 2)?.contiguous()?;
-        let k = k.transpose(1, 2)?.contiguous()?;
-        let v = v.transpose(1, 2)?.contiguous()?;
-        // complex RoPE == interleaved pairs -> candle rope_i
-        let q = candle_nn::rotary_emb::rope_i(&q, cos, sin)?;
-        let k = candle_nn::rotary_emb::rope_i(&k, cos, sin)?;
+            .forward(&self.to_k.forward(x)?.reshape(shape)?)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let vv = self.to_v.forward(x)?.reshape(shape)?; // (B,S,H,D)
+        let qh = candle_nn::rotary_emb::rope_i(&qh, cos, sin)?;
+        let kh = candle_nn::rotary_emb::rope_i(&kh, cos, sin)?;
         let scale = 1.0 / (HEAD_DIM as f64).sqrt();
-        let attn = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        let attn = attn.broadcast_add(mask)?; // (B,H,S,S) + (1,1,S,S)
+        let out = self.attend(&qh, &kh, &vv, mask, txt_len, scale)?; // (B,S,H,D)
+        Ok(self.to_out.forward(&out.reshape((b, s, INNER))?)?)
+    }
+
+    /// With `flash-attn`: image queries take full FlashAttention (they attend to
+    /// the whole joint sequence) and the `txt_len` text queries take a small
+    /// causal FlashAttention — exactly the block-causal structure for
+    /// text-to-image, so no dense S² matrix is materialized. Returns (B,S,H,D).
+    #[cfg(feature = "flash-attn")]
+    fn attend(
+        &self,
+        qh: &Tensor,
+        kh: &Tensor,
+        vv: &Tensor,
+        mask: &Tensor,
+        txt_len: usize,
+        scale: f64,
+    ) -> Result<Tensor> {
+        let _ = mask;
+        let (_b, _h, s, _d) = qh.dims4()?;
+        let qf = qh.transpose(1, 2)?.contiguous()?; // (B,S,H,D)
+        let kf = kh.transpose(1, 2)?.contiguous()?;
+        let vf = vv.contiguous()?;
+        let sc = scale as f32;
+        let ot = candle_flash_attn::flash_attn(
+            &qf.narrow(1, 0, txt_len)?.contiguous()?,
+            &kf.narrow(1, 0, txt_len)?.contiguous()?,
+            &vf.narrow(1, 0, txt_len)?.contiguous()?,
+            sc,
+            true,
+        )?;
+        let oi = candle_flash_attn::flash_attn(
+            &qf.narrow(1, txt_len, s - txt_len)?.contiguous()?,
+            &kf,
+            &vf,
+            sc,
+            false,
+        )?;
+        Ok(Tensor::cat(&[ot, oi], 1)?)
+    }
+
+    /// Naive attention with the additive block-causal `mask`. Returns (B,S,H,D).
+    #[cfg(not(feature = "flash-attn"))]
+    fn attend(
+        &self,
+        qh: &Tensor,
+        kh: &Tensor,
+        vv: &Tensor,
+        mask: &Tensor,
+        txt_len: usize,
+        scale: f64,
+    ) -> Result<Tensor> {
+        let _ = txt_len;
+        let v = vv.transpose(1, 2)?.contiguous()?; // (B,H,S,D)
+        let attn = (qh.matmul(&kh.transpose(2, 3)?)? * scale)?;
+        let attn = attn.broadcast_add(mask)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         let out = attn.matmul(&v)?; // (B,H,S,D)
-        let out = out.transpose(1, 2)?.reshape((b, s, INNER))?;
-        Ok(self.to_out.forward(&out)?)
+        Ok(out.transpose(1, 2)?.contiguous()?)
     }
 }
 
@@ -228,10 +288,11 @@ impl Block {
         mask: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        txt_len: usize,
     ) -> Result<Tensor> {
         let x = norm_no_affine(h, self.eps)?;
         let x = x.broadcast_mul(&(scale1 + 1.0)?)?;
-        let attn = self.attn.forward(&x, mask, cos, sin)?;
+        let attn = self.attn.forward(&x, mask, cos, sin, txt_len)?;
         let h = (h + gate1.tanh()?.broadcast_mul(&attn)?)?;
         let x = norm_no_affine(&h, self.eps)?;
         let x = x.broadcast_mul(&(scale2 + 1.0)?)?;
@@ -374,12 +435,19 @@ impl QwenImageDit {
         let scale2 = sel(&mods[2])?;
         let gate2 = sel(&mods[3])?;
 
+        // The dense block-causal mask is only needed by the naive path; the
+        // flash path derives the same structure from the text/image split.
+        #[cfg(not(feature = "flash-attn"))]
         let mask = block_causal_mask(txt_len, img_tokens, dtype, &self.device)?;
+        #[cfg(feature = "flash-attn")]
+        let mask = Tensor::zeros((1, 1, 1, 1), dtype, &self.device)?;
         let (cos, sin) = self.rope_cos_sin(txt_len, h, w, dtype)?;
 
         let mut x = joint;
         for block in &self.blocks {
-            x = block.forward(&x, &scale1, &gate1, &scale2, &gate2, &mask, &cos, &sin)?;
+            x = block.forward(
+                &x, &scale1, &gate1, &scale2, &gate2, &mask, &cos, &sin, txt_len,
+            )?;
         }
 
         // norm_out: AdaLayerNorm scale-only, then proj_out. Scale from temb rows.
@@ -406,6 +474,8 @@ fn select_rows(m: &Tensor, txt_len: usize, img_tokens: usize, dev: &Device) -> R
 }
 
 /// Block-causal additive mask `(1,1,S,S)`: allowed[q,kv] = (q>=kv) OR both-image.
+/// Used by the naive attention path only (the flash path derives the structure).
+#[cfg_attr(feature = "flash-attn", allow(dead_code))]
 fn block_causal_mask(
     txt_len: usize,
     img_tokens: usize,
