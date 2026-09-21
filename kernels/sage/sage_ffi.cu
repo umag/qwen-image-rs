@@ -54,6 +54,44 @@ extern "C" void sage_quant_k(const void *in, void *out_i8, float *scale, int B,
                    (cudaStream_t)stream);
 }
 
+// BSHD variant: the bf16 input is read with caller-supplied strides (a
+// (B,S,H,D) tensor, possibly a narrowed view — see src/sage.rs), while the int8
+// output + scales are written HND-contiguous (unchanged from the HND path, so
+// the attention kernel indexes them identically). Only the input strides differ.
+template <uint32_t BLOCK_SIZE>
+static void launch_quant_bshd(const __nv_bfloat16 *in, int8_t *out, float *scale,
+                              int B, int H, int N, uint32_t sbz_in,
+                              uint32_t sseq_in, uint32_t sh_in,
+                              cudaStream_t s) {
+  uint32_t nblk = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  dim3 grid(nblk, H, B);
+  constexpr uint32_t num_pack = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
+  dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack);
+  uint32_t sbz_out = (uint32_t)H * N * HEAD_DIM, sh_out = (uint32_t)N * HEAD_DIM,
+           sseq_out = HEAD_DIM;
+  uint32_t sbz_sc = (uint32_t)H * nblk, sh_sc = nblk;
+  QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack, false, false, __nv_bfloat16>
+      <<<grid, block, 0, s>>>((__nv_bfloat16 *)in, nullptr, out, scale, 1.0f,
+                              (uint32_t)N, sbz_in, sseq_in, sh_in, 0, 0, sbz_out,
+                              sseq_out, sh_out, sbz_sc, sh_sc);
+}
+
+extern "C" void sage_quant_q_bshd(const void *in, void *out_i8, float *scale,
+                                  int B, int H, int N, unsigned sbz_in,
+                                  unsigned sseq_in, unsigned sh_in,
+                                  void *stream) {
+  launch_quant_bshd<128>((const __nv_bfloat16 *)in, (int8_t *)out_i8, scale, B,
+                         H, N, sbz_in, sseq_in, sh_in, (cudaStream_t)stream);
+}
+
+extern "C" void sage_quant_k_bshd(const void *in, void *out_i8, float *scale,
+                                  int B, int H, int N, unsigned sbz_in,
+                                  unsigned sseq_in, unsigned sh_in,
+                                  void *stream) {
+  launch_quant_bshd<64>((const __nv_bfloat16 *)in, (int8_t *)out_i8, scale, B, H,
+                        N, sbz_in, sseq_in, sh_in, (cudaStream_t)stream);
+}
+
 template <MaskMode MM>
 static void launch_attn(const int8_t *q, const int8_t *k, const half *v,
                         __nv_bfloat16 *o, const float *qs, const float *ks,
@@ -100,4 +138,62 @@ extern "C" void sage_attn(const void *q_i8, const void *k_i8, const void *v_f16,
                                  (const half *)v_f16, (__nv_bfloat16 *)o_bf16,
                                  q_scale, k_scale, B, Hq, Hk, qo_len, kv_len,
                                  sm_scale, (cudaStream_t)stream);
+}
+
+// BSHD variant: int8 q/k + their scales stay HND-contiguous (as produced by the
+// _bshd quant launchers above), so q/k strides are the HND ones. V (f16) and O
+// (bf16) are read/written with caller-supplied (B,S,H,D) strides — V may be a
+// narrowed view, O is a fresh contiguous (B, qo, Hq, D) buffer. The kernel
+// honors stride_bz/seq/h independently for every operand; only head_dim must be
+// stride-1 (satisfied in both layouts).
+template <MaskMode MM>
+static void launch_attn_bshd(const int8_t *q, const int8_t *k, const half *v,
+                             __nv_bfloat16 *o, const float *qs, const float *ks,
+                             int B, int Hq, int Hk, int qo_len, int kv_len,
+                             uint32_t sbz_v, uint32_t sseq_v, uint32_t sh_v,
+                             uint32_t sbz_o, uint32_t sseq_o, uint32_t sh_o,
+                             float sm_scale, cudaStream_t stream) {
+  constexpr int CTA_Q = 128, CTA_K = 64, WARP_Q = 32, WARP_K = 64;
+  int num_kv_groups = Hq / Hk;
+  uint32_t sbz_q = (uint32_t)Hq * qo_len * HEAD_DIM,
+           sh_q = (uint32_t)qo_len * HEAD_DIM, sseq_q = HEAD_DIM;
+  uint32_t sbz_k = (uint32_t)Hk * kv_len * HEAD_DIM,
+           sh_k = (uint32_t)kv_len * HEAD_DIM, sseq_k = HEAD_DIM;
+  size_t smem_max = std::max((size_t)CTA_Q * HEAD_DIM * sizeof(int8_t) +
+                                 CTA_K * HEAD_DIM * sizeof(int8_t) +
+                                 CTA_K * HEAD_DIM * sizeof(half),
+                             (size_t)CTA_Q * HEAD_DIM * sizeof(half));
+  auto kf = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM,
+                                      DataType::kInt8, QuantGranularity::kPerBlock,
+                                      QuantGranularity::kPerBlock, float, false,
+                                      __nv_bfloat16, ComputeUnit::kTensorCore, MM,
+                                      false, false>;
+  cudaFuncSetAttribute(kf, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+  dim3 grid((qo_len + CTA_Q - 1) / CTA_Q, Hq, B);
+  dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
+  kf<<<grid, block, smem_max, stream>>>(
+      (int8_t *)q, (int8_t *)k, (half *)v, o, nullptr, (float *)qs, (float *)ks,
+      nullptr, qo_len, kv_len, num_kv_groups, sbz_q, sseq_q, sh_q, sbz_k, sseq_k,
+      sh_k, sbz_v, sseq_v, sh_v, sbz_o, sseq_o, sh_o, sm_scale);
+}
+
+extern "C" void sage_attn_bshd(const void *q_i8, const void *k_i8,
+                               const void *v_f16, void *o_bf16,
+                               const float *q_scale, const float *k_scale, int B,
+                               int Hq, int Hk, int qo_len, int kv_len,
+                               unsigned sbz_v, unsigned sseq_v, unsigned sh_v,
+                               unsigned sbz_o, unsigned sseq_o, unsigned sh_o,
+                               float sm_scale, int is_causal, void *stream) {
+  if (is_causal)
+    launch_attn_bshd<MaskMode::kCausal>(
+        (const int8_t *)q_i8, (const int8_t *)k_i8, (const half *)v_f16,
+        (__nv_bfloat16 *)o_bf16, q_scale, k_scale, B, Hq, Hk, qo_len, kv_len,
+        sbz_v, sseq_v, sh_v, sbz_o, sseq_o, sh_o, sm_scale,
+        (cudaStream_t)stream);
+  else
+    launch_attn_bshd<MaskMode::kNone>(
+        (const int8_t *)q_i8, (const int8_t *)k_i8, (const half *)v_f16,
+        (__nv_bfloat16 *)o_bf16, q_scale, k_scale, B, Hq, Hk, qo_len, kv_len,
+        sbz_v, sseq_v, sh_v, sbz_o, sseq_o, sh_o, sm_scale,
+        (cudaStream_t)stream);
 }

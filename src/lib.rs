@@ -19,6 +19,8 @@ pub mod fusednorm;
 pub mod loader;
 pub mod model;
 #[cfg(feature = "sage")]
+pub mod rope;
+#[cfg(feature = "sage")]
 pub mod sage;
 
 /// Crate result alias.

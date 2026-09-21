@@ -46,8 +46,10 @@ fn main() {
 
     #[cfg(feature = "sage")]
     {
-        // Vendored SageAttention INT8-QK / FP16-PV kernel (thu-ml), torch-free.
+        // Vendored SageAttention INT8-QK / FP16-PV kernel (thu-ml), torch-free,
+        // plus the BSHD interleaved-RoPE kernel used only by the sage path.
         println!("cargo:rerun-if-changed=kernels/sage/sage_ffi.cu");
+        println!("cargo:rerun-if-changed=kernels/sage/rope_bshd.cu");
         let cap = std::env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".into());
         cc::Build::new()
             .cuda(true)
@@ -58,6 +60,7 @@ fn main() {
             .flag("-diag-suppress=177") // unused CHECK_ macros in vendored utils
             .include("kernels/sage")
             .file("kernels/sage/sage_ffi.cu")
+            .file("kernels/sage/rope_bshd.cu")
             .compile("sage_attn");
         println!("cargo:rustc-link-lib=dylib=cudart");
     }

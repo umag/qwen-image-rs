@@ -1068,6 +1068,16 @@ fn sage_test() -> Result<()> {
                 if cos > 0.99 { "OK" } else { "TOO LOW" }
             );
         }
+        let rope_cos = qwen_image_rs::rope::self_test()?;
+        println!(
+            "rope-i BSHD vs candle rope_i: cosine = {rope_cos:.6} ({})",
+            if rope_cos > 0.999 { "OK" } else { "TOO LOW" }
+        );
+        let (bshd_cos, maxabs) = qwen_image_rs::sage::self_test_bshd()?;
+        println!(
+            "sage BSHD vs BHSD (block-causal split): cosine = {bshd_cos:.6}, maxabs = {maxabs:.4} ({})",
+            if bshd_cos > 0.9999 { "OK" } else { "TOO LOW" }
+        );
         Ok(())
     }
     #[cfg(not(feature = "sage"))]

@@ -271,59 +271,78 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let shape = (b, s, HEADS, HEAD_DIM);
-        // (B,H,S,D) for RoPE (rope_i rotates per position across heads).
-        let qh = self
-            .norm_q
-            .forward(&self.to_q.forward(x)?.reshape(shape)?)?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let kh = self
-            .norm_k
-            .forward(&self.to_k.forward(x)?.reshape(shape)?)?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let vv = self.to_v.forward(x)?.reshape(shape)?; // (B,S,H,D)
-        let qh = candle_nn::rotary_emb::rope_i(&qh, cos, sin)?;
-        let kh = candle_nn::rotary_emb::rope_i(&kh, cos, sin)?;
         let scale = 1.0 / (HEAD_DIM as f64).sqrt();
-        let out = self.attend(&qh, &kh, &vv, mask, txt_len, scale)?; // (B,S,H,D)
-        self.to_out.forward(&out.reshape((b, s, INNER))?)
+        #[cfg(feature = "sage")]
+        {
+            let _ = mask; // block-causal structure is expressed via narrows, not a mask
+                          // BSHD-native: q/k/v stay (B,S,H,D); a BSHD rope replaces
+                          // candle rope_i and the sage kernel reads/writes BSHD, so
+                          // there are no transpose->contiguous copies anywhere.
+            let qh = self
+                .norm_q
+                .forward(&self.to_q.forward(x)?.reshape(shape)?)?; // (B,S,H,D)
+            let kh = self
+                .norm_k
+                .forward(&self.to_k.forward(x)?.reshape(shape)?)?;
+            let qh = crate::rope::rope_i_bshd(&qh, cos, sin)?;
+            let kh = crate::rope::rope_i_bshd(&kh, cos, sin)?;
+            let vv = self.to_v.forward(x)?.reshape(shape)?; // (B,S,H,D)
+            let out = self.attend_bshd(&qh, &kh, &vv, txt_len, scale)?; // (B,S,H,D)
+            return self.to_out.forward(&out.reshape((b, s, INNER))?);
+        }
+        #[cfg(not(feature = "sage"))]
+        {
+            // (B,H,S,D) for RoPE (rope_i rotates per position across heads).
+            let qh = self
+                .norm_q
+                .forward(&self.to_q.forward(x)?.reshape(shape)?)?
+                .transpose(1, 2)?
+                .contiguous()?;
+            let kh = self
+                .norm_k
+                .forward(&self.to_k.forward(x)?.reshape(shape)?)?
+                .transpose(1, 2)?
+                .contiguous()?;
+            let vv = self.to_v.forward(x)?.reshape(shape)?; // (B,S,H,D)
+            let qh = candle_nn::rotary_emb::rope_i(&qh, cos, sin)?;
+            let kh = candle_nn::rotary_emb::rope_i(&kh, cos, sin)?;
+            let out = self.attend(&qh, &kh, &vv, mask, txt_len, scale)?; // (B,S,H,D)
+            self.to_out.forward(&out.reshape((b, s, INNER))?)
+        }
     }
 
-    /// With `sage`: same block-causal split as the flash path, but each half
-    /// runs SageAttention (INT8-QK / FP16-PV). Image queries attend to the whole
-    /// joint sequence (non-causal); the `txt_len` text queries attend causally
-    /// to the text prefix. `qh,kh` are (B,H,S,D); `vv` is (B,S,H,D). Returns
-    /// (B,S,H,D). Takes precedence over flash-attn when both features are on.
+    /// With `sage`: BSHD-native block-causal SageAttention (INT8-QK / FP16-PV).
+    /// `qh,kh,vv` are all `(B,S,H,D)` — no transpose to (B,H,S,D). Image queries
+    /// attend non-causally to the whole joint sequence; the `txt_len` text
+    /// queries attend causally to the text prefix. The S-axis narrows are
+    /// zero-copy views (B=1), and the sage kernel writes `(B,S,H,D)` directly, so
+    /// this path materializes no transpose copies. Returns `(B,S,H,D)`.
     #[cfg(feature = "sage")]
-    fn attend(
+    fn attend_bshd(
         &self,
         qh: &Tensor,
         kh: &Tensor,
         vv: &Tensor,
-        mask: &Tensor,
         txt_len: usize,
         scale: f64,
     ) -> Result<Tensor> {
-        let _ = mask;
-        let (_b, _h, s, _d) = qh.dims4()?;
-        // `sage_attention` contiguizes its inputs internally, so pass views —
-        // an explicit `.contiguous()` here would just double the copy.
-        let vh = vv.transpose(1, 2)?; // (B,H,S,D) view
+        let (_b, s, _h, _d) = qh.dims4()?;
+        // V is cast to f16 once (contiguous, no transpose); the narrows below are
+        // zero-copy S-axis views the bridge reads via start_offset + strides.
+        let vf = vv.to_dtype(DType::F16)?; // (B,S,H,D) f16
         let sc = scale as f32;
         // text prefix: causal over [0, txt_len)
-        let ot = crate::sage::sage_attention(
-            &qh.narrow(2, 0, txt_len)?,
-            &kh.narrow(2, 0, txt_len)?,
-            &vh.narrow(2, 0, txt_len)?,
+        let ot = crate::sage::sage_attention_bshd(
+            &qh.narrow(1, 0, txt_len)?,
+            &kh.narrow(1, 0, txt_len)?,
+            &vf.narrow(1, 0, txt_len)?,
             sc,
             true,
-        )?; // (B,H,txt,D)
+        )?; // (B,txt,H,D)
             // image queries: full non-causal attention over the whole sequence
-        let qi = qh.narrow(2, txt_len, s - txt_len)?;
-        let oi = crate::sage::sage_attention(&qi, kh, &vh, sc, false)?; // (B,H,s-txt,D)
-        let out = Tensor::cat(&[ot, oi], 2)?; // (B,H,S,D)
-        Ok(out.transpose(1, 2)?.contiguous()?) // (B,S,H,D)
+        let qi = qh.narrow(1, txt_len, s - txt_len)?;
+        let oi = crate::sage::sage_attention_bshd(&qi, kh, &vf, sc, false)?; // (B,s-txt,H,D)
+        Ok(Tensor::cat(&[ot, oi], 1)?) // (B,S,H,D)
     }
 
     /// With `flash-attn`: image queries take full FlashAttention (they attend to
