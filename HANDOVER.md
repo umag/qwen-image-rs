@@ -36,7 +36,31 @@ Optimizations, each measured:
   ~62 s → it's a VRAM tool, NOT speed. Load-speed needs a pre-quantized GGUF file.
 - **ConvRot W8A8 INT8** (`--features convrot`): see below.
 
-## ConvRot INT8 (the last active work) — validated + fast, needs DiT wiring
+## ConvRot INT8 — WIRED INTO THE DiT + validated end to end (commit 3ff66f6)
+`QLinear` gained a feature-gated `Convrot(ConvRotLinear)` variant; a runtime
+`convrot: bool` threads `QwenImageDit::load → Block → Attention/SwiGlu` (mirrors
+`quant`). When set and in-features % 256 == 0, attn q/k/v/o + SwiGlu proj/gate/out
+run rotated INT8; norm_out/proj_out/modulation/img_in/txt_in stay bf16 (they're
+plain `Linear`, untouched). The 256×256 Regular Hadamard is built once per load,
+shared by handle clone. `--convrot` added to generate/batch/denoise/dit-forward.
+- **dit-forward --convrot vs oracle: overall cosine 0.999945** (per-token image
+  mean 0.99995) — matches the bf16 baseline's 0.99996. Wiring is numerically exact.
+- **Full generate --convrot: coherent, on-prompt image.** vs the bf16 image:
+  PSNR 20.8 dB — LOW only because of 40-step flow-match trajectory divergence in
+  fine detail (mug interior lighting, coffee level); both images are clean red
+  mugs, same composition. Per-step accuracy is the 0.9999 above.
+- **Speed (naive-attn path, 40 steps @1024²): convrot ~40.8s vs bf16 ~44.7s,
+  ~1.02 vs 1.12 s/step (~1.1×).** The isolated MLP win is 1.59×; it's diluted
+  here because naive S² attention (unchanged) dominates each step. **Next real
+  win = build `--features convrot,flash-attn` together** so attention is cheap
+  and the convrot linear speedup is a bigger fraction of the step.
+- Build: `cargo build --release --features convrot` (CUTLASS_DIR set), ~1m53s.
+  Runtime compare needs the oracle venv python (`~/dev_tmp/qwen-image-oracle/.venv/bin/python`
+  has safetensors/PIL/numpy; the system python3 does not).
+- `scripts/host.sh` fixed: `--repo-dir` is a swamp SUBCOMMAND option, not a global
+  flag — it now follows `model method run` / `data get`, not `swamp` itself.
+
+## ConvRot INT8 (earlier) — validated + fast, DiT wiring now DONE (above)
 Method = pytorch/ao#4695 Group-wise Regular Hadamard Rotation for DiTs. Reference
 kernel: sglang#38040 (vendored `kernels/convrot/convrot_int8_gemm.cu`, but it's
 torch+sgl-extension coupled — we used a SIMPLER stock-CUTLASS path instead).
