@@ -1,0 +1,102 @@
+{
+  "id": "4b2cbf90-0657-4766-94a9-681fcbe21832",
+  "name": "6a8a726be49261c7cc11314333b0b924b16e3a09",
+  "modelId": "73ad2263-3c16-4e09-aebf-90e9238351b6",
+  "modelName": "qwen-image-rs-fused-rmsnorm-gate",
+  "modelType": "@magistr/issue-lifecycle",
+  "version": 1,
+  "contentType": "application/json",
+  "lifetime": "infinite",
+  "garbageCollection": 20,
+  "streaming": false,
+  "tags": {
+    "type": "resource",
+    "specName": "attestation",
+    "modelName": "qwen-image-rs-fused-rmsnorm-gate",
+    "initiatedBy": "user:magistr"
+  },
+  "ownerDefinition": {
+    "ownerType": "model-method",
+    "ownerRef": "73ad2263-3c16-4e09-aebf-90e9238351b6"
+  },
+  "createdAt": "2026-09-21T21:27:02.165Z",
+  "size": 2388,
+  "checksum": "f0da8d9d4368bc8df0d6d1fc6ace73a90614221d7b7ac3aa167508a8054e5a73",
+  "contentPath": "../../.swamp/repos/c8eb7040-ad64-4e9e-9c47-e2d30504659e/dev-tmp-swamp/data/@magistr/issue-lifecycle/73ad2263-3c16-4e09-aebf-90e9238351b6/6a8a726be49261c7cc11314333b0b924b16e3a09/1/raw",
+  "content": {
+    "attestationVersion": 1,
+    "issue": "Fused RMSNorm×weight + fused gated-residual kernels (fusednorm feature)",
+    "commitSha": "6a8a726be49261c7cc11314333b0b924b16e3a09",
+    "branch": "main",
+    "planVersion": 1,
+    "configChecksums": {
+      "Cargo.toml": "5ee86165d928d18e56e585ca9ef5475e663602624135484be6e51098c3ee7eb9",
+      "agent-constraints/implementation-conventions.md": "5d7196119fb8c37ec4f49646dda6390f5a56517551a94f0d2873bd30993abf5a",
+      "agent-constraints/verification-controls.md": "9c48f9c338d52c336b4e339247851e310e82f5eef5114a138cb3af432b74eb21"
+    },
+    "controls": [
+      {
+        "name": "fmt",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh fmt",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 592,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "== fmt ==\n== local checks OK ==\n"
+      },
+      {
+        "name": "clippy",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh clippy",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 1156,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.95s\n"
+      },
+      {
+        "name": "check",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh check",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 525,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.40s\n"
+      },
+      {
+        "name": "test",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh test",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 1208,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.37s\n     Running unittests src/lib.rs (/Users/mag1/.cache/qwen-image-rs-target/debug/deps/qwen_image_rs-453b6dfd9eeab634)\n     Running unittests src/main.rs (/Users/mag1/.cache/qwen-image-rs-target/debug/deps/qwen_image_rs-1d1276dbe20172b3)\n   Doc-tests qwen_image_rs\n"
+      }
+    ],
+    "reviews": [
+      {
+        "reviewer": "review-code",
+        "verdict": "SUGGEST_CHANGES",
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 1
+      },
+      {
+        "reviewer": "review-adversarial",
+        "verdict": "PASS",
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 1
+      }
+    ],
+    "runner": "local",
+    "producedAt": "2026-09-21T21:27:02.158Z",
+    "producedBy": "navi.aopab.art",
+    "modelVersion": "2026.09.20.2"
+  }
+}

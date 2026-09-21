@@ -192,7 +192,8 @@ fallback unchanged). `fusednorm-test` verb.
   the convrot,sage,fusednorm path. Recommended fast build now:
   `--features convrot,sage,fusednorm`.
 - Scope: LayerNorm+affine only (the dominant bucket). RMSNorm variants
-  (ZeroCenterRmsNorm/HeadRmsNorm) are a possible follow-on fusion.
+  (ZeroCenterRmsNorm/HeadRmsNorm) + gated residuals were the follow-on — see
+  "Fused RMSNorm×weight + gated residual" below.
 
 ### Fused activation quantizer (DONE — extends `convrot`)
 Driven through the issue-lifecycle (`qwen-image-rs-fused-actquant`). nsys showed
@@ -209,7 +210,8 @@ pre-allocated input (fresh zeros, no aliasing/autograd — safe in inference);
 - **Denoise 17.8 s -> 15.2 s (40 steps) = ~14.5% faster** (0.445 -> 0.380 s/step)
   on convrot,sage,fusednorm,+actquant. Cumulative fastest path denoise: bf16
   0.62 -> 0.38 s/step.
-- Remaining fusion levers: RMSNorm variants.
+- Remaining fusion levers: RMSNorm variants + gated residuals (both now DONE —
+  see "Fused RMSNorm×weight + gated residual" below).
 
 ### Fused dequant epilogue (DONE — `qwen-image-rs-dequant-epilogue`, extends `convrot`)
 Driven through the issue-lifecycle. nsys showed ~7.4% of a 10-step denoise trace
@@ -240,7 +242,35 @@ epilogue so the INT8 GEMM emits bf16 directly.
   convrot,sage,fusednorm. The win exceeds the 7.4% dequant fraction because the
   fusion also removes the i32 tensor's global write+readback and 2240 kernel
   launches/trace.
-- Remaining fusion levers: RMSNorm variants.
+
+### Fused RMSNorm×weight + gated residual (DONE — `qwen-image-rs-fused-rmsnorm-gate`, extends `fusednorm`)
+Driven through the issue-lifecycle. nsys of the fast path showed ~10% of denoise
+GPU time spread across bmul_f32 (6.2%) / bmul_bf16 (4.6%) / fast_sum_f32 (3.6%) /
+usqr_f32 (2.3%) / badd_bf16 (2.8%) — the RMSNorm variants and the gated residuals
+the LayerNorm+AdaLN fusion left untouched. Two more kernels in
+`kernels/fusednorm/fused_norm.cu`, both behind `fusednorm`:
+- `fused_rmsnorm_scale_kernel` — CTA-per-row f32 sum-of-squares reduction,
+  `out[m,n] = x[m,n] * rsqrt(mean_n(x^2)+eps) * W[n]` with a per-COLUMN weight
+  vector `W` (f32). ONE kernel serves both RMSNorm sites: `ZeroCenterRmsNorm`
+  (txt_in, N=4096, `W=weight+1`) and `HeadRmsNorm` (q/k norm, N=128, `W=weight`).
+  `W` rides as f32 so it matches candle's `weight.to_dtype(F32)(+1)` exactly;
+  ZeroCenter bakes `weight+1` in f32 at load, Head upcasts weight at load.
+- `fused_gated_residual_kernel` — elementwise `out = h + tanh(gate)*y` (f32 tanh +
+  fma, bf16 in/out), the 2×/block gated residuals in `Block::forward`.
+- `src/fusednorm.rs`: `FusedRmsnormScale` (CustomOp2) + `FusedGatedResidual`
+  (CustomOp3) bridges + `self_test_rmsnorm`/`self_test_gated`. `src/model/dit.rs`:
+  `rmsnorm_scale` + `gated_residual` helpers (mirror `norm_mod`) wired behind
+  `cfg(fusednorm)`; candle fallback unchanged. `fusednorm-test` prints the new
+  cosines.
+- **Self-tests vs candle: RMSNorm×weight cosine 0.999995 (N=4096) / 0.999999
+  (N=128); gated residual 0.999996.** dit-forward vs oracle overall_cos 0.999935
+  (UNCHANGED from the 0.999934 baseline).
+- **Denoise ~13.5 s -> ~10.8 s (40 steps, mean of 10679/10881 ms) = ~20% faster**
+  (0.338 -> 0.270 s/step) on convrot,sage,fusednorm. The win exceeds the ~10%
+  kernel fraction because the fusions also drop many small op launches and
+  bf16<->f32 casts. Cumulative fastest path: bf16 0.62 -> 0.27 s/step.
+- Remaining fusion levers: none obvious in the norm/residual buckets; attention
+  and the resident VAE decode dominate what's left.
 
 ### Copy-reduction audit (`qwen-image-rs-reduce-copies` issue — NEGATIVE RESULT, no code change)
 nsys of the fast path (`convrot,sage,fusednorm`, bf16 VAE) showed `ucopy_bf16` at
