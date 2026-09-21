@@ -27,13 +27,12 @@ CUDA default; `--convrot --text-gguf <gguf> --vae-tile 32`). Oracle parity held
 at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 dB.
 
 ### Speed today (1024², RTX 4090, measured 2026-09-21)
-- **Denoise: 0.27 s/step** (was bf16+flash 0.62) — **~2.3×**. VAE tiled bf16
-  decode **1.15 s** (was f32 1.84).
-- **Single `generate` (loads all 3 models each run): ~25.8 s** (40 steps); the
+- **Denoise: 0.247 s/step** (was bf16+flash 0.62) — **~2.5×**. VAE tiled bf16
+  decode **1.19 s** (was f32 1.84).
+- **Single `generate` (loads all 3 models each run): ~25 s** (40 steps); the
   ~14 s beyond compute is one-time model load (8 GB text GGUF mmap + DiT + VAE).
-- **`batch --resident` (models loaded once): ~12 s/image @40 steps, ~7.8 s/image
-  @25 steps** (enc ~25 ms + denoise 25×0.264 s + tiled decode ~1.15 s). Steady,
-  no VRAM drift — a serve loop yields a new image every ~8 s.
+- **`batch --resident` (models loaded once): ~11.1 s/image @40 steps** (enc
+  ~25 ms + denoise 40×0.247 s + tiled decode ~1.19 s). Steady, no VRAM drift.
 
 ### The optimization scoreboard (all via issue-lifecycle, all oracle-neutral)
 | lever | feature | denoise s/step |
@@ -44,7 +43,8 @@ at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 d
 | fused LayerNorm+AdaLN | fusednorm | 0.445 |
 | fused activation quantizer | convrot | 0.38 |
 | dequant→CUTLASS-EVT epilogue | convrot | 0.34 |
-| fused RMSNorm×weight + gated residual | fusednorm | **0.27** |
+| fused RMSNorm×weight + gated residual | fusednorm | 0.27 |
+| BSHD-native attention (no transpose copies) | sage | **0.247** |
 
 Plus (not per-step): bf16 VAE decode 1.57×; text encoder Q8_0 GGUF (resident
 VRAM); VAE tiling (constant decode memory); true CFG (`--guidance`/`--negative`,
@@ -63,12 +63,12 @@ sage attn 8.0% · bf16 GEMMs ~11% (non-convrot linears + VAE) · our 4 fused
 kernels ~11% total (each 1.8–3.6%, efficient) · silu 3% · one-time load
 weight-quant ~6.6% (224-inst kernels — NOT per-step). Remaining levers, by
 impact/effort:
-1. **BSHD-native fused attention** (biggest single target). Rewrite the sage
-   bridge (src/sage.rs + the `#[cfg(feature="sage")] attend` in dit.rs) to ingest
-   `(B,S,H,D)` directly, eliminating the ~8.4% `ucopy_bf16` transpose→contiguous
-   copies + the per-step V bf16→f16 cast, and tightening sage. LARGE rewrite,
-   but the only lever that kills the structural copies (the copy-reduction audit
-   proved they can't be removed at the Rust level — see that section).
+1. ~~**BSHD-native fused attention**~~ **DONE** (`qwen-image-rs-bshd-attention`,
+   commit a081ad5). See "BSHD-native fused attention" below — denoise
+   0.27→0.247 s/step (~8.5%), oracle 0.999934 unchanged, sage BSHD vs BHSD
+   bit-exact. Remaining follow-on: fuse Q/K quant INTO the rope kernel
+   (SageAttention's own IO trick), and a bf16-native-V PV path (the V f16 cast
+   remains, but no longer via a transpose).
 2. **VAE conv algorithm** (`im2col_bf16` ~10%). bf16 already; further needs
    implicit-GEMM / Winograd convs or a fused decoder — large.
 3. **Per-warp sage quant** (accuracy/speed refinement) + **SageAttention on
@@ -328,7 +328,42 @@ the LayerNorm+AdaLN fusion left untouched. Two more kernels in
 - Remaining fusion levers: none obvious in the norm/residual buckets; attention
   and the resident VAE decode dominate what's left.
 
-### Copy-reduction audit (`qwen-image-rs-reduce-copies` issue — NEGATIVE RESULT, no code change)
+### BSHD-native fused attention (DONE — `qwen-image-rs-bshd-attention`, commit a081ad5)
+Kills the transpose→contiguous copies the copy-reduction audit (below) proved
+unremovable at the Rust level. The sage path now keeps q/k/v in `(B,S,H,D)` end
+to end:
+- `kernels/sage/rope_bshd.cu` + `src/rope.rs` — a BSHD interleaved-RoPE
+  `CustomOp3` replaces candle `rope_i` (which forces `(B,H,S,D)`), so q/k are
+  never transposed for RoPE. Parity vs candle `rope_i`: cosine **0.999996**.
+- `kernels/sage/sage_ffi.cu` — stride-parameterized launchers
+  (`sage_quant_q/k_bshd` read bf16 in BSHD, write int8 **HND**;
+  `sage_attn_bshd` reads int8 q/k HND, V + O in BSHD). The vendored kernels are
+  UNCHANGED — they already honor independent `stride_bz/seq/h` for q/k/v/o
+  (base ptrs at `qk_int_sv_f16_sm80.cuh:198-200`, O store `:634`) and separate
+  quant in/out strides (`fused_quant.cuh:65-92`). Only head_dim need be stride-1
+  (true in HND and BSHD).
+- `src/sage.rs` `sage_attention_bshd` — CustomOp3 that honors each view's
+  `Layout::start_offset()` + strides, so the block-causal S-axis narrows (text
+  prefix / image queries) are **zero-copy views** (offsets the device ptr by
+  `start_offset*2` bytes). `debug_assert!(b==1)` marks the validated envelope
+  (stride-honoring would also be correct for B>1, but that's untested). The old
+  `(B,H,S,D)` `sage_attention` is retained ONLY as the equivalence oracle.
+- `src/model/dit.rs` — `forward()` branches on `cfg(sage)`: BSHD path (no
+  transpose, `rope_i_bshd`, `attend_bshd` with dim-1 narrows + `Tensor::cat`,
+  BSHD out); flash/naive paths unchanged.
+- **Validation:** sage BSHD vs the retained BHSD path (same block-causal split)
+  **cosine 1.000000, maxabs 0.0** — bit-exact, so images are identical to the
+  pre-change fast path. dit-forward `--convrot` vs oracle **0.999934**
+  (UNCHANGED). Denoise **0.270→0.247 s/step** (~8.5%, 9885 ms/40 resident) —
+  matches the predicted ~8.4% ucopy fraction. nsys: `ucopy_bf16` fell from
+  ~8.4% (2785 inst / 10-step denoise) to ~2.5% (377 inst) in a FULL generate
+  trace that also includes VAE decode + the bf16 text encoder; the residual is
+  VAE + the `ot||oi` cat, not attention transposes.
+- Follow-ons (not done): fuse Q/K quant INTO the rope kernel (thu-ml's own IO
+  trick — avoids a separate rope pass); bf16-native-V PV kernel (the V f16 cast
+  survives, but no longer behind a transpose).
+
+### Copy-reduction audit (`qwen-image-rs-reduce-copies` issue — NEGATIVE RESULT, superseded by BSHD attention above)
 nsys of the fast path (`convrot,sage,fusednorm`, bf16 VAE) showed `ucopy_bf16` at
 6.9% (2785 instances / 10-step denoise ≈ 278/step) — plain `.contiguous()` memory
 copies. Audited every fast-path `.contiguous()` for redundant (already-contiguous)
@@ -472,7 +507,7 @@ attn: 4096 OK). ConvRotLinear input dim K = the linear's in_features.
 Phase ports (complete): `-oracle`, `-vae`, `-text-encoder`, `-dit`.
 Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-dequant-epilogue` (CUTLASS EVT), `-fused-rmsnorm-gate` (RMSNorm+gated residual),
-`-vae-bf16`.
+`-vae-bf16`, `-bshd-attention` (BSHD-native fused attention).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path
 `.contiguous()` load-bearing; see "Copy-reduction audit"); `-fused-dequant`
 (closed — superseded by `-dequant-epilogue` which shipped it).

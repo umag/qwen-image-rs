@@ -18,10 +18,9 @@ static __global__ void rope_i_bshd_kernel(__nv_bfloat16 *__restrict__ out,
   int token_head = blockIdx.x;   // 0 .. B*S*H
   int j = threadIdx.x;           // 0 .. Dhalf
   if (j >= Dhalf) return;
-  int h = token_head % H;
+  // cos/sin are indexed by sequence position s (head-independent). b and h drop
+  // out because the (B,S,H,D) base offset is linear in token_head.
   int s = (token_head / H) % S;
-  // b = token_head / (S*H) — not needed explicitly; base is linear.
-  (void)h;
   int D = Dhalf * 2;
   const __nv_bfloat16 *xb = in + (size_t)token_head * D;
   __nv_bfloat16 *ob = out + (size_t)token_head * D;
