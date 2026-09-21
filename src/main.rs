@@ -491,6 +491,7 @@ fn batch(
         let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
         tracing::info!("resident: all three models loaded, streaming prompts");
         for (i, p) in prompts.iter().enumerate() {
+            let t_enc = std::time::Instant::now();
             let ids: Vec<u32> = tok
                 .encode(tmpl::t2i_template(p), false)
                 .map_err(|e| anyhow::anyhow!("encode: {e}"))?
@@ -501,6 +502,9 @@ fn batch(
                 .forward(&Tensor::from_vec(ids, (1, seq), &dev)?)?
                 .narrow(1, drop, seq - drop)?
                 .contiguous()?;
+            dev.synchronize()?;
+            let enc_ms = t_enc.elapsed().as_millis();
+            let t_dn = std::time::Instant::now();
             dev.set_seed(seed + i as u64)?;
             let mut latents =
                 Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?.to_dtype(DType::F32)?;
@@ -511,9 +515,11 @@ fn batch(
                 let np = joint.narrow(1, jl - img_seq, img_seq)?.to_dtype(DType::F32)?;
                 latents = (latents + (np * sched.dt(si))?)?;
             }
+            dev.synchronize()?;
+            let dn_ms = t_dn.elapsed().as_millis();
             let img = vmodel.decode(&vae::unpack_latents(&latents, 64)?)?;
             save_png(&img, out_dir.join(format!("{i:03}.png")))?;
-            tracing::info!(image = i, "done (resident)");
+            tracing::info!(image = i, enc_ms, denoise_ms = dn_ms, "done (resident)");
         }
         println!(
             "wrote {} images to {} (resident)",
