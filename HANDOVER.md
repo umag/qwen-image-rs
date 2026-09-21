@@ -178,6 +178,22 @@ SageAttention. Interesting future source for a **fused AdaLN/RMS-AdaLN** kernel
 NVFP4/MXFP8/MXFP4 are Blackwell (sm120) — no use on Ada; our INT8 convrot+sage
 already cover the 4090 wins. No model impls, no ConvRot scheme.
 
+### Fused LayerNorm+AdaLN kernel (DONE — `fusednorm` feature)
+Driven through the issue-lifecycle (`qwen-image-rs-fused-adaln`). nsys showed
+~22% of denoise GPU time in unfused norm/modulation ops + ~11k bf16<->f32 casts.
+`kernels/fusednorm/fused_norm.cu` fuses `norm_no_affine(x)*(scale+1)` into one
+CTA-per-row kernel (f32 mean/var in shared mem, bf16 in/out) + AdaLN affine;
+candle `CustomOp2` bridge in `src/fusednorm.rs`; `norm_mod` helper in dit.rs
+wires it at the 2 block norms + norm_out behind the `fusednorm` feature (candle
+fallback unchanged). `fusednorm-test` verb.
+- **Unit: fused vs candle cosine 0.999996.** Integration: dit-forward vs oracle
+  0.999929 (unchanged from convrot+sage 0.999924).
+- **Denoise 20.3 s -> 17.8 s (40 steps) = ~12% faster** (0.51 -> 0.445 s/step) on
+  the convrot,sage,fusednorm path. Recommended fast build now:
+  `--features convrot,sage,fusednorm`.
+- Scope: LayerNorm+affine only (the dominant bucket). RMSNorm variants
+  (ZeroCenterRmsNorm/HeadRmsNorm) are a possible follow-on fusion.
+
 ### Future levers
 - **Faster resident encode** — the Q8 te forward dominates resident per-image
   time; cache dequantized bf16 weights once after load (trades VRAM), or use a
