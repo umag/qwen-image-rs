@@ -17,6 +17,28 @@ it into this candle project is scoped below.
    to CUTLASS 3.x collective (SM100) or CUTLASS 2.x `mma.sync` (Ada/Ampere, our
    sm89 path). int8 in, int32 accumulate, bf16 out.
 
+## Build finding (important)
+The sgl `.cu` depends on **sgl-kernel's own CUTLASS extensions**, not just stock
+CUTLASS: `cutlass_extensions/{epilogue_per_row_per_col_scale.h,
+gemm_universal_base_compat.h, gemm_with_epilogue_visitor.h}` + a torch-coupled
+`utils.h` (`device_sm_version`, `CHECK_INPUT`). A faithful FFI must vendor that
+whole slice + torch-decouple `utils.h`. For sm89 only the CUTLASS **2.x**
+`run_convrot_int8_gemm_mma_sync` path is used (drop all Sm90/Sm100 3.x/cute code).
+
+## RECOMMENDED simpler path (avoids the sgl extension headers)
+The sgl kernel fuses per-row×per-col dequant into a custom CUTLASS epilogue
+visitor (hence the extension headers). We don't need that fusion:
+1. **Rotate + quantize in candle** (no custom kernel): rotation is done
+   (`rotation.rs`); add per-token amax INT8 quant (candle ops). Same for the
+   weight offline (per-channel INT8), folded with `fold_weight`.
+2. **One stock-CUTLASS 2.x INT8 GEMM** `C(int32) = A(int8) @ Bᵀ(int8)` via
+   `cutlass::gemm::device::Gemm<int8,RowMajor, int8,ColumnMajor, int32,RowMajor,
+   int32, OpClassTensorOp, Sm80, ...>` + trivial `LinearCombination<int32>` — the
+   canonical CUTLASS int8 example, **stock headers only**, builds for sm89.
+3. **Dequant in candle**: `out_bf16 = int32.to(f32) * x_scale[m] * w_scale[n]
+   (+bias)` — cheap elementwise pass.
+This shrinks the FFI to ONE small stock-CUTLASS kernel; everything else is candle.
+
 ## Integration steps (the remaining work)
 1. **Decouple torch**: drop `torch/all.h`, `ATen/cuda/CUDAContext.h`, `c10/...`;
    replace `TORCH_CHECK` with `assert`; rewrite the two GEMM launchers to take
@@ -42,9 +64,20 @@ it into this candle project is scoped below.
    bench the int8 GEMM vs bf16 (expect ~2x on the MLP).
 
 ## Status
-- ✅ Rotation foundation in candle (`src/model/rotation.rs`) validated (this is
-  the same H/sqrt(N) rotation the kernel fuses — useful as a CPU oracle).
-- ✅ Kernel vendored + interface understood.
-- ⬜ Steps 1–6 above (the FFI build + bridge + validate) — a focused session.
-  Main risk: the CUTLASS build config for the sm89 int8 path, and the
-  candle↔cudarc device-pointer bridge.
+- ✅ Rotation foundation in candle (`src/model/rotation.rs`) validated.
+- ✅ Kernel vendored + interface understood; sgl extension-header dependency found.
+- ✅ **INT8 tensor-core GEMM PROVEN** (`kernels/convrot/int8_gemm.cu`, the simpler
+  stock-CUTLASS path): compiles for sm89 + runs + **bit-exact vs CPU** on the 4090.
+  This was the biggest risk — it works. `int8_gemm_s32(int32* C, int8* A, int8* B,
+  M, N, K, stream)`.
+- ⚠️ **CUTLASS build note:** the flash-attn-vendored CUTLASS checkout has a
+  `matrix.h` `set_slice3x3` bug that **CUDA 13.3 rejects**. Use a FRESH CUTLASS:
+  `git clone --depth 1 https://github.com/NVIDIA/cutlass` (cloned to
+  `~/dev_tmp/cutlass` on the host). Compile: `nvcc -arch=sm_89 -std=c++17
+  --expt-relaxed-constexpr -I~/dev_tmp/cutlass/include`.
+- ⬜ **Remaining (Rust integration):** (1) `build.rs` compiling `int8_gemm.cu`
+  (via `cc`/`bindgen_cuda`, pin CUTLASS) + link; (2) candle↔cudarc **device-ptr
+  bridge** (candle CUDA tensor -> raw `int8*`/`int32*`); (3) candle rotate+per-token
+  INT8 quant (activation) + per-channel INT8 weight (offline) + int32→bf16 dequant;
+  (4) `ConvRotLinear` behind `--convrot`, mixed precision; (5) validate DiT/image
+  vs bf16. The GEMM + rotation are done; this is plumbing + the pointer bridge.
