@@ -51,6 +51,23 @@ enum Command {
         #[arg(long)]
         out: std::path::PathBuf,
     },
+    /// Run the full flow-match denoise loop (DiT x N steps) to a final latent (Phase 4).
+    Denoise {
+        /// transformer/ weights directory.
+        #[arg(long)]
+        weights: std::path::PathBuf,
+        /// safetensors with initial noise under `hidden_states` (or `latent`).
+        #[arg(long)]
+        noise: std::path::PathBuf,
+        /// safetensors with prompt embeddings under `embeds`.
+        #[arg(long)]
+        embeds: std::path::PathBuf,
+        #[arg(long, default_value_t = 40)]
+        steps: usize,
+        /// Output final latent safetensors path.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
     /// Run one DiT forward on dumped inputs and save the joint output (Phase 4).
     DitForward {
         /// The transformer/ directory (config.json + *.safetensors shards).
@@ -106,7 +123,83 @@ fn main() -> Result<()> {
             inputs,
             out,
         } => dit_forward(&weights, &inputs, &out),
+        Command::Denoise {
+            weights,
+            noise,
+            embeds,
+            steps,
+            out,
+        } => denoise(&weights, &noise, &embeds, steps, &out),
     }
+}
+
+/// Phase 4: full flow-match denoise loop -> final latent.
+fn denoise(
+    weights: &std::path::Path,
+    noise: &std::path::Path,
+    embeds: &std::path::Path,
+    steps: usize,
+    out: &std::path::Path,
+) -> Result<()> {
+    use qwen_image_rs::model::dit::QwenImageDit;
+    use qwen_image_rs::model::scheduler::{FlowConfig, FlowMatchEuler};
+
+    let dev = device::best_device()?;
+    let dtype = if matches!(dev, candle_core::Device::Cuda(_)) {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    tracing::info!(device = device::label(&dev), steps, "denoise");
+
+    let set = WeightSet::resolve(weights)?;
+    let files = set.files.clone();
+    let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &dev)? };
+    let model = QwenImageDit::load(32, 64, vb)?;
+
+    let nmap = candle_core::safetensors::load(noise, &dev)?;
+    let mut latents = nmap
+        .get("hidden_states")
+        .or_else(|| nmap.get("latent"))
+        .context("noise file needs `hidden_states` or `latent`")?
+        .to_dtype(DType::F32)?;
+    if latents.dims().len() == 2 {
+        latents = latents.unsqueeze(0)?;
+    }
+    let (_b, img_seq, _) = latents.dims3()?;
+    let hw = (img_seq as f64).sqrt() as usize;
+
+    let emap = candle_core::safetensors::load(embeds, &dev)?;
+    let mut enc = emap
+        .get("embeds")
+        .context("embeds file needs `embeds`")?
+        .clone();
+    if enc.dims().len() == 2 {
+        enc = enc.unsqueeze(0)?;
+    }
+    let enc = enc.to_dtype(dtype)?;
+
+    let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
+    let ts = sched.timesteps().to_vec();
+    for (i, t) in ts.iter().enumerate() {
+        let tt = Tensor::from_vec(vec![(*t / 1000.0) as f32], (1,), &dev)?;
+        let out_joint = model.forward(&latents.to_dtype(dtype)?, &enc, &tt, hw, hw)?;
+        // image tokens = last img_seq of the joint sequence
+        let (_b, joint, _) = out_joint.dims3()?;
+        let noise_pred = out_joint
+            .narrow(1, joint - img_seq, img_seq)?
+            .to_dtype(DType::F32)?;
+        latents = (latents + (noise_pred * sched.dt(i))?)?;
+        if i % 10 == 0 || i + 1 == ts.len() {
+            tracing::info!(step = i, t, "denoising");
+        }
+    }
+
+    let mut map = std::collections::HashMap::new();
+    map.insert("latent".to_string(), latents.contiguous()?); // (1, seq, 64)
+    candle_core::safetensors::save(&map, out)?;
+    println!("wrote {} ({} steps)", out.display(), steps);
+    Ok(())
 }
 
 /// Phase 4: run one DiT forward on dumped inputs, save the joint output.
