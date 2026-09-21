@@ -81,6 +81,9 @@ enum Command {
         /// Negative prompt for CFG (used only when --guidance > 1).
         #[arg(long, default_value = "")]
         negative: String,
+        /// Force the VAE decode in f32 (default: bf16 on CUDA).
+        #[arg(long)]
+        vae_f32: bool,
         #[arg(long)]
         out: std::path::PathBuf,
     },
@@ -122,6 +125,9 @@ enum Command {
         /// Negative prompt for CFG (used only when --guidance > 1).
         #[arg(long, default_value = "")]
         negative: String,
+        /// Force the VAE decode in f32 (default: bf16 on CUDA).
+        #[arg(long)]
+        vae_f32: bool,
         /// Output directory (writes 000.png, 001.png, ...).
         #[arg(long)]
         out_dir: std::path::PathBuf,
@@ -216,6 +222,9 @@ enum Command {
         /// A packed latent saved by scripts/oracle.py (`*.latent.pt`).
         #[arg(long)]
         latent: std::path::PathBuf,
+        /// Decode the VAE in bf16 (default: f32 reference).
+        #[arg(long)]
+        bf16: bool,
         /// Output PNG path.
         #[arg(long)]
         out: std::path::PathBuf,
@@ -249,6 +258,7 @@ fn main() -> Result<()> {
             vae_tile,
             guidance,
             negative,
+            vae_f32,
             out_dir,
         } => batch(
             &model,
@@ -264,6 +274,7 @@ fn main() -> Result<()> {
             vae_tile,
             guidance,
             &negative,
+            vae_f32,
             &out_dir,
         ),
         Command::Info { weights } => info(&weights),
@@ -280,6 +291,7 @@ fn main() -> Result<()> {
             vae_tile,
             guidance,
             negative,
+            vae_f32,
             out,
         } => generate(
             &model,
@@ -294,6 +306,7 @@ fn main() -> Result<()> {
             vae_tile,
             guidance,
             &negative,
+            vae_f32,
             &out,
         ),
         Command::PrequantizeText { weights, out } => prequantize_text(&weights, &out),
@@ -301,8 +314,9 @@ fn main() -> Result<()> {
         Command::VaeDecode {
             weights,
             latent,
+            bf16,
             out,
-        } => vae_decode(&weights, &latent, &out),
+        } => vae_decode(&weights, &latent, bf16, &out),
         Command::TextEncode {
             weights,
             input_ids,
@@ -399,6 +413,7 @@ fn generate(
     vae_tile: usize,
     guidance: f32,
     negative: &str,
+    vae_f32: bool,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -417,6 +432,9 @@ fn generate(
         let files = WeightSet::resolve(&dir)?.files;
         Ok(unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dt, &dev)? })
     };
+    // The VAE runs in bf16 on CUDA by default (tensor-core convs, ~2x decode);
+    // --vae-f32 forces the f32 reference path.
+    let vae_dt = if vae_f32 { DType::F32 } else { dtype };
 
     // Tokenize the t2i chat template; drop = system-prefix token count.
     let tok = Tokenizer::from_file(model.join("processor/tokenizer.json"))
@@ -498,7 +516,7 @@ fn generate(
         &VaeConfig::default(),
         &f32vec("latents_mean"),
         &f32vec("latents_std"),
-        load_vb(model.join("vae"), DType::F32)?,
+        load_vb(model.join("vae"), vae_dt)?,
     )?;
     let z = vae::unpack_latents(&latent, 64)?;
     let img = if vae_tile > 0 {
@@ -532,6 +550,7 @@ fn batch(
     vae_tile: usize,
     guidance: f32,
     negative: &str,
+    vae_f32: bool,
     out_dir: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -550,6 +569,9 @@ fn batch(
         let files = WeightSet::resolve(&dir)?.files;
         Ok(unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dt, &dev)? })
     };
+    // The VAE runs in bf16 on CUDA by default (tensor-core convs, ~2x decode);
+    // --vae-f32 forces the f32 reference path.
+    let vae_dt = if vae_f32 { DType::F32 } else { dtype };
     std::fs::create_dir_all(out_dir)?;
 
     let prompts: Vec<String> = std::fs::read_to_string(prompts_path)?
@@ -603,7 +625,7 @@ fn batch(
             &VaeConfig::default(),
             &vae_cfg("latents_mean")?,
             &vae_cfg("latents_std")?,
-            load_vb(model.join("vae"), DType::F32)?,
+            load_vb(model.join("vae"), vae_dt)?,
         )?;
         let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
         // Negative embedding (encoded once; shared by every prompt) for CFG.
@@ -747,7 +769,7 @@ fn batch(
         &VaeConfig::default(),
         &vae_cfg("latents_mean")?,
         &vae_cfg("latents_std")?,
-        load_vb(model.join("vae"), DType::F32)?,
+        load_vb(model.join("vae"), vae_dt)?,
     )?;
     for (i, lat) in latents_list.iter().enumerate() {
         let z = vae::unpack_latents(lat, 64)?;
@@ -935,6 +957,7 @@ fn text_encode(
 fn vae_decode(
     weights: &std::path::Path,
     latent: &std::path::Path,
+    bf16: bool,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::{config::VaeConfig, vae};
@@ -961,7 +984,8 @@ fn vae_decode(
     // Resolve the safetensors shard(s) in the vae dir.
     let set = WeightSet::resolve(weights)?;
     let files: Vec<_> = set.files.clone();
-    let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, DType::F32, &dev)? };
+    let vae_dt = if bf16 { DType::BF16 } else { DType::F32 };
+    let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, vae_dt, &dev)? };
     let model = vae::QwenImageVae::load(&cfg, &latents_mean, &latents_std, vb)?;
 
     // Load the packed latent. Prefer a safetensors sidecar (candle-native);

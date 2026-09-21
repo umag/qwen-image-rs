@@ -45,15 +45,18 @@ impl RmsNorm {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // F.normalize: x / max(||x||_2 over C, 1e-12)
-        let norm = x
+        // F.normalize: x / max(||x||_2 over C, 1e-12). Reduce in f32 (bf16 sums
+        // over the channel dim lose precision / the 1e-12 eps vanishes), then
+        // cast back to the working dtype and apply gamma.
+        let dt = x.dtype();
+        let xf = x.to_dtype(DType::F32)?;
+        let norm = xf
             .sqr()?
             .sum_keepdim(1)?
             .sqrt()?
             .clamp(1e-12, f64::INFINITY)?;
-        let normalized = x.broadcast_div(&norm)?;
-        let scaled = (normalized * self.scale)?;
-        Ok(scaled.broadcast_mul(&self.gamma)?)
+        let normalized = (xf.broadcast_div(&norm)? * self.scale)?.to_dtype(dt)?;
+        Ok(normalized.broadcast_mul(&self.gamma)?)
     }
 }
 
@@ -340,8 +343,9 @@ impl Decoder3d {
 pub struct QwenImageVae {
     post_quant_conv: Conv2d,
     decoder: Decoder3d,
-    latents_mean: Tensor, // (1, z, 1, 1)
-    latents_std: Tensor,  // (1, z, 1, 1)
+    latents_mean: Tensor, // (1, z, 1, 1) f32
+    latents_std: Tensor,  // (1, z, 1, 1) f32
+    dtype: DType,         // conv working dtype (bf16 on CUDA, f32 fallback)
 }
 
 impl QwenImageVae {
@@ -358,6 +362,7 @@ impl QwenImageVae {
         let mean = Tensor::from_slice(latents_mean, (1, z, 1, 1), &dev)?;
         let std = Tensor::from_slice(latents_std, (1, z, 1, 1), &dev)?;
         Ok(Self {
+            dtype: vb.dtype(),
             post_quant_conv: conv2d_k1(z, z, vb.pp("post_quant_conv"))?,
             decoder: Decoder3d::load(cfg, vb.pp("decoder"))?,
             latents_mean: mean,
@@ -368,10 +373,13 @@ impl QwenImageVae {
     /// Decode an already-unpacked, normalized latent `(B, z, H, W)` into an RGBA
     /// image `(B, 4, H*16, W*16)` in [-1, 1] (pre postprocess).
     pub fn decode(&self, z_normalized: &Tensor) -> Result<Tensor> {
-        // unnormalize: z = z_norm * std + mean  (diffusers stores latents_std as 1/std)
+        // Unnormalize in f32 (per-channel std/mean; latents_std stores 1/std),
+        // then cast to the conv working dtype (bf16 on CUDA → tensor-core convs).
         let z = z_normalized
+            .to_dtype(DType::F32)?
             .broadcast_mul(&self.latents_std)?
-            .broadcast_add(&self.latents_mean)?;
+            .broadcast_add(&self.latents_mean)?
+            .to_dtype(self.dtype)?;
         let x = self.post_quant_conv.forward(&z)?;
         let out = self.decoder.forward(&x)?;
         Ok(out.clamp(-1.0, 1.0)?)
