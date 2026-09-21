@@ -68,6 +68,10 @@ enum Command {
         /// instead of quantizing on load — smaller VRAM pool, no ~58 s load.
         #[arg(long)]
         text_gguf: Option<std::path::PathBuf>,
+        /// VAE tiled decode: latent tile size (0 = off). Caps decode peak memory
+        /// (~tile²) so it fits alongside co-resident models. Try 32.
+        #[arg(long, default_value_t = 0)]
+        vae_tile: usize,
         #[arg(long)]
         out: std::path::PathBuf,
     },
@@ -100,6 +104,9 @@ enum Command {
         /// Load the text encoder from a pre-quantized GGUF (from prequantize-text).
         #[arg(long)]
         text_gguf: Option<std::path::PathBuf>,
+        /// VAE tiled decode: latent tile size (0 = off). Try 32 for resident.
+        #[arg(long, default_value_t = 0)]
+        vae_tile: usize,
         /// Output directory (writes 000.png, 001.png, ...).
         #[arg(long)]
         out_dir: std::path::PathBuf,
@@ -223,10 +230,11 @@ fn main() -> Result<()> {
             quant_text,
             resident,
             text_gguf,
+            vae_tile,
             out_dir,
         } => batch(
             &model, &prompts, size, steps, seed, quant, convrot, quant_text, resident,
-            text_gguf.as_deref(), &out_dir,
+            text_gguf.as_deref(), vae_tile, &out_dir,
         ),
         Command::Info { weights } => info(&weights),
         Command::Generate {
@@ -239,10 +247,11 @@ fn main() -> Result<()> {
             convrot,
             quant_text,
             text_gguf,
+            vae_tile,
             out,
         } => generate(
             &model, &prompt, size, steps, seed, quant, convrot, quant_text,
-            text_gguf.as_deref(), &out,
+            text_gguf.as_deref(), vae_tile, &out,
         ),
         Command::PrequantizeText { weights, out } => prequantize_text(&weights, &out),
         Command::PrequantizeConvrot { weights, out } => prequantize_convrot(&weights, &out),
@@ -312,6 +321,7 @@ fn generate(
     convrot: bool,
     quant_text: bool,
     text_gguf: Option<&std::path::Path>,
+    vae_tile: usize,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -396,7 +406,11 @@ fn generate(
         load_vb(model.join("vae"), DType::F32)?,
     )?;
     let z = vae::unpack_latents(&latent, 64)?;
-    let img = vmodel.decode(&z)?;
+    let img = if vae_tile > 0 {
+        vmodel.decode_tiled(&z, vae_tile, (vae_tile / 4).max(1))?
+    } else {
+        vmodel.decode(&z)?
+    };
     let (w, h, bytes) = vae::to_rgba_u8(&img)?;
     let buf: image::RgbaImage =
         image::ImageBuffer::from_raw(w as u32, h as u32, bytes).context("image buffer")?;
@@ -420,6 +434,7 @@ fn batch(
     quant_text: bool,
     resident: bool,
     text_gguf: Option<&std::path::Path>,
+    vae_tile: usize,
     out_dir: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -517,9 +532,17 @@ fn batch(
             }
             dev.synchronize()?;
             let dn_ms = t_dn.elapsed().as_millis();
-            let img = vmodel.decode(&vae::unpack_latents(&latents, 64)?)?;
+            let t_dec = std::time::Instant::now();
+            let z = vae::unpack_latents(&latents, 64)?;
+            let img = if vae_tile > 0 {
+                vmodel.decode_tiled(&z, vae_tile, (vae_tile / 4).max(1))?
+            } else {
+                vmodel.decode(&z)?
+            };
+            dev.synchronize()?;
+            let dec_ms = t_dec.elapsed().as_millis();
             save_png(&img, out_dir.join(format!("{i:03}.png")))?;
-            tracing::info!(image = i, enc_ms, denoise_ms = dn_ms, "done (resident)");
+            tracing::info!(image = i, enc_ms, denoise_ms = dn_ms, decode_ms = dec_ms, "done (resident)");
         }
         println!(
             "wrote {} images to {} (resident)",
@@ -577,7 +600,12 @@ fn batch(
         load_vb(model.join("vae"), DType::F32)?,
     )?;
     for (i, lat) in latents_list.iter().enumerate() {
-        let img = vmodel.decode(&vae::unpack_latents(lat, 64)?)?;
+        let z = vae::unpack_latents(lat, 64)?;
+        let img = if vae_tile > 0 {
+            vmodel.decode_tiled(&z, vae_tile, (vae_tile / 4).max(1))?
+        } else {
+            vmodel.decode(&z)?
+        };
         save_png(&img, out_dir.join(format!("{i:03}.png")))?;
     }
     println!("wrote {} images to {}", prompts.len(), out_dir.display());

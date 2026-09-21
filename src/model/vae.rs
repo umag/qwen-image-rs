@@ -376,6 +376,69 @@ impl QwenImageVae {
         let out = self.decoder.forward(&x)?;
         Ok(out.clamp(-1.0, 1.0)?)
     }
+
+    /// Tiled decode: split the latent into overlapping `tile`×`tile` (latent)
+    /// windows, decode each, and feather-blend them into the full image. Peak
+    /// memory scales with the tile size², not the image size², so the decode
+    /// fits alongside co-resident models (fixes the resident-mode VAE thrash).
+    /// `overlap` (latent) is blended with a linear feather to hide seams.
+    /// Scale factor latent→image is 16.
+    pub fn decode_tiled(&self, z_normalized: &Tensor, tile: usize, overlap: usize) -> Result<Tensor> {
+        let (b, _c, h, w) = z_normalized.dims4()?;
+        if tile == 0 || (tile >= h && tile >= w) {
+            return self.decode(z_normalized); // one tile — no benefit
+        }
+        const SCALE: usize = 16;
+        let stride = tile.saturating_sub(overlap).max(1);
+        let blend_px = (overlap * SCALE).max(1) as f32;
+        let dev = z_normalized.device().clone();
+        let (ph, pw) = (h * SCALE, w * SCALE);
+        let out_c = 4usize; // RGBA
+        let mut canvas = Tensor::zeros((b, out_c, ph, pw), DType::F32, &dev)?;
+        let mut wsum = Tensor::zeros((1usize, 1usize, ph, pw), DType::F32, &dev)?;
+        // Linear feather that plateaus at 1 in the interior and ramps toward the
+        // edges; floored above 0 so the outer border (covered by one tile) is
+        // recovered exactly after the division.
+        let feather = |len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|k| (((k + 1).min(len - k)) as f32 / blend_px).clamp(1.0 / blend_px, 1.0))
+                .collect()
+        };
+        let mut i = 0;
+        loop {
+            let th = tile.min(h - i);
+            let mut j = 0;
+            loop {
+                let tw = tile.min(w - j);
+                let ztile = z_normalized.narrow(2, i, th)?.narrow(3, j, tw)?.contiguous()?;
+                let dec = self.decode(&ztile)?.to_dtype(DType::F32)?; // (b,4,th*S,tw*S)
+                let (pi, pj, pth, ptw) = (i * SCALE, j * SCALE, th * SCALE, tw * SCALE);
+                let wy = Tensor::from_vec(feather(pth), (1, 1, pth, 1), &dev)?;
+                let wx = Tensor::from_vec(feather(ptw), (1, 1, 1, ptw), &dev)?;
+                let mask = wy.broadcast_mul(&wx)?; // (1,1,pth,ptw)
+                let weighted = dec.broadcast_mul(&mask)?;
+                let cregion = canvas.narrow(2, pi, pth)?.narrow(3, pj, ptw)?;
+                canvas = canvas.slice_assign(
+                    &[0..b, 0..out_c, pi..pi + pth, pj..pj + ptw],
+                    &(cregion + weighted)?.contiguous()?,
+                )?;
+                let wregion = wsum.narrow(2, pi, pth)?.narrow(3, pj, ptw)?;
+                wsum = wsum.slice_assign(
+                    &[0..1, 0..1, pi..pi + pth, pj..pj + ptw],
+                    &(wregion + mask)?.contiguous()?,
+                )?;
+                if tw >= w - j {
+                    break;
+                }
+                j += stride;
+            }
+            if th >= h - i {
+                break;
+            }
+            i += stride;
+        }
+        Ok(canvas.broadcast_div(&wsum)?.clamp(-1.0, 1.0)?)
+    }
 }
 
 /// Unpack the 2.1 pipeline's token latent `(B, seq, C)` into `(B, C, H, W)`.
