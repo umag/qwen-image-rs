@@ -88,35 +88,27 @@ pub fn int8_gemm(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 }
 
 /// End-to-end bridge self-test: candle U8(int8) tensors -> kernel -> candle I32,
-/// compared to an f32 reference. Returns the max abs difference (should be 0).
-pub fn self_test() -> Result<f32> {
-    use candle_core::{DType, Device};
+/// compared to a CPU int reference. Only the kernel runs on the GPU (host-side
+/// compare avoids needing candle cast kernels). Returns the max abs difference.
+pub fn self_test() -> Result<i64> {
+    use candle_core::Device;
     let dev = Device::new_cuda(0)?;
     let (m, n, k) = (64usize, 128usize, 256usize);
     let ai: Vec<i8> = (0..m * k).map(|i| ((i * 7) % 15) as i8 - 7).collect();
     let bi: Vec<i8> = (0..n * k).map(|i| ((i * 13) % 15) as i8 - 7).collect();
-    let a_u8 = Tensor::from_vec(
-        ai.iter().map(|&v| v as u8).collect::<Vec<u8>>(),
-        (m, k),
-        &dev,
-    )?;
-    let b_u8 = Tensor::from_vec(
-        bi.iter().map(|&v| v as u8).collect::<Vec<u8>>(),
-        (n, k),
-        &dev,
-    )?;
-    let c = int8_gemm(&a_u8, &b_u8)?.to_dtype(DType::F32)?;
+    let a_u8 = Tensor::from_vec(ai.iter().map(|&v| v as u8).collect::<Vec<u8>>(), (m, k), &dev)?;
+    let b_u8 = Tensor::from_vec(bi.iter().map(|&v| v as u8).collect::<Vec<u8>>(), (n, k), &dev)?;
+    let c: Vec<i32> = int8_gemm(&a_u8, &b_u8)?.flatten_all()?.to_vec1::<i32>()?;
 
-    let af = Tensor::from_vec(
-        ai.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
-        (m, k),
-        &dev,
-    )?;
-    let bf = Tensor::from_vec(
-        bi.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
-        (n, k),
-        &dev,
-    )?;
-    let cref = af.matmul(&bf.t()?)?;
-    Ok((c - cref)?.abs()?.max_all()?.to_scalar::<f32>()?)
+    let mut maxdiff = 0i64;
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0i64;
+            for kk in 0..k {
+                acc += ai[mi * k + kk] as i64 * bi[ni * k + kk] as i64;
+            }
+            maxdiff = maxdiff.max((acc - c[mi * n + ni] as i64).abs());
+        }
+    }
+    Ok(maxdiff)
 }

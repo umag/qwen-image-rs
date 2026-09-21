@@ -667,8 +667,8 @@ fn convrot_test() -> Result<()> {
     {
         let maxdiff = qwen_image_rs::convrot::self_test()?;
         println!(
-            "convrot int8-gemm bridge: max abs diff vs f32 = {maxdiff} ({})",
-            if maxdiff == 0.0 {
+            "convrot int8-gemm bridge: max abs diff vs CPU int ref = {maxdiff} ({})",
+            if maxdiff == 0 {
                 "EXACT — bridge OK"
             } else {
                 "MISMATCH"
