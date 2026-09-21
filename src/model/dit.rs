@@ -250,11 +250,42 @@ impl Attention {
         Ok(self.to_out.forward(&out.reshape((b, s, INNER))?)?)
     }
 
+    /// With `sage`: same block-causal split as the flash path, but each half
+    /// runs SageAttention (INT8-QK / FP16-PV). Image queries attend to the whole
+    /// joint sequence (non-causal); the `txt_len` text queries attend causally
+    /// to the text prefix. `qh,kh` are (B,H,S,D); `vv` is (B,S,H,D). Returns
+    /// (B,S,H,D). Takes precedence over flash-attn when both features are on.
+    #[cfg(feature = "sage")]
+    fn attend(
+        &self,
+        qh: &Tensor,
+        kh: &Tensor,
+        vv: &Tensor,
+        mask: &Tensor,
+        txt_len: usize,
+        scale: f64,
+    ) -> Result<Tensor> {
+        let _ = mask;
+        let (_b, _h, s, _d) = qh.dims4()?;
+        let vh = vv.transpose(1, 2)?.contiguous()?; // (B,H,S,D)
+        let sc = scale as f32;
+        // text prefix: causal over [0, txt_len)
+        let qt = qh.narrow(2, 0, txt_len)?.contiguous()?;
+        let kt = kh.narrow(2, 0, txt_len)?.contiguous()?;
+        let vt = vh.narrow(2, 0, txt_len)?.contiguous()?;
+        let ot = crate::sage::sage_attention(&qt, &kt, &vt, sc, true)?; // (B,H,txt,D)
+        // image queries: full non-causal attention over the whole sequence
+        let qi = qh.narrow(2, txt_len, s - txt_len)?.contiguous()?;
+        let oi = crate::sage::sage_attention(&qi, &kh.contiguous()?, &vh, sc, false)?; // (B,H,s-txt,D)
+        let out = Tensor::cat(&[ot, oi], 2)?; // (B,H,S,D)
+        Ok(out.transpose(1, 2)?.contiguous()?) // (B,S,H,D)
+    }
+
     /// With `flash-attn`: image queries take full FlashAttention (they attend to
     /// the whole joint sequence) and the `txt_len` text queries take a small
     /// causal FlashAttention — exactly the block-causal structure for
     /// text-to-image, so no dense S² matrix is materialized. Returns (B,S,H,D).
-    #[cfg(feature = "flash-attn")]
+    #[cfg(all(feature = "flash-attn", not(feature = "sage")))]
     fn attend(
         &self,
         qh: &Tensor,
@@ -288,7 +319,7 @@ impl Attention {
     }
 
     /// Naive attention with the additive block-causal `mask`. Returns (B,S,H,D).
-    #[cfg(not(feature = "flash-attn"))]
+    #[cfg(all(not(feature = "flash-attn"), not(feature = "sage")))]
     fn attend(
         &self,
         qh: &Tensor,
@@ -520,10 +551,10 @@ impl QwenImageDit {
         let gate2 = sel(&mods[3])?;
 
         // The dense block-causal mask is only needed by the naive path; the
-        // flash path derives the same structure from the text/image split.
-        #[cfg(not(feature = "flash-attn"))]
+        // flash and sage paths derive the same structure from the text/image split.
+        #[cfg(all(not(feature = "flash-attn"), not(feature = "sage")))]
         let mask = block_causal_mask(txt_len, img_tokens, dtype, &self.device)?;
-        #[cfg(feature = "flash-attn")]
+        #[cfg(any(feature = "flash-attn", feature = "sage"))]
         let mask = Tensor::zeros((1, 1, 1, 1), dtype, &self.device)?;
         let (cos, sin) = self.rope_cos_sin(txt_len, h, w, dtype)?;
 
@@ -559,7 +590,7 @@ fn select_rows(m: &Tensor, txt_len: usize, img_tokens: usize, dev: &Device) -> R
 
 /// Block-causal additive mask `(1,1,S,S)`: allowed[q,kv] = (q>=kv) OR both-image.
 /// Used by the naive attention path only (the flash path derives the structure).
-#[cfg_attr(feature = "flash-attn", allow(dead_code))]
+#[cfg_attr(any(feature = "flash-attn", feature = "sage"), allow(dead_code))]
 fn block_causal_mask(
     txt_len: usize,
     img_tokens: usize,
