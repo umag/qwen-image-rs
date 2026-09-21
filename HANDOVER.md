@@ -194,6 +194,23 @@ fallback unchanged). `fusednorm-test` verb.
 - Scope: LayerNorm+affine only (the dominant bucket). RMSNorm variants
   (ZeroCenterRmsNorm/HeadRmsNorm) are a possible follow-on fusion.
 
+### Fused activation quantizer (DONE — extends `convrot`)
+Driven through the issue-lifecycle (`qwen-image-rs-fused-actquant`). nsys showed
+~18.5% of denoise in the per-forward activation quant (uabs_bf16 5.0% +
+fast_max_bf16 5.5% + quantize_rows_i8 2.7%). `quantize_rows_fused_k`
+(kernels/convrot/quant_ops.cu) does the CTA-per-row `max(|x|)` reduction +
+`scale=amax/127` + int8 quantize in one pass, emitting int8 + the per-row scale.
+`QuantizeFused` CustomOp2 (src/convrot.rs) writes `row_scale` in place into a
+pre-allocated input (fresh zeros, no aliasing/autograd — safe in inference);
+`ConvRotLinear::forward` calls it, dropping candle's abs+max_keepdim+recip.
+`from_weight` (load-time) unchanged.
+- **convrot-test cosine 0.99994 (int8-gemm exact); dit-forward vs oracle 0.999934
+  (unchanged).**
+- **Denoise 17.8 s -> 15.2 s (40 steps) = ~14.5% faster** (0.445 -> 0.380 s/step)
+  on convrot,sage,fusednorm,+actquant. Cumulative fastest path denoise: bf16
+  0.62 -> 0.38 s/step.
+- Remaining fusion levers: RMSNorm variants; the dequant is cheap and left as-is.
+
 ### Future levers
 - **Faster resident encode** — the Q8 te forward dominates resident per-image
   time; cache dequantized bf16 weights once after load (trades VRAM), or use a
