@@ -4,6 +4,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=kernels/convrot/int8_gemm.cu");
+    println!("cargo:rerun-if-changed=kernels/convrot/quant_ops.cu");
     println!("cargo:rerun-if-env-changed=CUTLASS_DIR");
 
     #[cfg(feature = "convrot")]
@@ -19,6 +20,7 @@ fn main() {
             .cuda(true)
             .flag("-std=c++17")
             .flag("--expt-relaxed-constexpr")
+            .flag("--expt-extended-lambda") // EVT epilogue visitors use device lambdas
             .flag(format!("-arch=sm_{cap}"))
             .include(&cutlass)
             .file("kernels/convrot/int8_gemm.cu")

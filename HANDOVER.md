@@ -209,7 +209,38 @@ pre-allocated input (fresh zeros, no aliasing/autograd — safe in inference);
 - **Denoise 17.8 s -> 15.2 s (40 steps) = ~14.5% faster** (0.445 -> 0.380 s/step)
   on convrot,sage,fusednorm,+actquant. Cumulative fastest path denoise: bf16
   0.62 -> 0.38 s/step.
-- Remaining fusion levers: RMSNorm variants; the dequant is cheap and left as-is.
+- Remaining fusion levers: RMSNorm variants.
+
+### Fused dequant epilogue (DONE — `qwen-image-rs-dequant-epilogue`, extends `convrot`)
+Driven through the issue-lifecycle. nsys showed ~7.4% of a 10-step denoise trace
+(2240 instances = 224 convrot linears × 10 steps) in the standalone
+`dequant_i32_bf16_k` kernel applying `out=i32*s_row[m]*s_col[n]->bf16` after the
+INT8 GEMM, plus the i32 intermediate written to and read back from global memory.
+Fused the per-token(row) × per-channel(col) dequant INTO the GEMM's CUTLASS
+epilogue so the INT8 GEMM emits bf16 directly.
+- `kernels/convrot/int8_gemm.cu`: new `int8_gemm_dequant_bf16` built on the
+  **CUTLASS 4.8 SM80 Epilogue Visitor Tree (`Sm80EVT`)** — `VisitorAccFetch`
+  (i32) → `VisitorCompute<multiplies>` with `VisitorColBroadcast` s_row[m] →
+  `VisitorCompute<multiplies>` with `VisitorRowBroadcast` s_col[n] →
+  `VisitorAuxStore` bf16 — via `DefaultGemmWithVisitor` + `GemmUniversalAdapter`,
+  modeled on `examples/47`. **INT8 needs `arch::OpMultiplyAddSaturate`** (there is
+  no plain-`OpMultiplyAdd` s8 16×8×32 mma). The raw `int8_gemm_s32` is kept for
+  the bit-exact self-test. `build.rs` gained `--expt-extended-lambda` (EVT
+  visitors use device lambdas).
+- `quant_ops.cu`: the `dequant_i32_bf16_k` kernel + launcher are removed.
+- `src/convrot.rs`: `int8_gemm` + `Dequant` collapse into one `CustomOp3`
+  (`Int8GemmDequant`). candle has no `CustomOp4`, so the two scale vectors ride
+  in one packed f32 tensor `cat(col_scale, row_scale)` — **col first** so the
+  vectorized `RowBroadcast` load of s_col starts at the 32-B-aligned buffer base
+  (s_row then sits at offset N, aligned because N is always a mult of 8). Packing
+  `row` first mis-aligns s_col at odd M and faults `CUDA_ERROR_MISALIGNED_ADDRESS`.
+- **convrot-test cosine 0.99994 (int8-gemm bit-exact, max diff 0); dit-forward vs
+  oracle 0.999934 (UNCHANGED). MLP-shape isolated linear 2.68 -> 0.935 ms.**
+- **Denoise 15.3 s -> ~13.5 s (40 steps) = ~11-12% faster** on
+  convrot,sage,fusednorm. The win exceeds the 7.4% dequant fraction because the
+  fusion also removes the i32 tensor's global write+readback and 2240 kernel
+  launches/trace.
+- Remaining fusion levers: RMSNorm variants.
 
 ### Copy-reduction audit (`qwen-image-rs-reduce-copies` issue — NEGATIVE RESULT, no code change)
 nsys of the fast path (`convrot,sage,fusednorm`, bf16 VAE) showed `ucopy_bf16` at

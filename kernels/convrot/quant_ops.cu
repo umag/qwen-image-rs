@@ -19,17 +19,9 @@ __global__ void quantize_rows_i8_k(
   }
 }
 
-// out[m,n] = bf16(c[m,n] * row_scale[m] * col_scale[n]).
-__global__ void dequant_i32_bf16_k(
-    __nv_bfloat16* out, const int* c, const float* row_scale, const float* col_scale, long M, long N) {
-  long total = M * N;
-  for (long idx = blockIdx.x * (long)blockDim.x + threadIdx.x; idx < total;
-       idx += (long)gridDim.x * blockDim.x) {
-    long m = idx / N, n = idx % N;
-    float v = (float)c[idx] * row_scale[m] * col_scale[n];
-    out[idx] = __float2bfloat16(v);
-  }
-}
+// (The i32->bf16 dequant is now fused into the INT8 GEMM's CUTLASS epilogue —
+// see int8_gemm_dequant_bf16 in int8_gemm.cu — so the standalone dequant kernel
+// and its launcher have been removed.)
 
 // Fused per-row activation quantize: one CTA per row computes amax = max(|x|)
 // over K, then scale = amax/127, then quantizes each element to int8 — in a
@@ -77,14 +69,6 @@ extern "C" void quantize_rows_i8(
   long total = (long)M * K;
   int t = 256;
   quantize_rows_i8_k<<<grid_for(total, t), t, 0, s>>>(out, x, inv_scale, M, K);
-}
-
-extern "C" void dequant_i32_bf16(
-    __nv_bfloat16* out, const int* c, const float* row_scale, const float* col_scale, int M, int N,
-    cudaStream_t s) {
-  long total = (long)M * N;
-  int t = 256;
-  dequant_i32_bf16_k<<<grid_for(total, t), t, 0, s>>>(out, c, row_scale, col_scale, M, N);
 }
 
 extern "C" void quantize_rows_fused_launch(

@@ -19,6 +19,19 @@ extern "C" {
         k: i32,
         stream: *mut std::ffi::c_void,
     ) -> i32;
+    // Fused INT8 GEMM + per-row/per-col dequant epilogue -> bf16.
+    // d[m,n] = bf16(acc[m,n] * s_row[m] * s_col[n]).
+    fn int8_gemm_dequant_bf16(
+        d: *mut std::ffi::c_void,
+        a: *const i8,
+        b: *const i8,
+        s_row: *const f32,
+        s_col: *const f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
 }
 
 struct Int8Gemm;
@@ -94,15 +107,6 @@ extern "C" {
         inv_scale: *const f32,
         m: i32,
         k: i32,
-        stream: *mut std::ffi::c_void,
-    );
-    fn dequant_i32_bf16(
-        out: *mut std::ffi::c_void,
-        c: *const i32,
-        row_scale: *const f32,
-        col_scale: *const f32,
-        m: i32,
-        n: i32,
         stream: *mut std::ffi::c_void,
     );
     fn quantize_rows_fused_launch(
@@ -223,11 +227,26 @@ fn quantize_rows_fused(x: &Tensor) -> Result<(Tensor, Tensor)> {
     Ok((x_i8, row_scale))
 }
 
-/// Dequant: `c (M,N) i32`, `row_scale (M,)`, `col_scale (N,)` -> `bf16 (M,N)`.
-struct Dequant;
-impl candle_core::CustomOp3 for Dequant {
+/// Fused INT8 GEMM + per-row/per-col dequant epilogue.
+///
+/// `a (M,K) u8=int8` @ `Bᵀ` where `b (N,K) u8=int8`, then the CUTLASS epilogue
+/// applies `out[m,n] = acc[m,n] * s_row[m] * s_col[n]` and casts to bf16 —
+/// producing `(M,N) bf16` directly, with no i32 intermediate and no separate
+/// dequant kernel.
+///
+/// candle has no `CustomOp4`, so the two scale vectors ride in ONE packed f32
+/// tensor `scales (N+M,)` = `cat(col_scale, row_scale)`: `s_col = scales[0..N]`,
+/// `s_row = scales[N..N+M]` (the kernel reads `s_row = s_col_ptr + N`).
+///
+/// Order matters for alignment: the epilogue's `RowBroadcast` load of `s_col`
+/// is vectorized (8 f32 / 32 B), so its base must be 32-B aligned — putting
+/// `col_scale` first keeps it at the buffer base. `s_row` then sits at offset N,
+/// which is 32-B aligned because N (out_features) is always a multiple of 8
+/// (the bf16 store alignment requires it anyway).
+struct Int8GemmDequant;
+impl candle_core::CustomOp3 for Int8GemmDequant {
     fn name(&self) -> &'static str {
-        "dequant-i32-bf16"
+        "int8-gemm-dequant-bf16"
     }
     fn cpu_fwd(
         &self,
@@ -238,39 +257,59 @@ impl candle_core::CustomOp3 for Dequant {
         _: &CpuStorage,
         _: &Layout,
     ) -> candle_core::Result<(CpuStorage, Shape)> {
-        candle_core::bail!("cuda-only")
+        candle_core::bail!("int8-gemm-dequant is CUDA-only")
     }
     fn cuda_fwd(
         &self,
-        c: &CudaStorage,
-        c_l: &Layout,
-        rs: &CudaStorage,
-        _: &Layout,
-        cs: &CudaStorage,
-        _: &Layout,
+        a: &CudaStorage,
+        a_l: &Layout,
+        b: &CudaStorage,
+        b_l: &Layout,
+        s: &CudaStorage,
+        s_l: &Layout,
     ) -> candle_core::Result<(CudaStorage, Shape)> {
-        let dev = c.device().clone();
-        let (m, n) = c_l.shape().dims2()?;
-        let c = c.as_cuda_slice::<i32>()?;
-        let rs = rs.as_cuda_slice::<f32>()?;
-        let cs = cs.as_cuda_slice::<f32>()?;
+        let dev = a.device().clone();
+        let (m, k) = a_l.shape().dims2()?;
+        let (n, k2) = b_l.shape().dims2()?;
+        if k != k2 {
+            candle_core::bail!("int8-gemm-dequant K mismatch: {k} vs {k2}");
+        }
+        let packed = s_l.shape().dims1()?;
+        if packed != m + n {
+            candle_core::bail!(
+                "int8-gemm-dequant packed scales len {packed} != N+M = {}",
+                n + m
+            );
+        }
+        // U8 storage holding int8 bytes; scales are f32 (col ++ row).
+        let a = a.as_cuda_slice::<u8>()?;
+        let b = b.as_cuda_slice::<u8>()?;
+        let s = s.as_cuda_slice::<f32>()?;
         let stream = dev.cuda_stream();
         let out = unsafe { dev.alloc::<half::bf16>(m * n)? };
         {
-            let (cp, _a) = c.device_ptr(&stream);
-            let (rp, _b) = rs.device_ptr(&stream);
-            let (sp, _c) = cs.device_ptr(&stream);
-            let (op, _d) = out.device_ptr(&stream);
-            unsafe {
-                dequant_i32_bf16(
+            let (ap, _ga) = a.device_ptr(&stream);
+            let (bp, _gb) = b.device_ptr(&stream);
+            let (sp, _gs) = s.device_ptr(&stream);
+            let (op, _go) = out.device_ptr(&stream);
+            let s_col = sp as *const f32;
+            // s_row follows s_col in the packed buffer (offset N floats, aligned).
+            let s_row = unsafe { s_col.add(n) };
+            let rc = unsafe {
+                int8_gemm_dequant_bf16(
                     op as *mut std::ffi::c_void,
-                    cp as *const i32,
-                    rp as *const f32,
-                    sp as *const f32,
+                    ap as *const i8,
+                    bp as *const i8,
+                    s_row,
+                    s_col,
                     m as i32,
                     n as i32,
+                    k as i32,
                     stream.cu_stream() as *mut std::ffi::c_void,
-                );
+                )
+            };
+            if rc != 0 {
+                candle_core::bail!("int8_gemm_dequant_bf16 failed, rc={rc}");
             }
         }
         Ok((CudaStorage::wrap_cuda_slice(out, dev), (m, n).into()))
@@ -330,9 +369,13 @@ impl ConvRotLinear {
         let x2 = x.reshape((m, k))?;
         let xr = crate::model::rotation::rotate(&x2, &self.hadamard)?; // (M,K) bf16
         let (x_i8, row_scale) = quantize_rows_fused(&xr)?; // fused amax+quantize
-        let c = int8_gemm(&x_i8, &self.w_i8)?; // (M,N) i32
         let n = self.col_scale.dim(0)?;
-        let out = c.apply_op3(&row_scale, &self.col_scale, Dequant)?; // (M,N) bf16
+        // Pack the two scale vectors into one tensor (candle has no CustomOp4):
+        // scales[0..N] = s_col, scales[N..N+M] = s_row. col first so the
+        // vectorized RowBroadcast load of s_col starts at the aligned base.
+        let scales = Tensor::cat(&[&self.col_scale, &row_scale], 0)?; // (N+M,) f32
+                                                                      // Fused INT8 GEMM + per-row/per-col dequant epilogue -> (M,N) bf16.
+        let out = x_i8.apply_op3(&self.w_i8, &scales, Int8GemmDequant)?;
         let mut out_dims = dims[..dims.len() - 1].to_vec();
         out_dims.push(n);
         Ok(out.reshape(out_dims)?)
