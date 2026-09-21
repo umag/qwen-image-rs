@@ -25,6 +25,13 @@ enum Command {
         #[arg(long, default_value_t = 1024)]
         n: usize,
     },
+    /// Micro-benchmark the DiT's dominant ops (MLP GEMM vs attention) in bf16.
+    Bench {
+        #[arg(long, default_value_t = 4117)]
+        seq: usize,
+        #[arg(long, default_value_t = 30)]
+        iters: usize,
+    },
     /// Resolve and report a component's on-disk weight set (safetensors or GGUF).
     Info {
         /// Directory holding .safetensors shards or a .gguf file.
@@ -114,6 +121,7 @@ fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Smoke { n } => smoke(n),
+        Command::Bench { seq, iters } => bench(seq, iters),
         Command::Info { weights } => info(&weights),
         Command::Generate {
             model,
@@ -487,6 +495,61 @@ fn vae_decode(
         image::ImageBuffer::from_raw(w as u32, h as u32, bytes).context("image buffer")?;
     buf.save(out)?;
     println!("wrote {} ({w}x{h} RGBA)", out.display());
+    Ok(())
+}
+
+/// Micro-benchmark the DiT's per-layer dominant ops in bf16 on the active
+/// device, to see whether the workload is GEMM-bound or attention-bound.
+fn bench(seq: usize, iters: usize) -> Result<()> {
+    let dev = device::best_device()?;
+    let dt = if matches!(dev, candle_core::Device::Cuda(_)) {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    let (h, inter, heads, hd) = (4096usize, 12288usize, 32usize, 128usize);
+    let x = Tensor::randn(0f32, 1f32, (seq, h), &dev)?.to_dtype(dt)?;
+    let wqkv = Tensor::randn(0f32, 1f32, (3 * h, h), &dev)?.to_dtype(dt)?;
+    let wo = Tensor::randn(0f32, 1f32, (h, h), &dev)?.to_dtype(dt)?;
+    let wgate = Tensor::randn(0f32, 1f32, (inter, h), &dev)?.to_dtype(dt)?;
+    let wup = Tensor::randn(0f32, 1f32, (inter, h), &dev)?.to_dtype(dt)?;
+    let wdown = Tensor::randn(0f32, 1f32, (h, inter), &dev)?.to_dtype(dt)?;
+    let q = Tensor::randn(0f32, 1f32, (heads, seq, hd), &dev)?.to_dtype(dt)?;
+    let k = Tensor::randn(0f32, 1f32, (heads, seq, hd), &dev)?.to_dtype(dt)?;
+    let v = Tensor::randn(0f32, 1f32, (heads, seq, hd), &dev)?.to_dtype(dt)?;
+
+    let time = |name: &str, f: &dyn Fn() -> Result<()>| -> Result<()> {
+        f()?; // warmup
+        dev.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            f()?;
+        }
+        dev.synchronize()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        println!("  {name:20} {ms:8.3} ms/iter");
+        Ok(())
+    };
+
+    println!("seq={seq} dtype={dt:?} iters={iters}");
+    time("attn_proj (qkv+o)", &|| {
+        let _ = x.matmul(&wqkv.t()?)?;
+        let _ = x.matmul(&wo.t()?)?;
+        Ok(())
+    })?;
+    time("mlp (gate+up+down)", &|| {
+        let g = candle_nn::ops::silu(&x.matmul(&wgate.t()?)?)?;
+        let u = x.matmul(&wup.t()?)?;
+        let _ = (g * u)?.matmul(&wdown.t()?)?;
+        Ok(())
+    })?;
+    time("attention (S^2)", &|| {
+        let scale = 1.0 / (hd as f64).sqrt();
+        let a = (q.matmul(&k.transpose(1, 2)?)? * scale)?;
+        let a = candle_nn::ops::softmax_last_dim(&a)?;
+        let _ = a.matmul(&v)?;
+        Ok(())
+    })?;
     Ok(())
 }
 
