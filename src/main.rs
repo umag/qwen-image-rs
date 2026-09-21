@@ -1,7 +1,7 @@
 //! `qwen-image-rs` CLI.
 
 use anyhow::Context;
-use candle_core::{DType, Tensor};
+use candle_core::{DType, IndexOp, Tensor};
 use clap::{Parser, Subcommand};
 
 use qwen_image_rs::{device, loader::WeightSet, Result};
@@ -36,6 +36,21 @@ enum Command {
         #[arg(long)]
         prompt: String,
     },
+    /// Encode input_ids through the Qwen3-VL text encoder to prompt embeddings (Phase 3).
+    TextEncode {
+        /// The text_encoder/ directory (config.json + *.safetensors shards).
+        #[arg(long)]
+        weights: std::path::PathBuf,
+        /// A safetensors file with an `input_ids` tensor (from the embeds dump).
+        #[arg(long)]
+        input_ids: std::path::PathBuf,
+        /// Number of leading system-prompt tokens to drop.
+        #[arg(long, default_value_t = 0)]
+        drop: usize,
+        /// Output embeddings safetensors path.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
     /// Decode a saved latent (.pt) through the VAE to an RGBA PNG (Phase 2).
     VaeDecode {
         /// The vae/ directory (holds config.json + *.safetensors).
@@ -68,7 +83,64 @@ fn main() -> Result<()> {
             latent,
             out,
         } => vae_decode(&weights, &latent, &out),
+        Command::TextEncode {
+            weights,
+            input_ids,
+            drop,
+            out,
+        } => text_encode(&weights, &input_ids, drop, &out),
     }
+}
+
+/// Phase 3: run the Qwen3-VL text encoder on dumped input_ids, drop the system
+/// prefix, save the pre-final-norm hidden states.
+fn text_encode(
+    weights: &std::path::Path,
+    input_ids_path: &std::path::Path,
+    drop: usize,
+    out: &std::path::Path,
+) -> Result<()> {
+    use qwen_image_rs::model::text_encoder::{QwenTextEncoder, TextConfig};
+
+    let dev = device::best_device()?;
+    tracing::info!(device = device::label(&dev), "text-encode");
+
+    let set = WeightSet::resolve(weights)?;
+    let files = set.files.clone();
+    // bf16: the 8B encoder is ~16 GB in bf16 (fits the 24 GB 4090) and matches
+    // the oracle's bf16 compute. F32 would be 32 GB and OOM.
+    let dtype = if matches!(dev, candle_core::Device::Cuda(_)) {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &dev)? };
+    let cfg = TextConfig::default();
+    let model = QwenTextEncoder::load(&cfg, vb)?;
+
+    let ids_map = candle_core::safetensors::load(input_ids_path, &dev)?;
+    let ids = ids_map
+        .get("input_ids")
+        .context("no 'input_ids' in file")?
+        .to_dtype(DType::U32)?;
+    let seq = ids.dims1()?;
+    let ids = ids.reshape((1, seq))?;
+    tracing::info!(seq, drop, "running encoder");
+
+    let hidden = model.forward(&ids)?; // (1, seq, hidden)
+    let kept = seq - drop;
+    let embeds = hidden
+        .narrow(1, drop, kept)?
+        .i(0)?
+        .to_dtype(DType::F32)?
+        .contiguous()?; // (kept, hidden)
+    tracing::info!(shape = ?embeds.dims(), "embeddings");
+
+    let mut map = std::collections::HashMap::new();
+    map.insert("embeds".to_string(), embeds);
+    candle_core::safetensors::save(&map, out)?;
+    println!("wrote {} (kept {kept} tokens)", out.display());
+    Ok(())
 }
 
 /// Phase 2: load the VAE decoder, decode a saved packed latent, save RGBA PNG.
