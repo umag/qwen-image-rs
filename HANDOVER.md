@@ -51,9 +51,15 @@ shared by handle clone. `--convrot` added to generate/batch/denoise/dit-forward.
   mugs, same composition. Per-step accuracy is the 0.9999 above.
 - **Speed (naive-attn path, 40 steps @1024²): convrot ~40.8s vs bf16 ~44.7s,
   ~1.02 vs 1.12 s/step (~1.1×).** The isolated MLP win is 1.59×; it's diluted
-  here because naive S² attention (unchanged) dominates each step. **Next real
-  win = build `--features convrot,flash-attn` together** so attention is cheap
-  and the convrot linear speedup is a bigger fraction of the step.
+  here because naive S² attention (unchanged) dominates each step.
+- **`--features convrot,flash-attn` TOGETHER (DONE, builds in ~1m with flash
+  cached): convrot denoise ~19.8s vs bf16 ~24.2s, 0.51 vs 0.62 s/step (~1.22×)**
+  — the win grows once flash makes attention cheap, as predicted. AND the image
+  is far closer: **bf16-vs-convrot PSNR 38.2 dB** (naive-attn was only 20.8),
+  because flash's stable attention keeps the INT8-perturbed 40-step trajectory
+  near the bf16 one. dit-forward cosine 0.999942 (unchanged). This is the
+  recommended fast path. Next levers: pre-quantized GGUF file (cut load),
+  SageAttention INT8 attention, CUDA-graph capture of the denoise loop.
 - Build: `cargo build --release --features convrot` (CUTLASS_DIR set), ~1m53s.
   Runtime compare needs the oracle venv python (`~/dev_tmp/qwen-image-oracle/.venv/bin/python`
   has safetensors/PIL/numpy; the system python3 does not).
