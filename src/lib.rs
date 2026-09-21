@@ -13,6 +13,8 @@
 
 #[cfg(feature = "convrot")]
 pub mod convrot;
+#[cfg(feature = "sage")]
+pub mod sage;
 pub mod device;
 pub mod loader;
 pub mod model;

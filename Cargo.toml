@@ -35,6 +35,8 @@ cudnn = ["cuda", "candle-core/cudnn"]
 flash-attn = ["cuda", "dep:candle-flash-attn"]
 # ConvRot INT8 W8A8: compiles kernels/convrot/*.cu (needs CUTLASS_DIR).
 convrot = ["cuda", "dep:cc", "dep:half"]
+# SageAttention INT8-QK / FP16-PV attention: compiles vendored kernels/sage/*.cu.
+sage = ["cuda", "dep:cc", "dep:half"]
 
 [profile.release]
 opt-level = 3

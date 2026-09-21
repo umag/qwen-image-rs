@@ -27,6 +27,8 @@ enum Command {
     },
     /// Self-test the ConvRot INT8 GEMM bridge (candle -> CUTLASS kernel -> candle).
     ConvrotTest,
+    /// Self-test the SageAttention INT8-QK/FP16-PV kernel vs an f32 reference.
+    SageTest,
     /// Micro-benchmark the DiT's dominant ops (MLP GEMM vs attention) in bf16.
     Bench {
         #[arg(long, default_value_t = 4117)]
@@ -177,6 +179,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Smoke { n } => smoke(n),
         Command::ConvrotTest => convrot_test(),
+        Command::SageTest => sage_test(),
         Command::Bench { seq, iters } => bench(seq, iters),
         Command::Batch {
             model,
@@ -719,6 +722,24 @@ fn convrot_test() -> Result<()> {
     }
     #[cfg(not(feature = "convrot"))]
     anyhow::bail!("build with --features convrot (needs CUTLASS_DIR)")
+}
+
+/// Self-test SageAttention (INT8-QK / FP16-PV) vs an f32 softmax-attention
+/// reference, non-causal and causal.
+fn sage_test() -> Result<()> {
+    #[cfg(feature = "sage")]
+    {
+        for causal in [false, true] {
+            let cos = qwen_image_rs::sage::self_test(causal)?;
+            println!(
+                "sage INT8 attn (causal={causal}) vs f32 ref: cosine = {cos:.5} ({})",
+                if cos > 0.99 { "OK" } else { "TOO LOW" }
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "sage"))]
+    anyhow::bail!("build with --features sage")
 }
 
 /// Micro-benchmark the DiT's per-layer dominant ops in bf16 on the active

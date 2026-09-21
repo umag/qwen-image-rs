@@ -26,4 +26,22 @@ fn main() {
             .compile("convrot_int8");
         println!("cargo:rustc-link-lib=dylib=cudart");
     }
+
+    #[cfg(feature = "sage")]
+    {
+        // Vendored SageAttention INT8-QK / FP16-PV kernel (thu-ml), torch-free.
+        println!("cargo:rerun-if-changed=kernels/sage/sage_ffi.cu");
+        let cap = std::env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".into());
+        cc::Build::new()
+            .cuda(true)
+            .flag("-std=c++17")
+            .flag("--expt-relaxed-constexpr")
+            .flag("--expt-extended-lambda")
+            .flag(format!("-arch=sm_{cap}"))
+            .flag("-diag-suppress=177") // unused CHECK_ macros in vendored utils
+            .include("kernels/sage")
+            .file("kernels/sage/sage_ffi.cu")
+            .compile("sage_attn");
+        println!("cargo:rustc-link-lib=dylib=cudart");
+    }
 }
