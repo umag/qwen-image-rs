@@ -6,10 +6,37 @@
 //! complex RoPE. Text-to-image only: no condition images, no KV cache, no flex
 //! attention — the block-causal mask is built dense and applied once per block.
 
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{linear_no_bias, Linear, Module, VarBuilder};
 
 use crate::Result;
+
+/// A no-bias linear that is either full-precision or Q8_0-quantized (GGUF).
+enum QLinear {
+    Full(Linear),
+    Quant(QMatMul),
+}
+
+impl QLinear {
+    /// Load `(out, in)` weights; quantize to Q8_0 when `quant` is set.
+    fn load(in_c: usize, out_c: usize, quant: bool, vb: VarBuilder) -> Result<Self> {
+        if quant {
+            let w = vb.get((out_c, in_c), "weight")?;
+            let qt = QTensor::quantize(&w, GgmlDType::Q8_0)?;
+            Ok(QLinear::Quant(QMatMul::from_qtensor(qt)?))
+        } else {
+            Ok(QLinear::Full(linear_no_bias(in_c, out_c, vb)?))
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            QLinear::Full(l) => Ok(l.forward(x)?),
+            QLinear::Quant(q) => Ok(q.forward(x)?),
+        }
+    }
+}
 
 const INNER: usize = 4096; // num_heads * head_dim = 32 * 128
 const HEADS: usize = 32;
@@ -136,21 +163,21 @@ impl HeadRmsNorm {
 }
 
 struct Attention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
+    to_q: QLinear,
+    to_k: QLinear,
+    to_v: QLinear,
+    to_out: QLinear,
     norm_q: HeadRmsNorm,
     norm_k: HeadRmsNorm,
 }
 
 impl Attention {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(quant: bool, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            to_q: linear_no_bias(INNER, INNER, vb.pp("to_q"))?,
-            to_k: linear_no_bias(INNER, INNER, vb.pp("to_k"))?,
-            to_v: linear_no_bias(INNER, INNER, vb.pp("to_v"))?,
-            to_out: linear_no_bias(INNER, INNER, vb.pp("to_out").pp("0"))?,
+            to_q: QLinear::load(INNER, INNER, quant, vb.pp("to_q"))?,
+            to_k: QLinear::load(INNER, INNER, quant, vb.pp("to_k"))?,
+            to_v: QLinear::load(INNER, INNER, quant, vb.pp("to_v"))?,
+            to_out: QLinear::load(INNER, INNER, quant, vb.pp("to_out").pp("0"))?,
             norm_q: HeadRmsNorm::load(vb.pp("norm_q"))?,
             norm_k: HeadRmsNorm::load(vb.pp("norm_k"))?,
         })
@@ -244,16 +271,16 @@ impl Attention {
 }
 
 struct SwiGlu {
-    proj: Linear,
-    gate: Linear,
-    out: Linear,
+    proj: QLinear,
+    gate: QLinear,
+    out: QLinear,
 }
 impl SwiGlu {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(quant: bool, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            proj: linear_no_bias(INNER, INNER * 3, vb.pp("proj"))?,
-            gate: linear_no_bias(INNER, INNER * 3, vb.pp("gate_layer"))?,
-            out: linear_no_bias(INNER * 3, INNER, vb.pp("out"))?,
+            proj: QLinear::load(INNER, INNER * 3, quant, vb.pp("proj"))?,
+            gate: QLinear::load(INNER, INNER * 3, quant, vb.pp("gate_layer"))?,
+            out: QLinear::load(INNER * 3, INNER, quant, vb.pp("out"))?,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -269,10 +296,10 @@ struct Block {
 }
 
 impl Block {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(quant: bool, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            attn: Attention::load(vb.pp("attn"))?,
-            mlp: SwiGlu::load(vb.pp("img_mlp"))?,
+            attn: Attention::load(quant, vb.pp("attn"))?,
+            mlp: SwiGlu::load(quant, vb.pp("img_mlp"))?,
             eps: 1e-6,
         })
     }
@@ -315,12 +342,17 @@ pub struct QwenImageDit {
 }
 
 impl QwenImageDit {
-    pub fn load(num_layers: usize, out_channels: usize, vb: VarBuilder) -> Result<Self> {
+    pub fn load(
+        num_layers: usize,
+        out_channels: usize,
+        quant: bool,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let dev = vb.device().clone();
         let mut blocks = Vec::with_capacity(num_layers);
         let vb_b = vb.pp("transformer_blocks");
         for i in 0..num_layers {
-            blocks.push(Block::load(vb_b.pp(i))?);
+            blocks.push(Block::load(quant, vb_b.pp(i))?);
         }
         let inv_freqs = std::array::from_fn(|a| {
             let d = AXES[a];

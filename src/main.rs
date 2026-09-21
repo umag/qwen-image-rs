@@ -51,6 +51,9 @@ enum Command {
         steps: usize,
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        /// Quantize the DiT block linears to Q8_0 (GGUF) — lower VRAM.
+        #[arg(long)]
+        quant: bool,
         #[arg(long)]
         out: std::path::PathBuf,
     },
@@ -82,6 +85,9 @@ enum Command {
         embeds: std::path::PathBuf,
         #[arg(long, default_value_t = 40)]
         steps: usize,
+        /// Quantize the DiT block linears to Q8_0 (GGUF).
+        #[arg(long)]
+        quant: bool,
         /// Output final latent safetensors path.
         #[arg(long)]
         out: std::path::PathBuf,
@@ -94,6 +100,9 @@ enum Command {
         /// dit_io.safetensors with hidden_states/encoder_hidden_states/timestep.
         #[arg(long)]
         inputs: std::path::PathBuf,
+        /// Quantize the DiT block linears to Q8_0 (GGUF).
+        #[arg(long)]
+        quant: bool,
         /// Output safetensors path (joint output tensor).
         #[arg(long)]
         out: std::path::PathBuf,
@@ -129,8 +138,9 @@ fn main() -> Result<()> {
             size,
             steps,
             seed,
+            quant,
             out,
-        } => generate(&model, &prompt, size, steps, seed, &out),
+        } => generate(&model, &prompt, size, steps, seed, quant, &out),
         Command::VaeDecode {
             weights,
             latent,
@@ -145,15 +155,17 @@ fn main() -> Result<()> {
         Command::DitForward {
             weights,
             inputs,
+            quant,
             out,
-        } => dit_forward(&weights, &inputs, &out),
+        } => dit_forward(&weights, &inputs, quant, &out),
         Command::Denoise {
             weights,
             noise,
             embeds,
             steps,
+            quant,
             out,
-        } => denoise(&weights, &noise, &embeds, steps, &out),
+        } => denoise(&weights, &noise, &embeds, steps, quant, &out),
     }
 }
 
@@ -166,6 +178,7 @@ fn generate(
     size: usize,
     steps: usize,
     seed: u64,
+    quant: bool,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -218,7 +231,7 @@ fn generate(
     let hw = size / 16; // vae spatial compression
     let img_seq = hw * hw;
     let latent = {
-        let dit = QwenImageDit::load(32, 64, load_vb(model.join("transformer"), dtype)?)?;
+        let dit = QwenImageDit::load(32, 64, quant, load_vb(model.join("transformer"), dtype)?)?;
         dev.set_seed(seed)?;
         let mut latents =
             Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?.to_dtype(DType::F32)?;
@@ -268,6 +281,7 @@ fn denoise(
     noise: &std::path::Path,
     embeds: &std::path::Path,
     steps: usize,
+    quant: bool,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -284,7 +298,7 @@ fn denoise(
     let set = WeightSet::resolve(weights)?;
     let files = set.files.clone();
     let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &dev)? };
-    let model = QwenImageDit::load(32, 64, vb)?;
+    let model = QwenImageDit::load(32, 64, quant, vb)?;
 
     let nmap = candle_core::safetensors::load(noise, &dev)?;
     let mut latents = nmap
@@ -335,6 +349,7 @@ fn denoise(
 fn dit_forward(
     weights: &std::path::Path,
     inputs: &std::path::Path,
+    quant: bool,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -350,7 +365,7 @@ fn dit_forward(
     let set = WeightSet::resolve(weights)?;
     let files = set.files.clone();
     let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &dev)? };
-    let model = QwenImageDit::load(32, 64, vb)?;
+    let model = QwenImageDit::load(32, 64, quant, vb)?;
 
     let m = candle_core::safetensors::load(inputs, &dev)?;
     let get = |k: &str| -> Result<Tensor> {
