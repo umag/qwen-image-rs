@@ -37,6 +37,8 @@ flash-attn = ["cuda", "dep:candle-flash-attn"]
 convrot = ["cuda", "dep:cc", "dep:half"]
 # SageAttention INT8-QK / FP16-PV attention: compiles vendored kernels/sage/*.cu.
 sage = ["cuda", "dep:cc", "dep:half"]
+# Fused LayerNorm+AdaLN kernel: compiles kernels/fusednorm/*.cu.
+fusednorm = ["cuda", "dep:cc", "dep:half"]
 
 [profile.release]
 opt-level = 3

@@ -15,6 +15,8 @@
 pub mod convrot;
 #[cfg(feature = "sage")]
 pub mod sage;
+#[cfg(feature = "fusednorm")]
+pub mod fusednorm;
 pub mod device;
 pub mod loader;
 pub mod model;

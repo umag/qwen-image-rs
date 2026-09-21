@@ -87,6 +87,8 @@ fn silu(x: &Tensor) -> Result<Tensor> {
 }
 
 /// LayerNorm with no learnable affine (elementwise_affine=False), eps 1e-6.
+/// Used by `norm_mod`'s non-fused fallback.
+#[cfg_attr(feature = "fusednorm", allow(dead_code))]
 fn norm_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
     let x32 = x.to_dtype(DType::F32)?;
     let mean = x32.mean_keepdim(candle_core::D::Minus1)?;
@@ -94,6 +96,18 @@ fn norm_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
     let var = xc.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
     let normed = xc.broadcast_div(&(var + eps)?.sqrt()?)?;
     Ok(normed.to_dtype(x.dtype())?)
+}
+
+/// `norm_no_affine(x) * (scale + 1)` — the DiT's AdaLN pattern. Under the
+/// `fusednorm` feature this is one fused CUDA kernel; otherwise the candle ops.
+/// `x` and `scale` share shape `(..., INNER)`.
+fn norm_mod(x: &Tensor, scale: &Tensor, eps: f64) -> Result<Tensor> {
+    #[cfg(feature = "fusednorm")]
+    {
+        return crate::fusednorm::fused_norm_mod(x, scale, eps as f32);
+    }
+    #[cfg(not(feature = "fusednorm"))]
+    Ok(norm_no_affine(x, eps)?.broadcast_mul(&(scale + 1.0)?)?)
 }
 
 /// `QwenImage21ZeroCenterRMSNorm`: scale = weight + 1, computed in fp32.
@@ -391,12 +405,10 @@ impl Block {
         sin: &Tensor,
         txt_len: usize,
     ) -> Result<Tensor> {
-        let x = norm_no_affine(h, self.eps)?;
-        let x = x.broadcast_mul(&(scale1 + 1.0)?)?;
+        let x = norm_mod(h, scale1, self.eps)?;
         let attn = self.attn.forward(&x, mask, cos, sin, txt_len)?;
         let h = (h + gate1.tanh()?.broadcast_mul(&attn)?)?;
-        let x = norm_no_affine(&h, self.eps)?;
-        let x = x.broadcast_mul(&(scale2 + 1.0)?)?;
+        let x = norm_mod(&h, scale2, self.eps)?;
         let m = self.mlp.forward(&x)?;
         Ok((&h + gate2.tanh()?.broadcast_mul(&m)?)?)
     }
@@ -573,8 +585,7 @@ impl QwenImageDit {
         // norm_out: AdaLayerNorm scale-only, then proj_out. Scale from temb rows.
         let scale_out = self.norm_out_linear.forward(&silu(&temb)?)?; // (2, INNER)
         let scale_out = select_rows(&scale_out, txt_len, img_tokens, &self.device)?; // (1,seq,INNER)
-        let normed = norm_no_affine(&x, 1e-6)?;
-        let x = normed.broadcast_mul(&(scale_out + 1.0)?)?;
+        let x = norm_mod(&x, &scale_out, 1e-6)?;
         let out = self.proj_out.forward(&x)?; // (1, seq, out_channels)
         let _ = seq;
         Ok(out)

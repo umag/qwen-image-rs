@@ -29,6 +29,8 @@ enum Command {
     ConvrotTest,
     /// Self-test the SageAttention INT8-QK/FP16-PV kernel vs an f32 reference.
     SageTest,
+    /// Self-test the fused LayerNorm+AdaLN kernel vs the candle reference.
+    FusednormTest,
     /// Micro-benchmark the DiT's dominant ops (MLP GEMM vs attention) in bf16.
     Bench {
         #[arg(long, default_value_t = 4117)]
@@ -231,6 +233,7 @@ fn main() -> Result<()> {
         Command::Smoke { n } => smoke(n),
         Command::ConvrotTest => convrot_test(),
         Command::SageTest => sage_test(),
+        Command::FusednormTest => fusednorm_test(),
         Command::Bench { seq, iters } => bench(seq, iters),
         Command::Batch {
             model,
@@ -993,6 +996,21 @@ fn sage_test() -> Result<()> {
     }
     #[cfg(not(feature = "sage"))]
     anyhow::bail!("build with --features sage")
+}
+
+/// Self-test the fused LayerNorm+AdaLN kernel vs the candle reference.
+fn fusednorm_test() -> Result<()> {
+    #[cfg(feature = "fusednorm")]
+    {
+        let cos = qwen_image_rs::fusednorm::self_test()?;
+        println!(
+            "fused norm+AdaLN vs candle: cosine = {cos:.6} ({})",
+            if cos > 0.999 { "OK" } else { "TOO LOW" }
+        );
+        Ok(())
+    }
+    #[cfg(not(feature = "fusednorm"))]
+    anyhow::bail!("build with --features fusednorm")
 }
 
 /// Micro-benchmark the DiT's per-layer dominant ops in bf16 on the active

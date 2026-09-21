@@ -27,6 +27,21 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=cudart");
     }
 
+    #[cfg(feature = "fusednorm")]
+    {
+        // Fused LayerNorm+AdaLN kernel (no external deps).
+        println!("cargo:rerun-if-changed=kernels/fusednorm/fused_norm.cu");
+        let cap = std::env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".into());
+        cc::Build::new()
+            .cuda(true)
+            .flag("-std=c++17")
+            .flag("--expt-relaxed-constexpr")
+            .flag(format!("-arch=sm_{cap}"))
+            .file("kernels/fusednorm/fused_norm.cu")
+            .compile("fused_norm");
+        println!("cargo:rustc-link-lib=dylib=cudart");
+    }
+
     #[cfg(feature = "sage")]
     {
         // Vendored SageAttention INT8-QK / FP16-PV kernel (thu-ml), torch-free.
