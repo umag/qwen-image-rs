@@ -22,6 +22,7 @@ fn main() {
             .flag(format!("-arch=sm_{cap}"))
             .include(&cutlass)
             .file("kernels/convrot/int8_gemm.cu")
+            .file("kernels/convrot/quant_ops.cu")
             .compile("convrot_int8");
         println!("cargo:rustc-link-lib=dylib=cudart");
     }

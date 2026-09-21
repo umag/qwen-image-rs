@@ -674,6 +674,9 @@ fn convrot_test() -> Result<()> {
                 "MISMATCH"
             }
         );
+        let cos = qwen_image_rs::convrot::self_test_linear()?;
+        println!("convrot INT8 linear vs bf16: cosine = {cos:.5} ({})",
+            if cos > 0.99 { "OK" } else { "TOO LOW" });
         Ok(())
     }
     #[cfg(not(feature = "convrot"))]
