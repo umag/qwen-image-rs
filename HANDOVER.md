@@ -74,14 +74,38 @@ time rotate+quant. No new flag; point a transformer dir at the file and use
 - Warm load ties (~3.5s both, cheap compute + hot cache) — the win is cold-start
   I/O (halved), VRAM, and repeated loads (serve).
 
-### Remaining levers (spiked)
-- **SageAttention INT8 attention** — the one lever that still cuts *denoise*.
-  Needs a fused INT8 FLASH kernel (INT8 QKᵀ + online softmax + PV, per-block
-  scales/smoothing), a research-grade port, NOT a clean single-GEMM vendor like
-  `int8_gemm`. Scope as its own effort; expect multiple build cycles.
+### SageAttention INT8-QK / FP16-PV (STARTED — kernel validated, integrated)
+Vendored thu-ml/SageAttention's sm80 fused kernel into `kernels/sage/vendor/`
+(torch stripped) + `kernels/sage/sage_ffi.cu` raw-pointer launchers (head_dim
+128, per-BLOCK INT8 scales, float SV accum, bf16 out) + INT8 quant via their
+`QuantInt8Kernel`. `src/sage.rs` bridges via candle CustomOp3 (q,k bf16 + v f16
+→ o bf16). `sage` feature, `sage-test` verb.
+- **Kernel builds torch-free under CUDA 13.3 (~1 min)** — needed `#include
+  <cassert>` before cuda_fp8/fp6/fp4 headers (CUDA 13 `__assert_fail`).
+- **Self-test: INT8 attention cosine 0.99991 (non-causal) / 0.99994 (causal)**
+  vs f32 softmax reference.
+- Wired into DiT `attend()` (sage feature takes precedence over flash-attn):
+  causal SageAttention over the text prefix, non-causal over image queries —
+  same block-causal split as the flash path. Benchmark build: `--features
+  convrot,sage` (INT8 linears + INT8 attention). [denoise speed / image PSNR:
+  measuring].
+- Per-BLOCK granularity (not per-warp) so quant scale counts match the kernel's
+  per-block indexing without padding. Per-warp is a later accuracy refinement
+  (needs the padded ceil(N/128)*4 scale layout + their per-warp quant kernel).
+
+### Future levers
+- **Quantize the TEXT ENCODER too (resident-VRAM mode).** Today `generate`
+  loads Qwen3-VL 8B (bf16 ~16 GB) → frees → DiT → frees → VAE, reloading each
+  per run. Quantize the text encoder (Q8_0/INT8) so text-enc + DiT (convrot ~7
+  GB) + VAE all fit in 24 GB **resident at once** — no reload between images,
+  big win for batch/serve. Mirrors the `--quant`/prequant work on the DiT;
+  apply Q8_0 (candle QMatMul) to the Qwen3 decoder linears in
+  `src/model/text_encoder.rs`, add a resident pipeline that loads all three once.
 - **CUDA-graph capture** — candle 0.11 exposes no stream-capture hook and its
   op path allocates fresh tensors per step (pointers move), so replay is fragile.
   Not viable without patching candle. Deprioritized.
+- **SageAttention per-warp / fused v-scale** — accuracy/speed refinement over the
+  per-block first cut above.
 - Build: `cargo build --release --features convrot` (CUTLASS_DIR set), ~1m53s.
   Runtime compare needs the oracle venv python (`~/dev_tmp/qwen-image-oracle/.venv/bin/python`
   has safetensors/PIL/numpy; the system python3 does not).

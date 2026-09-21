@@ -267,16 +267,21 @@ impl Attention {
     ) -> Result<Tensor> {
         let _ = mask;
         let (_b, _h, s, _d) = qh.dims4()?;
-        let vh = vv.transpose(1, 2)?.contiguous()?; // (B,H,S,D)
+        // `sage_attention` contiguizes its inputs internally, so pass views —
+        // an explicit `.contiguous()` here would just double the copy.
+        let vh = vv.transpose(1, 2)?; // (B,H,S,D) view
         let sc = scale as f32;
         // text prefix: causal over [0, txt_len)
-        let qt = qh.narrow(2, 0, txt_len)?.contiguous()?;
-        let kt = kh.narrow(2, 0, txt_len)?.contiguous()?;
-        let vt = vh.narrow(2, 0, txt_len)?.contiguous()?;
-        let ot = crate::sage::sage_attention(&qt, &kt, &vt, sc, true)?; // (B,H,txt,D)
+        let ot = crate::sage::sage_attention(
+            &qh.narrow(2, 0, txt_len)?,
+            &kh.narrow(2, 0, txt_len)?,
+            &vh.narrow(2, 0, txt_len)?,
+            sc,
+            true,
+        )?; // (B,H,txt,D)
         // image queries: full non-causal attention over the whole sequence
-        let qi = qh.narrow(2, txt_len, s - txt_len)?.contiguous()?;
-        let oi = crate::sage::sage_attention(&qi, &kh.contiguous()?, &vh, sc, false)?; // (B,H,s-txt,D)
+        let qi = qh.narrow(2, txt_len, s - txt_len)?;
+        let oi = crate::sage::sage_attention(&qi, kh, &vh, sc, false)?; // (B,H,s-txt,D)
         let out = Tensor::cat(&[ot, oi], 2)?; // (B,H,S,D)
         Ok(out.transpose(1, 2)?.contiguous()?) // (B,S,H,D)
     }
