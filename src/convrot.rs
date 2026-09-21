@@ -56,22 +56,26 @@ impl candle_core::CustomOp2 for Int8Gemm {
         let b = b.as_cuda_slice::<u8>()?;
         let stream = dev.cuda_stream();
         let dst = unsafe { dev.alloc::<i32>(m * n)? };
-        let (a_ptr, _ga) = a.device_ptr(&stream);
-        let (b_ptr, _gb) = b.device_ptr(&stream);
-        let (c_ptr, _gc) = dst.device_ptr(&stream);
-        let rc = unsafe {
-            int8_gemm_s32(
-                c_ptr as *mut i32,
-                a_ptr as *const i8,
-                b_ptr as *const i8,
-                m as i32,
-                n as i32,
-                k as i32,
-                stream.cu_stream() as *mut std::ffi::c_void,
-            )
-        };
-        if rc != 0 {
-            candle_core::bail!("int8_gemm_s32 failed, rc={rc}");
+        // Scope the device_ptr guards so their borrows of `dst` end before the
+        // wrap_cuda_slice move below.
+        {
+            let (a_ptr, _ga) = a.device_ptr(&stream);
+            let (b_ptr, _gb) = b.device_ptr(&stream);
+            let (c_ptr, _gc) = dst.device_ptr(&stream);
+            let rc = unsafe {
+                int8_gemm_s32(
+                    c_ptr as *mut i32,
+                    a_ptr as *const i8,
+                    b_ptr as *const i8,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                )
+            };
+            if rc != 0 {
+                candle_core::bail!("int8_gemm_s32 failed, rc={rc}");
+            }
         }
         let dst = CudaStorage::wrap_cuda_slice(dst, dev);
         Ok((dst, (m, n).into()))
