@@ -75,9 +75,18 @@ This shrinks the FFI to ONE small stock-CUTLASS kernel; everything else is candl
   `git clone --depth 1 https://github.com/NVIDIA/cutlass` (cloned to
   `~/dev_tmp/cutlass` on the host). Compile: `nvcc -arch=sm_89 -std=c++17
   --expt-relaxed-constexpr -I~/dev_tmp/cutlass/include`.
-- ⬜ **Remaining (Rust integration):** (1) `build.rs` compiling `int8_gemm.cu`
-  (via `cc`/`bindgen_cuda`, pin CUTLASS) + link; (2) candle↔cudarc **device-ptr
-  bridge** (candle CUDA tensor -> raw `int8*`/`int32*`); (3) candle rotate+per-token
-  INT8 quant (activation) + per-channel INT8 weight (offline) + int32→bf16 dequant;
-  (4) `ConvRotLinear` behind `--convrot`, mixed precision; (5) validate DiT/image
-  vs bf16. The GEMM + rotation are done; this is plumbing + the pointer bridge.
+- ✅ **`build.rs` + candle CustomOp2 bridge WORK** (`src/convrot.rs`, `--features
+  convrot`): compiles the kernel (cc + `CUTLASS_DIR`), launches it from candle via
+  `as_cuda_slice`→`device_ptr(&stream)`→`wrap_cuda_slice` (flash-attn pattern),
+  U8-holds-int8 in / I32 out. `convrot-test` CLI: candle→kernel→candle **bit-exact
+  (maxdiff 0)** on the 4090. The whole FFI chain is proven.
+- ⚠️ candle's cuda build here lacks the **I32→F32 cast** kernel ("named symbol not
+  found"); the self-test compares on host. The int32→bf16 dequant must avoid that
+  cast — do it in a tiny custom op/kernel, or copy-to-host, or a supported path.
+- ⬜ **Remaining (no unknowns, pure wiring):** (1) rotate+per-token INT8 quant of
+  activations (candle rotation is done; add amax→int8 into a U8 tensor — small
+  custom op, since candle can't emit signed int8 via `to_dtype`); (2) per-channel
+  INT8 weight quant offline (once, at load); (3) int32→bf16 dequant with row/col
+  scales (custom op / host, per the cast note); (4) `ConvRotLinear` behind
+  `--convrot`, mixed precision (attn-out + value-proj stay bf16); (5) validate
+  DiT/image vs bf16 (target ~29 dB / 0.96 SSIM) + bench vs bf16.
