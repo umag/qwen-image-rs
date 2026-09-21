@@ -62,8 +62,9 @@ __global__ void fused_norm_mod_kernel(__nv_bfloat16 *__restrict__ out,
 }
 
 // out/x/scale are (M, N) bf16 row-major, contiguous. M rows, N cols.
-extern "C" void fused_norm_mod(void *out, const void *x, const void *scale,
-                               int m, int n, float eps, void *stream) {
+extern "C" void fused_norm_mod_launch(void *out, const void *x,
+                                      const void *scale, int m, int n, float eps,
+                                      void *stream) {
   size_t shmem = (size_t)n * sizeof(float);
   fused_norm_mod_kernel<<<m, THREADS, shmem, (cudaStream_t)stream>>>(
       (__nv_bfloat16 *)out, (const __nv_bfloat16 *)x,

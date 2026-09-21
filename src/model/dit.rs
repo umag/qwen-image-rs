@@ -104,10 +104,12 @@ fn norm_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
 fn norm_mod(x: &Tensor, scale: &Tensor, eps: f64) -> Result<Tensor> {
     #[cfg(feature = "fusednorm")]
     {
-        return crate::fusednorm::fused_norm_mod(x, scale, eps as f32);
+        crate::fusednorm::fused_norm_mod(x, scale, eps as f32)
     }
     #[cfg(not(feature = "fusednorm"))]
-    Ok(norm_no_affine(x, eps)?.broadcast_mul(&(scale + 1.0)?)?)
+    {
+        Ok(norm_no_affine(x, eps)?.broadcast_mul(&(scale + 1.0)?)?)
+    }
 }
 
 /// `QwenImage21ZeroCenterRMSNorm`: scale = weight + 1, computed in fp32.

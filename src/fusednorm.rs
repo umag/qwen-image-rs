@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use crate::Result;
 
 extern "C" {
-    fn fused_norm_mod(
+    fn fused_norm_mod_launch(
         out: *mut c_void,
         x: *const c_void,
         scale: *const c_void,
@@ -68,7 +68,7 @@ impl candle_core::CustomOp2 for FusedNormMod {
             let (sp, _b) = scale.device_ptr(&stream);
             let (op, _c) = out.device_ptr(&stream);
             unsafe {
-                fused_norm_mod(
+                fused_norm_mod_launch(
                     op as *mut c_void,
                     xp as *const c_void,
                     sp as *const c_void,
