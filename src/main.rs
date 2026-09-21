@@ -89,6 +89,10 @@ enum Command {
         /// Q8_0-quantize the text encoder (weight-only, ~half VRAM).
         #[arg(long)]
         quant_text: bool,
+        /// Resident mode: load all three models once and keep them in VRAM,
+        /// streaming prompts (needs --quant-text --convrot to fit in 24 GB).
+        #[arg(long)]
+        resident: bool,
         /// Output directory (writes 000.png, 001.png, ...).
         #[arg(long)]
         out_dir: std::path::PathBuf,
@@ -199,9 +203,10 @@ fn main() -> Result<()> {
             quant,
             convrot,
             quant_text,
+            resident,
             out_dir,
         } => batch(
-            &model, &prompts, size, steps, seed, quant, convrot, quant_text, &out_dir,
+            &model, &prompts, size, steps, seed, quant, convrot, quant_text, resident, &out_dir,
         ),
         Command::Info { weights } => info(&weights),
         Command::Generate {
@@ -372,6 +377,7 @@ fn batch(
     quant: bool,
     convrot: bool,
     quant_text: bool,
+    resident: bool,
     out_dir: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -408,6 +414,77 @@ fn batch(
         .get_ids()
         .len();
 
+    let hw = size / 16;
+    let img_seq = hw * hw;
+    let vae_cfg = |k: &str| -> Result<Vec<f32>> {
+        let j: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(model.join("vae/config.json"))?)?;
+        Ok(j[k].as_array().map_or(vec![], |a| {
+            a.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect()
+        }))
+    };
+    let save_png = |img: &Tensor, path: std::path::PathBuf| -> Result<()> {
+        let (w, h, bytes) = vae::to_rgba_u8(img)?;
+        let buf: image::RgbaImage =
+            image::ImageBuffer::from_raw(w as u32, h as u32, bytes).context("image buffer")?;
+        buf.save(path)?;
+        Ok(())
+    };
+
+    // Resident pipeline: load all three models ONCE and keep them in VRAM,
+    // running encode->denoise->decode per prompt without freeing between them.
+    // Needs everything to fit at once — pass --quant-text (and --convrot) so the
+    // 8B encoder + DiT + VAE stay under 24 GB. Amortizes the one-time loads
+    // across every prompt (the batch/serve win).
+    if resident {
+        let te = QwenTextEncoder::load(
+            &TextConfig::default(),
+            quant_text,
+            load_vb(model.join("text_encoder"), dtype)?,
+        )?;
+        let dit =
+            QwenImageDit::load(32, 64, quant, convrot, load_vb(model.join("transformer"), dtype)?)?;
+        let vmodel = vae::QwenImageVae::load(
+            &VaeConfig::default(),
+            &vae_cfg("latents_mean")?,
+            &vae_cfg("latents_std")?,
+            load_vb(model.join("vae"), DType::F32)?,
+        )?;
+        let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
+        tracing::info!("resident: all three models loaded, streaming prompts");
+        for (i, p) in prompts.iter().enumerate() {
+            let ids: Vec<u32> = tok
+                .encode(tmpl::t2i_template(p), false)
+                .map_err(|e| anyhow::anyhow!("encode: {e}"))?
+                .get_ids()
+                .to_vec();
+            let seq = ids.len();
+            let emb = te
+                .forward(&Tensor::from_vec(ids, (1, seq), &dev)?)?
+                .narrow(1, drop, seq - drop)?
+                .contiguous()?;
+            dev.set_seed(seed + i as u64)?;
+            let mut latents =
+                Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?.to_dtype(DType::F32)?;
+            for (si, t) in sched.timesteps().iter().enumerate() {
+                let tt = Tensor::from_vec(vec![(*t / 1000.0) as f32], (1,), &dev)?;
+                let joint = dit.forward(&latents.to_dtype(dtype)?, &emb, &tt, hw, hw)?;
+                let (_b, jl, _) = joint.dims3()?;
+                let np = joint.narrow(1, jl - img_seq, img_seq)?.to_dtype(DType::F32)?;
+                latents = (latents + (np * sched.dt(si))?)?;
+            }
+            let img = vmodel.decode(&vae::unpack_latents(&latents, 64)?)?;
+            save_png(&img, out_dir.join(format!("{i:03}.png")))?;
+            tracing::info!(image = i, "done (resident)");
+        }
+        println!(
+            "wrote {} images to {} (resident)",
+            prompts.len(),
+            out_dir.display()
+        );
+        return Ok(());
+    }
+
     // Phase 1: encode every prompt (text encoder loaded once, then freed).
     let mut embeds_list = Vec::with_capacity(prompts.len());
     {
@@ -430,8 +507,6 @@ fn batch(
     tracing::info!("encoded {} prompts", embeds_list.len());
 
     // Phase 2: denoise every prompt (DiT loaded once, then freed).
-    let hw = size / 16;
-    let img_seq = hw * hw;
     let mut latents_list = Vec::with_capacity(prompts.len());
     {
         let dit = QwenImageDit::load(32, 64, quant, convrot, load_vb(model.join("transformer"), dtype)?)?;
@@ -455,25 +530,15 @@ fn batch(
     }
 
     // Phase 3: decode every latent (VAE loaded once).
-    let cfg_json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(model.join("vae/config.json"))?)?;
-    let f32vec = |k: &str| -> Vec<f32> {
-        cfg_json[k].as_array().map_or(vec![], |a| {
-            a.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect()
-        })
-    };
     let vmodel = vae::QwenImageVae::load(
         &VaeConfig::default(),
-        &f32vec("latents_mean"),
-        &f32vec("latents_std"),
+        &vae_cfg("latents_mean")?,
+        &vae_cfg("latents_std")?,
         load_vb(model.join("vae"), DType::F32)?,
     )?;
     for (i, lat) in latents_list.iter().enumerate() {
         let img = vmodel.decode(&vae::unpack_latents(lat, 64)?)?;
-        let (w, h, bytes) = vae::to_rgba_u8(&img)?;
-        let buf: image::RgbaImage =
-            image::ImageBuffer::from_raw(w as u32, h as u32, bytes).context("image buffer")?;
-        buf.save(out_dir.join(format!("{i:03}.png")))?;
+        save_png(&img, out_dir.join(format!("{i:03}.png")))?;
     }
     println!("wrote {} images to {}", prompts.len(), out_dir.display());
     Ok(())
