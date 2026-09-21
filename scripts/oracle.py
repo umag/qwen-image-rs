@@ -66,7 +66,13 @@ def main() -> None:
         stem = f"{idx:02d}"
         out.images[0].save(args.out / f"{stem}.png")
         if "latents" in captured:
-            torch.save(captured["latents"], args.out / f"{stem}.latent.pt")
+            # safetensors is candle-native (a bare torch.save .pt is not readable
+            # by candle's pickle reader).
+            from safetensors.torch import save_file
+            save_file(
+                {"latent": captured["latents"].contiguous()},
+                str(args.out / f"{stem}.latent.safetensors"),
+            )
         manifest.append({"idx": idx, "prompt": prompt, "seed": SEED,
                          "steps": args.steps, "size": SIZE})
         print(f"[oracle] {stem} done: {prompt[:48]}")

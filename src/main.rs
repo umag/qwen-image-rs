@@ -104,15 +104,23 @@ fn vae_decode(
     let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, DType::F32, &dev)? };
     let model = vae::QwenImageVae::load(&cfg, &latents_mean, &latents_std, vb)?;
 
-    // Load the packed latent (.pt pickle) and unpack.
-    let tensors = candle_core::pickle::read_all(latent)?;
-    let packed = tensors
-        .into_iter()
-        .next()
-        .context("no tensor in latent file")?
-        .1
-        .to_device(&dev)?
-        .to_dtype(DType::F32)?;
+    // Load the packed latent. Prefer a safetensors sidecar (candle-native);
+    // fall back to a torch .pt pickle.
+    let packed = if latent.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+        let map = candle_core::safetensors::load(latent, &dev)?;
+        map.get("latent")
+            .or_else(|| map.values().next())
+            .context("no 'latent' tensor in safetensors")?
+            .to_dtype(DType::F32)?
+    } else {
+        candle_core::pickle::read_all(latent)?
+            .into_iter()
+            .next()
+            .context("no tensor in .pt file")?
+            .1
+            .to_device(&dev)?
+            .to_dtype(DType::F32)?
+    };
     tracing::info!(?packed, shape = ?packed.dims(), "loaded latent");
     let packed = if packed.dims().len() == 3 {
         packed
