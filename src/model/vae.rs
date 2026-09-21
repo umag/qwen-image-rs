@@ -407,3 +407,45 @@ pub fn to_rgba_u8(img: &Tensor) -> Result<(usize, usize, Vec<u8>)> {
 }
 
 use candle_core::IndexOp;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    #[test]
+    fn rmsnorm_matches_reference() -> Result<()> {
+        let dev = Device::Cpu;
+        // x = [[3],[4]] over C=2: ||.||=5, normalized=[0.6,0.8], *sqrt(2).
+        let x = Tensor::from_slice(&[3f32, 4f32], (1, 2, 1, 1), &dev)?;
+        let n = RmsNorm {
+            gamma: Tensor::ones((1, 2, 1, 1), DType::F32, &dev)?,
+            scale: 2f64.sqrt(),
+        };
+        let out = n.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
+        let s = 2f32.sqrt();
+        assert!((out[0] - 0.6 * s).abs() < 1e-5, "{out:?}");
+        assert!((out[1] - 0.8 * s).abs() < 1e-5, "{out:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn unpack_latents_shape() -> Result<()> {
+        let dev = Device::Cpu;
+        // (B=1, seq=16, C=2) -> (1, 2, 4, 4)
+        let packed = Tensor::zeros((1, 16, 2), DType::F32, &dev)?;
+        let z = unpack_latents(&packed, 2)?;
+        assert_eq!(z.dims(), &[1, 2, 4, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn dup_up_doubles_spatial() -> Result<()> {
+        let dev = Device::Cpu;
+        // in=4, out=8, factor_t=1 -> repeats=8, output (1,8,4,4) from (1,4,2,2).
+        let x = Tensor::zeros((1, 4, 2, 2), DType::F32, &dev)?;
+        let y = dup_up(&x, 4, 8, 1)?;
+        assert_eq!(y.dims(), &[1, 8, 4, 4]);
+        Ok(())
+    }
+}
