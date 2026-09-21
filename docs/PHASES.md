@@ -10,13 +10,20 @@ end-to-end before any optimization**; **GGUF supported alongside safetensors**;
 
 | # | Phase | Component | Oracle gate | IL issue | Status |
 |---|-------|-----------|-------------|----------|--------|
-| 0 | Scaffold + host | repo, CUDA build, latest Rust | candle GPU smoke passes on 4090 | `qwen-image-rs-scaffold` | in progress |
-| 1 | Oracle harness | diffusers reference set | 3 PNGs + latents + embeds, fixed seed | `qwen-image-rs-oracle` | pending env |
-| 2 | VAE decode | `AutoencoderKLQwenImage21` | latent→RGBA matches oracle | `qwen-image-rs-vae` | not started |
+| 0 | Scaffold + host | repo, CUDA build, latest Rust | candle GPU smoke passes on 4090 | (folded into oracle) | ✅ done |
+| 1 | Oracle harness | diffusers reference set | 3 PNGs + latents, fixed seed | `qwen-image-rs-oracle` | ✅ complete (attested 4302633) |
+| 2 | VAE decode | `AutoencoderKLQwenImage` (Wan-style 3D causal-conv) | latent→RGBA matches oracle | `qwen-image-rs-vae` | 📋 planned |
 | 3 | Text encoder | `Qwen3VLForConditionalGeneration` | embeds match within tol | `qwen-image-rs-text-encoder` | not started |
 | 4 | DiT + sampler | `QwenImage21Transformer2DModel` + FlowMatchEuler | first e2e image ≈ oracle @ bf16 | `qwen-image-rs-dit` | not started |
 | 5 | Optimization | FP8 → SageAttention → GGUF → VAE tiling → CUDA-graph | each ≥ bf16 quality, faster | `qwen-image-rs-optimize` | not started |
 | 6 | Bench + package | CLI, latency/VRAM table vs ComfyUI | reproducible bench | `qwen-image-rs-bench` | not started |
+
+## Findings so far
+- **Oracle runs fast**: 15B model via `enable_model_cpu_offload` decodes ~37s/img (2.03 it/s, 40 steps) on the 4090 — **no OOM**, quick iteration viable.
+- **Latent geometry**: 1024² → 64×64×64 f32 (16× compression, 64 channels), confirmed from `oracle_out/*.latent.pt`.
+- **VAE is Wan-style 3D causal-conv** (`AutoencoderKLQwenImage`): `CausalConv3d`, RMS-norm, residual blocks, mid-block attention, nearest-exact resample. Decodes single frames (T=1).
+- **candle 0.11 has no conv3d** → Phase 2 builds `CausalConv3d` from `conv2d` (causal temporal pad + sum over 3 temporal kernel slices; trivial at T=1).
+- **DiT**: 32 layers, 32×128=4096 hidden, context_in_dim 4096, 3D RoPE [16,56,56], mlp_ratio 3, causal_condition.
 
 ## Phase 5 optimization order (4090-specific)
 1. **FP8 e4m3fn** weight-only on DiT + text-encoder linears (native Ada FP8 TC).
