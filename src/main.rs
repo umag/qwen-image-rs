@@ -56,6 +56,9 @@ enum Command {
         /// Quantize the DiT block linears to Q8_0 (GGUF) — lower VRAM.
         #[arg(long)]
         quant: bool,
+        /// ConvRot W8A8 INT8 for the DiT attn/MLP linears (`convrot` feature).
+        #[arg(long)]
+        convrot: bool,
         #[arg(long)]
         out: std::path::PathBuf,
     },
@@ -75,6 +78,9 @@ enum Command {
         seed: u64,
         #[arg(long)]
         quant: bool,
+        /// ConvRot W8A8 INT8 for the DiT attn/MLP linears (`convrot` feature).
+        #[arg(long)]
+        convrot: bool,
         /// Output directory (writes 000.png, 001.png, ...).
         #[arg(long)]
         out_dir: std::path::PathBuf,
@@ -110,6 +116,9 @@ enum Command {
         /// Quantize the DiT block linears to Q8_0 (GGUF).
         #[arg(long)]
         quant: bool,
+        /// ConvRot W8A8 INT8 for the DiT attn/MLP linears (`convrot` feature).
+        #[arg(long)]
+        convrot: bool,
         /// Output final latent safetensors path.
         #[arg(long)]
         out: std::path::PathBuf,
@@ -125,6 +134,9 @@ enum Command {
         /// Quantize the DiT block linears to Q8_0 (GGUF).
         #[arg(long)]
         quant: bool,
+        /// ConvRot W8A8 INT8 for the DiT attn/MLP linears (`convrot` feature).
+        #[arg(long)]
+        convrot: bool,
         /// Output safetensors path (joint output tensor).
         #[arg(long)]
         out: std::path::PathBuf,
@@ -161,8 +173,9 @@ fn main() -> Result<()> {
             steps,
             seed,
             quant,
+            convrot,
             out_dir,
-        } => batch(&model, &prompts, size, steps, seed, quant, &out_dir),
+        } => batch(&model, &prompts, size, steps, seed, quant, convrot, &out_dir),
         Command::Info { weights } => info(&weights),
         Command::Generate {
             model,
@@ -171,8 +184,9 @@ fn main() -> Result<()> {
             steps,
             seed,
             quant,
+            convrot,
             out,
-        } => generate(&model, &prompt, size, steps, seed, quant, &out),
+        } => generate(&model, &prompt, size, steps, seed, quant, convrot, &out),
         Command::VaeDecode {
             weights,
             latent,
@@ -188,22 +202,25 @@ fn main() -> Result<()> {
             weights,
             inputs,
             quant,
+            convrot,
             out,
-        } => dit_forward(&weights, &inputs, quant, &out),
+        } => dit_forward(&weights, &inputs, quant, convrot, &out),
         Command::Denoise {
             weights,
             noise,
             embeds,
             steps,
             quant,
+            convrot,
             out,
-        } => denoise(&weights, &noise, &embeds, steps, quant, &out),
+        } => denoise(&weights, &noise, &embeds, steps, quant, convrot, &out),
     }
 }
 
 /// Standalone text-to-image: prompt -> PNG. Loads the three models one at a
 /// time (text encoder -> DiT -> VAE), freeing each before the next so the
 /// pipeline fits in 24 GB.
+#[allow(clippy::too_many_arguments)]
 fn generate(
     model: &std::path::Path,
     prompt: &str,
@@ -211,6 +228,7 @@ fn generate(
     steps: usize,
     seed: u64,
     quant: bool,
+    convrot: bool,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -263,7 +281,7 @@ fn generate(
     let hw = size / 16; // vae spatial compression
     let img_seq = hw * hw;
     let latent = {
-        let dit = QwenImageDit::load(32, 64, quant, load_vb(model.join("transformer"), dtype)?)?;
+        let dit = QwenImageDit::load(32, 64, quant, convrot, load_vb(model.join("transformer"), dtype)?)?;
         dev.set_seed(seed)?;
         let mut latents =
             Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?.to_dtype(DType::F32)?;
@@ -310,6 +328,7 @@ fn generate(
 /// Batch generation: load each model once for all prompts (encode all -> free
 /// -> denoise all -> free -> decode all), so the ~24s of model loads is paid
 /// once instead of per image.
+#[allow(clippy::too_many_arguments)]
 fn batch(
     model: &std::path::Path,
     prompts_path: &std::path::Path,
@@ -317,6 +336,7 @@ fn batch(
     steps: usize,
     seed: u64,
     quant: bool,
+    convrot: bool,
     out_dir: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -378,7 +398,7 @@ fn batch(
     let img_seq = hw * hw;
     let mut latents_list = Vec::with_capacity(prompts.len());
     {
-        let dit = QwenImageDit::load(32, 64, quant, load_vb(model.join("transformer"), dtype)?)?;
+        let dit = QwenImageDit::load(32, 64, quant, convrot, load_vb(model.join("transformer"), dtype)?)?;
         let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
         for (i, emb) in embeds_list.iter().enumerate() {
             dev.set_seed(seed + i as u64)?;
@@ -430,6 +450,7 @@ fn denoise(
     embeds: &std::path::Path,
     steps: usize,
     quant: bool,
+    convrot: bool,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -446,7 +467,7 @@ fn denoise(
     let set = WeightSet::resolve(weights)?;
     let files = set.files.clone();
     let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &dev)? };
-    let model = QwenImageDit::load(32, 64, quant, vb)?;
+    let model = QwenImageDit::load(32, 64, quant, convrot, vb)?;
 
     let nmap = candle_core::safetensors::load(noise, &dev)?;
     let mut latents = nmap
@@ -498,6 +519,7 @@ fn dit_forward(
     weights: &std::path::Path,
     inputs: &std::path::Path,
     quant: bool,
+    convrot: bool,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -513,7 +535,7 @@ fn dit_forward(
     let set = WeightSet::resolve(weights)?;
     let files = set.files.clone();
     let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &dev)? };
-    let model = QwenImageDit::load(32, 64, quant, vb)?;
+    let model = QwenImageDit::load(32, 64, quant, convrot, vb)?;
 
     let m = candle_core::safetensors::load(inputs, &dev)?;
     let get = |k: &str| -> Result<Tensor> {

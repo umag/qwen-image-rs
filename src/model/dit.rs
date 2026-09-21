@@ -12,15 +12,40 @@ use candle_nn::{linear_no_bias, Linear, Module, VarBuilder};
 
 use crate::Result;
 
-/// A no-bias linear that is either full-precision or Q8_0-quantized (GGUF).
+/// A no-bias linear that is full-precision, Q8_0-quantized (GGUF), or ConvRot
+/// W8A8 INT8 (rotated int8 GEMM, `convrot` feature).
 enum QLinear {
     Full(Linear),
     Quant(QMatMul),
+    #[cfg(feature = "convrot")]
+    Convrot(crate::convrot::ConvRotLinear),
 }
 
 impl QLinear {
-    /// Load `(out, in)` weights; quantize to Q8_0 when `quant` is set.
-    fn load(in_c: usize, out_c: usize, quant: bool, vb: VarBuilder) -> Result<Self> {
+    /// Load `(out, in)` weights. `convrot` (with a rotation `rot` and in-features
+    /// a multiple of 256) takes priority over `quant`; otherwise Q8_0 when
+    /// `quant`, else full-precision.
+    fn load(
+        in_c: usize,
+        out_c: usize,
+        quant: bool,
+        convrot: bool,
+        rot: Option<&Tensor>,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        #[cfg(feature = "convrot")]
+        if convrot {
+            if let Some(r) = rot {
+                if in_c % crate::model::rotation::GROUP == 0 {
+                    let w = vb.get((out_c, in_c), "weight")?;
+                    return Ok(QLinear::Convrot(crate::convrot::ConvRotLinear::from_weight(
+                        &w, r,
+                    )?));
+                }
+            }
+        }
+        #[cfg(not(feature = "convrot"))]
+        let _ = (convrot, rot);
         if quant {
             let w = vb.get((out_c, in_c), "weight")?;
             let qt = QTensor::quantize(&w, GgmlDType::Q8_0)?;
@@ -34,6 +59,8 @@ impl QLinear {
         match self {
             QLinear::Full(l) => Ok(l.forward(x)?),
             QLinear::Quant(q) => Ok(q.forward(x)?),
+            #[cfg(feature = "convrot")]
+            QLinear::Convrot(c) => c.forward(x),
         }
     }
 }
@@ -172,12 +199,12 @@ struct Attention {
 }
 
 impl Attention {
-    fn load(quant: bool, vb: VarBuilder) -> Result<Self> {
+    fn load(quant: bool, convrot: bool, rot: Option<&Tensor>, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            to_q: QLinear::load(INNER, INNER, quant, vb.pp("to_q"))?,
-            to_k: QLinear::load(INNER, INNER, quant, vb.pp("to_k"))?,
-            to_v: QLinear::load(INNER, INNER, quant, vb.pp("to_v"))?,
-            to_out: QLinear::load(INNER, INNER, quant, vb.pp("to_out").pp("0"))?,
+            to_q: QLinear::load(INNER, INNER, quant, convrot, rot, vb.pp("to_q"))?,
+            to_k: QLinear::load(INNER, INNER, quant, convrot, rot, vb.pp("to_k"))?,
+            to_v: QLinear::load(INNER, INNER, quant, convrot, rot, vb.pp("to_v"))?,
+            to_out: QLinear::load(INNER, INNER, quant, convrot, rot, vb.pp("to_out").pp("0"))?,
             norm_q: HeadRmsNorm::load(vb.pp("norm_q"))?,
             norm_k: HeadRmsNorm::load(vb.pp("norm_k"))?,
         })
@@ -276,11 +303,11 @@ struct SwiGlu {
     out: QLinear,
 }
 impl SwiGlu {
-    fn load(quant: bool, vb: VarBuilder) -> Result<Self> {
+    fn load(quant: bool, convrot: bool, rot: Option<&Tensor>, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            proj: QLinear::load(INNER, INNER * 3, quant, vb.pp("proj"))?,
-            gate: QLinear::load(INNER, INNER * 3, quant, vb.pp("gate_layer"))?,
-            out: QLinear::load(INNER * 3, INNER, quant, vb.pp("out"))?,
+            proj: QLinear::load(INNER, INNER * 3, quant, convrot, rot, vb.pp("proj"))?,
+            gate: QLinear::load(INNER, INNER * 3, quant, convrot, rot, vb.pp("gate_layer"))?,
+            out: QLinear::load(INNER * 3, INNER, quant, convrot, rot, vb.pp("out"))?,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -296,10 +323,10 @@ struct Block {
 }
 
 impl Block {
-    fn load(quant: bool, vb: VarBuilder) -> Result<Self> {
+    fn load(quant: bool, convrot: bool, rot: Option<&Tensor>, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            attn: Attention::load(quant, vb.pp("attn"))?,
-            mlp: SwiGlu::load(quant, vb.pp("img_mlp"))?,
+            attn: Attention::load(quant, convrot, rot, vb.pp("attn"))?,
+            mlp: SwiGlu::load(quant, convrot, rot, vb.pp("img_mlp"))?,
             eps: 1e-6,
         })
     }
@@ -346,13 +373,27 @@ impl QwenImageDit {
         num_layers: usize,
         out_channels: usize,
         quant: bool,
+        convrot: bool,
         vb: VarBuilder,
     ) -> Result<Self> {
         let dev = vb.device().clone();
+        // Build the 256×256 Regular Hadamard rotation once; ConvRotLinear stores
+        // a cheap handle clone. Only meaningful under the `convrot` feature.
+        #[cfg(feature = "convrot")]
+        let rot: Option<Tensor> = if convrot {
+            Some(crate::model::rotation::regular_hadamard_256(&dev)?)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "convrot"))]
+        let rot: Option<Tensor> = {
+            let _ = convrot;
+            None
+        };
         let mut blocks = Vec::with_capacity(num_layers);
         let vb_b = vb.pp("transformer_blocks");
         for i in 0..num_layers {
-            blocks.push(Block::load(quant, vb_b.pp(i))?);
+            blocks.push(Block::load(quant, convrot, rot.as_ref(), vb_b.pp(i))?);
         }
         let inv_freqs = std::array::from_fn(|a| {
             let d = AXES[a];
