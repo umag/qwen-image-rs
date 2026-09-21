@@ -1074,9 +1074,10 @@ fn sage_test() -> Result<()> {
             if rope_cos > 0.999 { "OK" } else { "TOO LOW" }
         );
         let (bshd_cos, maxabs) = qwen_image_rs::sage::self_test_bshd()?;
+        let bshd_ok = bshd_cos > 0.9999 && maxabs.is_finite() && maxabs < 0.01;
         println!(
             "sage BSHD vs BHSD (block-causal split): cosine = {bshd_cos:.6}, maxabs = {maxabs:.4} ({})",
-            if bshd_cos > 0.9999 { "OK" } else { "TOO LOW" }
+            if bshd_ok { "OK" } else { "MISMATCH" }
         );
         Ok(())
     }

@@ -448,24 +448,45 @@ pub fn self_test_bshd() -> Result<(f32, f32)> {
     let oi = sage_attention_bshd(&qi, &k, &vf, sc, false)?;
     let ours = Tensor::cat(&[ot, oi], 1)?.to_dtype(DType::F32)?; // (B,S,H,D)
 
-    // Everything on the host in f64 so neither the metric can overflow nor a NaN
-    // can hide (CUDA's fmax reduction silently skips NaN, so an on-device
-    // max_all would report 0 even if the vendored INT8 kernel emitted a NaN for
-    // some row — which both paths do identically). maxabs is the authoritative
-    // bit-exactness signal; cosine is secondary.
+    // Element-wise on the host, NaN-aware. This test proves the BSHD layout ==
+    // the BHSD layout (same kernel, different read/write strides) — NOT that the
+    // vendored INT8 kernel never NaNs. On some synthetic randn draws that kernel
+    // emits a NaN row (a per-block-quant edge case; real model activations don't
+    // trigger it — dit-forward stays clean). Both paths emit it identically, so
+    // a position where BOTH are NaN is a MATCH; a one-sided NaN is a real
+    // mismatch. maxabs (over finite pairs) is the bit-exactness signal; cosine
+    // is over the finite pairs. A one-sided NaN forces maxabs -> NaN (fails).
     let a = ours.flatten_all()?.to_vec1::<f32>()?;
     let bvec = refb.flatten_all()?.to_vec1::<f32>()?;
     let (mut dot, mut na, mut nb, mut maxabs) = (0f64, 0f64, 0f64, 0f64);
+    let mut mismatched_nans = 0usize;
     for (x, y) in a.iter().zip(bvec.iter()) {
         let (x, y) = (*x as f64, *y as f64);
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-        let diff = (x - y).abs();
-        if diff.is_nan() || diff > maxabs {
-            maxabs = diff;
+        match (x.is_finite(), y.is_finite()) {
+            (true, true) => {
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
+                let diff = (x - y).abs();
+                if diff > maxabs {
+                    maxabs = diff;
+                }
+            }
+            // both non-finite: a match only if the same class (NaN vs NaN, or
+            // equal signed infinities).
+            (false, false) if x.is_nan() == y.is_nan() && (x.is_nan() || x == y) => {}
+            _ => mismatched_nans += 1,
         }
     }
-    let cos = (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32;
-    Ok((cos, maxabs as f32))
+    let cos = if na > 0.0 && nb > 0.0 {
+        (dot / (na.sqrt() * nb.sqrt())) as f32
+    } else {
+        1.0
+    };
+    let maxabs = if mismatched_nans > 0 {
+        f32::NAN
+    } else {
+        maxabs as f32
+    };
+    Ok((cos, maxabs))
 }
