@@ -1083,6 +1083,18 @@ fn fusednorm_test() -> Result<()> {
             "fused norm+AdaLN vs candle: cosine = {cos:.6} ({})",
             if cos > 0.999 { "OK" } else { "TOO LOW" }
         );
+        for n in [4096usize, 128usize] {
+            let cos = qwen_image_rs::fusednorm::self_test_rmsnorm(n)?;
+            println!(
+                "fused RMSNorm×weight (N={n}) vs candle: cosine = {cos:.6} ({})",
+                if cos > 0.9999 { "OK" } else { "TOO LOW" }
+            );
+        }
+        let cos = qwen_image_rs::fusednorm::self_test_gated()?;
+        println!(
+            "fused gated residual vs candle: cosine = {cos:.6} ({})",
+            if cos > 0.9999 { "OK" } else { "TOO LOW" }
+        );
         Ok(())
     }
     #[cfg(not(feature = "fusednorm"))]

@@ -20,6 +20,23 @@ extern "C" {
         eps: f32,
         stream: *mut c_void,
     );
+    fn fused_rmsnorm_scale_launch(
+        out: *mut c_void,
+        x: *const c_void,
+        w: *const c_void,
+        m: i32,
+        n: i32,
+        eps: f32,
+        stream: *mut c_void,
+    );
+    fn fused_gated_residual_launch(
+        out: *mut c_void,
+        h: *const c_void,
+        gate: *const c_void,
+        y: *const c_void,
+        total: usize,
+        stream: *mut c_void,
+    );
 }
 
 struct FusedNormMod {
@@ -114,5 +131,199 @@ pub fn self_test() -> Result<f32> {
     let dot = (&y * &yref)?.sum_all()?.to_scalar::<f32>()?;
     let na = y.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
     let nb = yref.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+    Ok(dot / (na * nb + 1e-8))
+}
+
+/// Fused RMSNorm(no zero-centering) × per-channel weight: `out[m,n] = x[m,n] *
+/// rsqrt(mean_n(x^2) + eps) * W[n]`. `x` is `(..., N)` bf16; `W` is `(N,)` f32.
+/// Replaces `x * (1/sqrt(mean(x^2)+eps)) * W` (ZeroCenterRmsNorm/HeadRmsNorm) in
+/// src/model/dit.rs. `W` is f32 so it matches candle's `weight.to_dtype(F32)`
+/// (Head) / `weight.to_dtype(F32) + 1` (ZeroCenter, baked at load) exactly.
+struct FusedRmsnormScale {
+    eps: f32,
+}
+
+impl candle_core::CustomOp2 for FusedRmsnormScale {
+    fn name(&self) -> &'static str {
+        "fused-rmsnorm-scale"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("fused-rmsnorm-scale is CUDA-only")
+    }
+
+    fn cuda_fwd(
+        &self,
+        x: &CudaStorage,
+        x_l: &Layout,
+        w: &CudaStorage,
+        w_l: &Layout,
+    ) -> candle_core::Result<(CudaStorage, Shape)> {
+        let dev = x.device().clone();
+        let dims = x_l.shape().dims().to_vec();
+        let n = *dims.last().unwrap();
+        let wn = w_l.shape().dims1()?;
+        if wn != n {
+            candle_core::bail!("fused-rmsnorm-scale weight len {wn} != last dim {n}");
+        }
+        let m: usize = dims[..dims.len() - 1].iter().product();
+        let x = x.as_cuda_slice::<half::bf16>()?;
+        let w = w.as_cuda_slice::<f32>()?;
+        let stream = dev.cuda_stream();
+        let out = unsafe { dev.alloc::<half::bf16>(m * n)? };
+        {
+            let (xp, _a) = x.device_ptr(&stream);
+            let (wp, _b) = w.device_ptr(&stream);
+            let (op, _c) = out.device_ptr(&stream);
+            unsafe {
+                fused_rmsnorm_scale_launch(
+                    op as *mut c_void,
+                    xp as *const c_void,
+                    wp as *const c_void,
+                    m as i32,
+                    n as i32,
+                    self.eps,
+                    stream.cu_stream() as *mut c_void,
+                );
+            }
+        }
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), x_l.shape().clone()))
+    }
+}
+
+/// `x * rsqrt(mean(x^2)+eps) * W` fused. `x` is `(..., N)` bf16, `W` is `(N,)`
+/// f32 (the effective per-channel weight). bf16 out.
+pub fn fused_rmsnorm_scale(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
+    let x = x.contiguous()?;
+    let w = w.contiguous()?;
+    Ok(x.apply_op2(&w, FusedRmsnormScale { eps })?)
+}
+
+/// Fused gated residual: `out = h + tanh(gate) * y`, elementwise. `h`, `gate`,
+/// `y` share the same shape (bf16). Replaces `h + gate.tanh() * y` (used twice
+/// per block) in src/model/dit.rs.
+struct FusedGatedResidual;
+
+impl candle_core::CustomOp3 for FusedGatedResidual {
+    fn name(&self) -> &'static str {
+        "fused-gated-residual"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("fused-gated-residual is CUDA-only")
+    }
+
+    fn cuda_fwd(
+        &self,
+        h: &CudaStorage,
+        h_l: &Layout,
+        gate: &CudaStorage,
+        gate_l: &Layout,
+        y: &CudaStorage,
+        y_l: &Layout,
+    ) -> candle_core::Result<(CudaStorage, Shape)> {
+        let dev = h.device().clone();
+        let dims = h_l.shape().dims().to_vec();
+        if dims != gate_l.shape().dims() || dims != y_l.shape().dims() {
+            candle_core::bail!(
+                "fused-gated-residual shape mismatch: h {:?} gate {:?} y {:?}",
+                dims,
+                gate_l.shape().dims(),
+                y_l.shape().dims()
+            );
+        }
+        let total: usize = dims.iter().product();
+        let h = h.as_cuda_slice::<half::bf16>()?;
+        let gate = gate.as_cuda_slice::<half::bf16>()?;
+        let y = y.as_cuda_slice::<half::bf16>()?;
+        let stream = dev.cuda_stream();
+        let out = unsafe { dev.alloc::<half::bf16>(total)? };
+        {
+            let (hp, _a) = h.device_ptr(&stream);
+            let (gp, _b) = gate.device_ptr(&stream);
+            let (yp, _c) = y.device_ptr(&stream);
+            let (op, _d) = out.device_ptr(&stream);
+            unsafe {
+                fused_gated_residual_launch(
+                    op as *mut c_void,
+                    hp as *const c_void,
+                    gp as *const c_void,
+                    yp as *const c_void,
+                    total,
+                    stream.cu_stream() as *mut c_void,
+                );
+            }
+        }
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), h_l.shape().clone()))
+    }
+}
+
+/// `h + tanh(gate) * y` fused. All three share shape (bf16 in/out).
+pub fn fused_gated_residual(h: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
+    let h = h.contiguous()?;
+    let gate = gate.contiguous()?;
+    let y = y.contiguous()?;
+    Ok(h.apply_op3(&gate, &y, FusedGatedResidual)?)
+}
+
+/// Validate the fused RMSNorm×weight kernel vs the candle reference (RMSNorm no
+/// zero-center, f32, then `* W`) at row width `n`: cosine similarity. `n` is
+/// 4096 (ZeroCenter) or 128 (Head) in the DiT.
+pub fn self_test_rmsnorm(n: usize) -> Result<f32> {
+    use candle_core::{DType, Device, D};
+    let dev = Device::new_cuda(0)?;
+    let m = 4117usize; // seq rows
+    let eps = 1e-6f32;
+    let x = Tensor::randn(0f32, 1f32, (m, n), &dev)?.to_dtype(DType::BF16)?;
+    // Effective per-channel weight (f32), as the DiT passes it.
+    let w = Tensor::randn(1f32, 0.2f32, n, &dev)?; // f32 (N,)
+
+    let y = fused_rmsnorm_scale(&x, &w, eps)?.to_dtype(DType::F32)?;
+
+    // candle reference: x * (1/sqrt(mean(x^2)+eps)) * w
+    let x32 = x.to_dtype(DType::F32)?;
+    let ms = x32.sqr()?.mean_keepdim(D::Minus1)?;
+    let rrms = (ms + eps as f64)?.sqrt()?.recip()?;
+    let yref = x32.broadcast_mul(&rrms)?.broadcast_mul(&w)?;
+
+    let dot = (&y * &yref)?.sum_all()?.to_scalar::<f32>()?;
+    let na = y.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+    let nb = yref.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+    Ok(dot / (na * nb + 1e-8))
+}
+
+/// Validate the fused gated-residual kernel vs candle `h + tanh(gate) * y`.
+/// `gate` is drawn with a wide spread so tanh is exercised across its
+/// saturating range, not only its near-linear region.
+pub fn self_test_gated() -> Result<f32> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let (b, s, inner) = (1usize, 4117usize, 4096usize);
+    let h = Tensor::randn(0f32, 1f32, (b, s, inner), &dev)?.to_dtype(DType::BF16)?;
+    let gate = Tensor::randn(0f32, 1.5f32, (b, s, inner), &dev)?.to_dtype(DType::BF16)?;
+    let y = Tensor::randn(0f32, 1f32, (b, s, inner), &dev)?.to_dtype(DType::BF16)?;
+
+    let out = fused_gated_residual(&h, &gate, &y)?.to_dtype(DType::F32)?;
+
+    // candle reference.
+    let oref = (&h + gate.tanh()?.broadcast_mul(&y)?)?.to_dtype(DType::F32)?;
+
+    let dot = (&out * &oref)?.sum_all()?.to_scalar::<f32>()?;
+    let na = out.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+    let nb = oref.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
     Ok(dot / (na * nb + 1e-8))
 }

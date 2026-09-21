@@ -112,27 +112,57 @@ fn norm_mod(x: &Tensor, scale: &Tensor, eps: f64) -> Result<Tensor> {
     }
 }
 
-/// `QwenImage21ZeroCenterRMSNorm`: scale = weight + 1, computed in fp32.
+/// `x * rsqrt(mean(x^2)+eps) * w` — the DiT's RMSNorm pattern with a per-channel
+/// weight. `w` is the effective f32 weight vector `(N,)`: `weight+1` for
+/// ZeroCenterRmsNorm, `weight` for HeadRmsNorm (both baked in f32 at load).
+/// Under `fusednorm` this is one fused CUDA kernel; otherwise the candle ops.
+fn rmsnorm_scale(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
+    #[cfg(feature = "fusednorm")]
+    {
+        crate::fusednorm::fused_rmsnorm_scale(x, w, eps as f32)
+    }
+    #[cfg(not(feature = "fusednorm"))]
+    {
+        let dt = x.dtype();
+        let x32 = x.to_dtype(DType::F32)?;
+        let ms = x32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let rrms = (ms + eps)?.sqrt()?.recip()?;
+        let out = x32.broadcast_mul(&rrms)?.broadcast_mul(w)?;
+        Ok(out.to_dtype(dt)?)
+    }
+}
+
+/// `h + tanh(gate) * y` — the DiT's gated residual (2× per block). `h`, `gate`,
+/// `y` share shape. Under `fusednorm` this is one fused elementwise kernel;
+/// otherwise the candle ops.
+fn gated_residual(h: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "fusednorm")]
+    {
+        crate::fusednorm::fused_gated_residual(h, gate, y)
+    }
+    #[cfg(not(feature = "fusednorm"))]
+    {
+        Ok((h + gate.tanh()?.broadcast_mul(y)?)?)
+    }
+}
+
+/// `QwenImage21ZeroCenterRMSNorm`: scale = weight + 1, computed in fp32. The
+/// `weight+1` is baked in f32 once at load so the fused kernel and the candle
+/// fallback both scale by the effective per-channel weight.
 struct ZeroCenterRmsNorm {
-    weight: Tensor, // (dim,)
+    weight: Tensor, // (dim,) f32, = raw_weight + 1
     eps: f64,
 }
 
 impl ZeroCenterRmsNorm {
     fn load(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            weight: vb.get(dim, "weight")?,
+            weight: (vb.get(dim, "weight")?.to_dtype(DType::F32)? + 1.0)?,
             eps,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dt = x.dtype();
-        let x32 = x.to_dtype(DType::F32)?;
-        let ms = x32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let rrms = (ms + self.eps)?.sqrt()?.recip()?;
-        let scale = (self.weight.to_dtype(DType::F32)? + 1.0)?;
-        let out = x32.broadcast_mul(&rrms)?.broadcast_mul(&scale)?;
-        Ok(out.to_dtype(dt)?)
+        rmsnorm_scale(x, &self.weight, self.eps)
     }
 }
 
@@ -191,28 +221,22 @@ impl TimestepEmbed {
     }
 }
 
-/// Per-head RMSNorm over head_dim (Qwen attention q/k norm).
+/// Per-head RMSNorm over head_dim (Qwen attention q/k norm). Weight is upcast to
+/// f32 once at load (exact) so it feeds the shared `rmsnorm_scale` helper.
 struct HeadRmsNorm {
-    weight: Tensor,
+    weight: Tensor, // (head_dim,) f32
     eps: f64,
 }
 impl HeadRmsNorm {
     fn load(vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            weight: vb.get(HEAD_DIM, "weight")?,
+            weight: vb.get(HEAD_DIM, "weight")?.to_dtype(DType::F32)?,
             eps: 1e-6,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // x (..., head_dim)
-        let dt = x.dtype();
-        let x32 = x.to_dtype(DType::F32)?;
-        let ms = x32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let rrms = (ms + self.eps)?.sqrt()?.recip()?;
-        let out = x32
-            .broadcast_mul(&rrms)?
-            .broadcast_mul(&self.weight.to_dtype(DType::F32)?)?;
-        Ok(out.to_dtype(dt)?)
+        rmsnorm_scale(x, &self.weight, self.eps)
     }
 }
 
@@ -410,10 +434,10 @@ impl Block {
     ) -> Result<Tensor> {
         let x = norm_mod(h, scale1, self.eps)?;
         let attn = self.attn.forward(&x, mask, cos, sin, txt_len)?;
-        let h = (h + gate1.tanh()?.broadcast_mul(&attn)?)?;
+        let h = gated_residual(h, gate1, &attn)?;
         let x = norm_mod(&h, scale2, self.eps)?;
         let m = self.mlp.forward(&x)?;
-        Ok((&h + gate2.tanh()?.broadcast_mul(&m)?)?)
+        gated_residual(&h, gate2, &m)
     }
 }
 
