@@ -1,28 +1,427 @@
-//! `QwenImage21Transformer2DModel` — ~7B single-stream DiT, 32 layers,
-//! mixed-granularity attention (token-level causal mask on text, chunk-level
-//! bidirectional on image) with prefix-KV-cache reuse across denoise steps.
-//! **Phase 4** (first end-to-end image). bf16 + FlashAttention-2 baseline
-//! before FP8 / SageAttention are layered in Phase 5.
+//! `QwenImage21Transformer2DModel` — 32-layer single-stream MMDiT. **Phase 4.**
 //!
-//! TODO(phase-4): port 32 single-stream layers, prefix-KV cache, and wire the
-//! flow-matching loop; match oracle at bf16.
+//! Joint text+image sequence, block-causal attention (text causal, the target
+//! image block internally bidirectional), `causal_condition` modulation (image
+//! tokens modulate from the sampled timestep, text tokens from t=0), 3-axis
+//! complex RoPE. Text-to-image only: no condition images, no KV cache, no flex
+//! attention — the block-causal mask is built dense and applied once per block.
 
-use crate::model::config::DitConfig;
+use candle_core::{DType, Device, Tensor};
+use candle_nn::{linear_no_bias, Linear, Module, VarBuilder};
 
-/// Single-stream DiT. Not yet implemented — see docs/PHASES.md, Phase 4.
-#[allow(dead_code)]
+use crate::Result;
+
+const INNER: usize = 4096; // num_heads * head_dim = 32 * 128
+const HEADS: usize = 32;
+const HEAD_DIM: usize = 128;
+const AXES: [usize; 3] = [16, 56, 56]; // rope dims (frame, height, width)
+const ROPE_THETA: f64 = 10000.0;
+
+fn silu(x: &Tensor) -> Result<Tensor> {
+    Ok(candle_nn::ops::silu(x)?)
+}
+
+/// LayerNorm with no learnable affine (elementwise_affine=False), eps 1e-6.
+fn norm_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let x32 = x.to_dtype(DType::F32)?;
+    let mean = x32.mean_keepdim(candle_core::D::Minus1)?;
+    let xc = x32.broadcast_sub(&mean)?;
+    let var = xc.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+    let normed = xc.broadcast_div(&(var + eps)?.sqrt()?)?;
+    Ok(normed.to_dtype(x.dtype())?)
+}
+
+/// `QwenImage21ZeroCenterRMSNorm`: scale = weight + 1, computed in fp32.
+struct ZeroCenterRmsNorm {
+    weight: Tensor, // (dim,)
+    eps: f64,
+}
+
+impl ZeroCenterRmsNorm {
+    fn load(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            weight: vb.get(dim, "weight")?,
+            eps,
+        })
+    }
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let dt = x.dtype();
+        let x32 = x.to_dtype(DType::F32)?;
+        let ms = x32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let rrms = (ms + self.eps)?.sqrt()?.recip()?;
+        let scale = (self.weight.to_dtype(DType::F32)? + 1.0)?;
+        let out = x32.broadcast_mul(&rrms)?.broadcast_mul(&scale)?;
+        Ok(out.to_dtype(dt)?)
+    }
+}
+
+/// `QwenImage21TextProjection`: ZeroCenterRMSNorm -> Linear -> GELU(tanh) -> Linear.
+struct TextProjection {
+    norm: ZeroCenterRmsNorm,
+    in_layer: Linear,
+    out_layer: Linear,
+}
+
+impl TextProjection {
+    fn load(ctx_dim: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            norm: ZeroCenterRmsNorm::load(ctx_dim, 1e-6, vb.pp("text_norm"))?,
+            in_layer: linear_no_bias(ctx_dim, INNER, vb.pp("in_layer"))?,
+            out_layer: linear_no_bias(INNER, INNER, vb.pp("out_layer"))?,
+        })
+    }
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = self.norm.forward(x)?;
+        let x = self.in_layer.forward(&x)?;
+        let x = x.gelu()?; // tanh approximation (matches GELU(approximate="tanh"))
+        Ok(self.out_layer.forward(&x)?)
+    }
+}
+
+/// Sinusoidal timestep embedding (256) -> MLP(256->INNER, silu, INNER->INNER).
+struct TimestepEmbed {
+    linear1: Linear,
+    linear2: Linear,
+    freqs: Tensor, // (128,)
+}
+
+impl TimestepEmbed {
+    fn load(vb: VarBuilder, dev: &Device) -> Result<Self> {
+        let half = 128usize;
+        let freqs: Vec<f32> = (0..half)
+            .map(|i| (-(10000f32.ln()) * i as f32 / half as f32).exp())
+            .collect();
+        Ok(Self {
+            linear1: linear_no_bias(256, INNER, vb.pp("timestep_embedder").pp("linear_1"))?,
+            linear2: linear_no_bias(INNER, INNER, vb.pp("timestep_embedder").pp("linear_2"))?,
+            freqs: Tensor::from_vec(freqs, (1, half), dev)?,
+        })
+    }
+
+    /// `timestep` (n,) in [0,1] -> temb (n, INNER), computed in the given dtype.
+    fn forward(&self, timestep: &Tensor, dtype: DType) -> Result<Tensor> {
+        let t = (timestep.to_dtype(DType::F32)? * 1000.0)?.reshape(((), 1))?;
+        let args = t.broadcast_mul(&self.freqs)?; // (n, 128)
+        let emb = Tensor::cat(&[args.cos()?, args.sin()?], candle_core::D::Minus1)?; // (n,256)
+        let emb = emb.to_dtype(dtype)?;
+        let x = self.linear1.forward(&emb)?;
+        let x = silu(&x)?;
+        Ok(self.linear2.forward(&x)?)
+    }
+}
+
+/// Per-head RMSNorm over head_dim (Qwen attention q/k norm).
+struct HeadRmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+impl HeadRmsNorm {
+    fn load(vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            weight: vb.get(HEAD_DIM, "weight")?,
+            eps: 1e-6,
+        })
+    }
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // x (..., head_dim)
+        let dt = x.dtype();
+        let x32 = x.to_dtype(DType::F32)?;
+        let ms = x32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let rrms = (ms + self.eps)?.sqrt()?.recip()?;
+        let out = x32
+            .broadcast_mul(&rrms)?
+            .broadcast_mul(&self.weight.to_dtype(DType::F32)?)?;
+        Ok(out.to_dtype(dt)?)
+    }
+}
+
+struct Attention {
+    to_q: Linear,
+    to_k: Linear,
+    to_v: Linear,
+    to_out: Linear,
+    norm_q: HeadRmsNorm,
+    norm_k: HeadRmsNorm,
+}
+
+impl Attention {
+    fn load(vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            to_q: linear_no_bias(INNER, INNER, vb.pp("to_q"))?,
+            to_k: linear_no_bias(INNER, INNER, vb.pp("to_k"))?,
+            to_v: linear_no_bias(INNER, INNER, vb.pp("to_v"))?,
+            to_out: linear_no_bias(INNER, INNER, vb.pp("to_out").pp("0"))?,
+            norm_q: HeadRmsNorm::load(vb.pp("norm_q"))?,
+            norm_k: HeadRmsNorm::load(vb.pp("norm_k"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor, mask: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let (b, s, _) = x.dims3()?;
+        let shape = (b, s, HEADS, HEAD_DIM);
+        let q = self
+            .norm_q
+            .forward(&self.to_q.forward(x)?.reshape(shape)?)?;
+        let k = self
+            .norm_k
+            .forward(&self.to_k.forward(x)?.reshape(shape)?)?;
+        let v = self.to_v.forward(x)?.reshape(shape)?;
+        // (B,H,S,D)
+        let q = q.transpose(1, 2)?.contiguous()?;
+        let k = k.transpose(1, 2)?.contiguous()?;
+        let v = v.transpose(1, 2)?.contiguous()?;
+        // complex RoPE == interleaved pairs -> candle rope_i
+        let q = candle_nn::rotary_emb::rope_i(&q, cos, sin)?;
+        let k = candle_nn::rotary_emb::rope_i(&k, cos, sin)?;
+        let scale = 1.0 / (HEAD_DIM as f64).sqrt();
+        let attn = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let attn = attn.broadcast_add(mask)?; // (B,H,S,S) + (1,1,S,S)
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        let out = attn.matmul(&v)?; // (B,H,S,D)
+        let out = out.transpose(1, 2)?.reshape((b, s, INNER))?;
+        Ok(self.to_out.forward(&out)?)
+    }
+}
+
+struct SwiGlu {
+    proj: Linear,
+    gate: Linear,
+    out: Linear,
+}
+impl SwiGlu {
+    fn load(vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            proj: linear_no_bias(INNER, INNER * 3, vb.pp("proj"))?,
+            gate: linear_no_bias(INNER, INNER * 3, vb.pp("gate_layer"))?,
+            out: linear_no_bias(INNER * 3, INNER, vb.pp("out"))?,
+        })
+    }
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let g = silu(&self.gate.forward(x)?)?;
+        Ok(self.out.forward(&(g * self.proj.forward(x)?)?)?)
+    }
+}
+
+struct Block {
+    attn: Attention,
+    mlp: SwiGlu,
+    eps: f64,
+}
+
+impl Block {
+    fn load(vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            attn: Attention::load(vb.pp("attn"))?,
+            mlp: SwiGlu::load(vb.pp("img_mlp"))?,
+            eps: 1e-6,
+        })
+    }
+
+    /// `mod1`/`mod2` are the per-token (1,S,2*INNER) selected modulation slices.
+    fn forward(
+        &self,
+        h: &Tensor,
+        scale1: &Tensor,
+        gate1: &Tensor,
+        scale2: &Tensor,
+        gate2: &Tensor,
+        mask: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        let x = norm_no_affine(h, self.eps)?;
+        let x = x.broadcast_mul(&(scale1 + 1.0)?)?;
+        let attn = self.attn.forward(&x, mask, cos, sin)?;
+        let h = (h + gate1.tanh()?.broadcast_mul(&attn)?)?;
+        let x = norm_no_affine(&h, self.eps)?;
+        let x = x.broadcast_mul(&(scale2 + 1.0)?)?;
+        let m = self.mlp.forward(&x)?;
+        Ok((&h + gate2.tanh()?.broadcast_mul(&m)?)?)
+    }
+}
+
+/// Full DiT.
 pub struct QwenImageDit {
-    config: DitConfig,
+    img_in: Linear,
+    txt_in: TextProjection,
+    time_embed: TimestepEmbed,
+    modulation: Linear, // INNER -> 4*INNER (after silu)
+    blocks: Vec<Block>,
+    norm_out_linear: Linear, // INNER -> INNER
+    proj_out: Linear,        // INNER -> out_channels
+    device: Device,
+    inv_freqs: [Vec<f32>; 3], // per-axis rope inv-freqs
 }
 
 impl QwenImageDit {
-    #[allow(dead_code)]
-    pub fn new(config: DitConfig) -> Self {
-        Self { config }
+    pub fn load(num_layers: usize, out_channels: usize, vb: VarBuilder) -> Result<Self> {
+        let dev = vb.device().clone();
+        let mut blocks = Vec::with_capacity(num_layers);
+        let vb_b = vb.pp("transformer_blocks");
+        for i in 0..num_layers {
+            blocks.push(Block::load(vb_b.pp(i))?);
+        }
+        let inv_freqs = std::array::from_fn(|a| {
+            let d = AXES[a];
+            (0..d / 2)
+                .map(|j| 1f32 / ROPE_THETA.powf(2.0 * j as f64 / d as f64) as f32)
+                .collect()
+        });
+        Ok(Self {
+            img_in: linear_no_bias(64, INNER, vb.pp("img_in"))?,
+            txt_in: TextProjection::load(4096, vb.pp("txt_in"))?,
+            time_embed: TimestepEmbed::load(vb.pp("time_text_embed"), &dev)?,
+            modulation: linear_no_bias(INNER, 4 * INNER, vb.pp("modulation").pp("1"))?,
+            blocks,
+            norm_out_linear: linear_no_bias(INNER, INNER, vb.pp("norm_out").pp("linear"))?,
+            proj_out: linear_no_bias(INNER, out_channels, vb.pp("proj_out"))?,
+            device: dev,
+            inv_freqs,
+        })
     }
 
-    #[allow(dead_code)]
-    pub fn num_layers(&self) -> usize {
-        self.config.num_layers
+    /// Build cos/sin `(S, 32)` for interleaved RoPE, from per-token 3-axis
+    /// position indices. `img_shapes` = (frame, H, W) for the target image;
+    /// `txt_len` text tokens precede `H*W` image tokens.
+    fn rope_cos_sin(
+        &self,
+        txt_len: usize,
+        h: usize,
+        w: usize,
+        dtype: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        let img = h * w;
+        let seq = txt_len + img;
+        // frame/height/width index per token (i32 to allow negatives)
+        let mut frame = vec![0i64; seq];
+        let mut height = vec![0i64; seq];
+        let mut width = vec![0i64; seq];
+        // text: positions 0..txt_len on all axes
+        for (p, item) in frame.iter_mut().enumerate().take(txt_len) {
+            *item = p as i64;
+            height[p] = p as i64;
+            width[p] = p as i64;
+        }
+        // image: frame frozen at txt_len; height/width grid centered on zero
+        let hs = -((h - h / 2) as i64);
+        let ws = -((w - w / 2) as i64);
+        for r in 0..h {
+            for c in 0..w {
+                let idx = txt_len + r * w + c;
+                frame[idx] = txt_len as i64;
+                height[idx] = hs + r as i64;
+                width[idx] = ws + c as i64;
+            }
+        }
+        // angle per token = concat over axes of pos * inv_freq
+        let half: usize = AXES.iter().map(|d| d / 2).sum(); // 8+28+28 = 64
+        let mut cos = vec![0f32; seq * half];
+        let mut sin = vec![0f32; seq * half];
+        let idxs = [&frame, &height, &width];
+        for s in 0..seq {
+            let mut off = 0;
+            for a in 0..3 {
+                let pos = idxs[a][s] as f32;
+                for (j, inv) in self.inv_freqs[a].iter().enumerate() {
+                    let ang = pos * inv;
+                    cos[s * half + off + j] = ang.cos();
+                    sin[s * half + off + j] = ang.sin();
+                }
+                off += AXES[a] / 2;
+            }
+        }
+        let cos = Tensor::from_vec(cos, (seq, half), &self.device)?.to_dtype(dtype)?;
+        let sin = Tensor::from_vec(sin, (seq, half), &self.device)?.to_dtype(dtype)?;
+        Ok((cos, sin))
     }
+
+    /// Forward for text-to-image (no condition images, no mask/cache).
+    /// `hidden_states` (1, H*W, 64), `encoder_hidden_states` (1, txt_len, 4096),
+    /// `timestep` scalar tensor (1,), `(h,w)` target latent grid.
+    /// Returns the joint output (1, txt_len + H*W, out_channels).
+    pub fn forward(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: &Tensor,
+        h: usize,
+        w: usize,
+    ) -> Result<Tensor> {
+        let dtype = hidden_states.dtype();
+        let (_b, txt_len, _) = encoder_hidden_states.dims3()?;
+        let img_tokens = h * w;
+        let seq = txt_len + img_tokens;
+
+        let img = self.img_in.forward(hidden_states)?; // (1, img, INNER)
+        let txt = self.txt_in.forward(encoder_hidden_states)?; // (1, txt, INNER)
+                                                               // joint = [text, image]
+        let joint = Tensor::cat(&[&txt, &img], 1)?; // (1, seq, INNER)
+
+        // timestep embedding for [t, 0]; modulation for both rows.
+        let t0 = Tensor::zeros((1,), dtype, &self.device)?;
+        let ts = Tensor::cat(&[&timestep.to_dtype(dtype)?, &t0], 0)?; // (2,)
+        let temb = self.time_embed.forward(&ts, dtype)?; // (2, INNER)
+        let modhad = self.modulation.forward(&silu(&temb)?)?; // (2, 4*INNER)
+
+        // Split modulation into scale1,gate1,scale2,gate2, each (2, INNER).
+        let chunk = |t: &Tensor, i: usize| -> Result<Tensor> { Ok(t.narrow(1, i * INNER, INNER)?) };
+        let mods: Vec<Tensor> = (0..4).map(|i| chunk(&modhad, i)).collect::<Result<_>>()?;
+        // Per-token selection: image tokens use row 0 (real t), text row 1 (t=0).
+        let sel =
+            |m: &Tensor| -> Result<Tensor> { select_rows(m, txt_len, img_tokens, &self.device) };
+        let scale1 = sel(&mods[0])?;
+        let gate1 = sel(&mods[1])?;
+        let scale2 = sel(&mods[2])?;
+        let gate2 = sel(&mods[3])?;
+
+        let mask = block_causal_mask(txt_len, img_tokens, dtype, &self.device)?;
+        let (cos, sin) = self.rope_cos_sin(txt_len, h, w, dtype)?;
+
+        let mut x = joint;
+        for block in &self.blocks {
+            x = block.forward(&x, &scale1, &gate1, &scale2, &gate2, &mask, &cos, &sin)?;
+        }
+
+        // norm_out: AdaLayerNorm scale-only, then proj_out. Scale from temb rows.
+        let scale_out = self.norm_out_linear.forward(&silu(&temb)?)?; // (2, INNER)
+        let scale_out = select_rows(&scale_out, txt_len, img_tokens, &self.device)?; // (1,seq,INNER)
+        let normed = norm_no_affine(&x, 1e-6)?;
+        let x = normed.broadcast_mul(&(scale_out + 1.0)?)?;
+        let out = self.proj_out.forward(&x)?; // (1, seq, out_channels)
+        let _ = seq;
+        Ok(out)
+    }
+}
+
+/// Select modulation rows per token: `(2, INNER)` -> `(1, seq, INNER)`, image
+/// tokens take row 0 (real timestep), text tokens row 1 (t=0).
+fn select_rows(m: &Tensor, txt_len: usize, img_tokens: usize, dev: &Device) -> Result<Tensor> {
+    let real = m.narrow(0, 0, 1)?; // (1, INNER)
+    let zero = m.narrow(0, 1, 1)?; // (1, INNER)
+    let text_rows = zero.broadcast_as((txt_len, m.dim(1)?))?;
+    let img_rows = real.broadcast_as((img_tokens, m.dim(1)?))?;
+    let rows = Tensor::cat(&[&text_rows, &img_rows], 0)?.unsqueeze(0)?; // (1, seq, INNER)
+    let _ = dev;
+    Ok(rows)
+}
+
+/// Block-causal additive mask `(1,1,S,S)`: allowed[q,kv] = (q>=kv) OR both-image.
+fn block_causal_mask(
+    txt_len: usize,
+    img_tokens: usize,
+    dtype: DType,
+    dev: &Device,
+) -> Result<Tensor> {
+    let s = txt_len + img_tokens;
+    let mut data = vec![0f32; s * s];
+    for q in 0..s {
+        for kv in 0..s {
+            let both_image = q >= txt_len && kv >= txt_len;
+            let allowed = kv <= q || both_image;
+            if !allowed {
+                data[q * s + kv] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    Ok(Tensor::from_vec(data, (1, 1, s, s), dev)?.to_dtype(dtype)?)
 }

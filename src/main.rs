@@ -51,6 +51,18 @@ enum Command {
         #[arg(long)]
         out: std::path::PathBuf,
     },
+    /// Run one DiT forward on dumped inputs and save the joint output (Phase 4).
+    DitForward {
+        /// The transformer/ directory (config.json + *.safetensors shards).
+        #[arg(long)]
+        weights: std::path::PathBuf,
+        /// dit_io.safetensors with hidden_states/encoder_hidden_states/timestep.
+        #[arg(long)]
+        inputs: std::path::PathBuf,
+        /// Output safetensors path (joint output tensor).
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
     /// Decode a saved latent (.pt) through the VAE to an RGBA PNG (Phase 2).
     VaeDecode {
         /// The vae/ directory (holds config.json + *.safetensors).
@@ -89,7 +101,56 @@ fn main() -> Result<()> {
             drop,
             out,
         } => text_encode(&weights, &input_ids, drop, &out),
+        Command::DitForward {
+            weights,
+            inputs,
+            out,
+        } => dit_forward(&weights, &inputs, &out),
     }
+}
+
+/// Phase 4: run one DiT forward on dumped inputs, save the joint output.
+fn dit_forward(
+    weights: &std::path::Path,
+    inputs: &std::path::Path,
+    out: &std::path::Path,
+) -> Result<()> {
+    use qwen_image_rs::model::dit::QwenImageDit;
+
+    let dev = device::best_device()?;
+    let dtype = if matches!(dev, candle_core::Device::Cuda(_)) {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    tracing::info!(device = device::label(&dev), "dit-forward");
+
+    let set = WeightSet::resolve(weights)?;
+    let files = set.files.clone();
+    let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &dev)? };
+    let model = QwenImageDit::load(32, 64, vb)?;
+
+    let m = candle_core::safetensors::load(inputs, &dev)?;
+    let get = |k: &str| -> Result<Tensor> {
+        Ok(m.get(k).context(format!("missing {k}"))?.to_dtype(dtype)?)
+    };
+    let hidden = get("hidden_states")?;
+    let enc = get("encoder_hidden_states")?;
+    let ts = get("timestep")?;
+    let (_b, img, _) = hidden.dims3()?;
+    let hw = (img as f64).sqrt() as usize;
+    tracing::info!(img, hw, "running DiT forward");
+
+    let output = model
+        .forward(&hidden, &enc, &ts, hw, hw)?
+        .to_dtype(DType::F32)?;
+    tracing::info!(shape = ?output.dims(), "DiT output");
+
+    let mut map = std::collections::HashMap::new();
+    map.insert("output".to_string(), output.i(0)?.contiguous()?);
+    candle_core::safetensors::save(&map, out)?;
+    println!("wrote {}", out.display());
+    Ok(())
 }
 
 /// Phase 3: run the Qwen3-VL text encoder on dumped input_ids, drop the system
