@@ -411,6 +411,7 @@ pub fn self_test_bshd() -> Result<(f32, f32)> {
     use candle_core::{DType, Device};
     let (b, h, s, d, txt) = (1usize, 4usize, 160usize, 128usize, 32usize);
     let dev = Device::new_cuda(0)?;
+    dev.set_seed(42)?; // deterministic inputs
     let sc = (1.0 / (d as f64).sqrt()) as f32;
     let q = Tensor::randn(0f32, 1f32, (b, s, h, d), &dev)?.to_dtype(DType::BF16)?;
     let k = Tensor::randn(0f32, 1f32, (b, s, h, d), &dev)?.to_dtype(DType::BF16)?;
@@ -447,9 +448,24 @@ pub fn self_test_bshd() -> Result<(f32, f32)> {
     let oi = sage_attention_bshd(&qi, &k, &vf, sc, false)?;
     let ours = Tensor::cat(&[ot, oi], 1)?.to_dtype(DType::F32)?; // (B,S,H,D)
 
-    let dot = (&ours * &refb)?.sum_all()?.to_scalar::<f32>()?;
-    let na = ours.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
-    let nb = refb.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
-    let maxabs = (&ours - &refb)?.abs()?.max_all()?.to_scalar::<f32>()?;
-    Ok((dot / (na * nb + 1e-8), maxabs))
+    // Everything on the host in f64 so neither the metric can overflow nor a NaN
+    // can hide (CUDA's fmax reduction silently skips NaN, so an on-device
+    // max_all would report 0 even if the vendored INT8 kernel emitted a NaN for
+    // some row — which both paths do identically). maxabs is the authoritative
+    // bit-exactness signal; cosine is secondary.
+    let a = ours.flatten_all()?.to_vec1::<f32>()?;
+    let bvec = refb.flatten_all()?.to_vec1::<f32>()?;
+    let (mut dot, mut na, mut nb, mut maxabs) = (0f64, 0f64, 0f64, 0f64);
+    for (x, y) in a.iter().zip(bvec.iter()) {
+        let (x, y) = (*x as f64, *y as f64);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+        let diff = (x - y).abs();
+        if diff.is_nan() || diff > maxabs {
+            maxabs = diff;
+        }
+    }
+    let cos = (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32;
+    Ok((cos, maxabs as f32))
 }
