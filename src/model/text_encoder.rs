@@ -274,6 +274,78 @@ impl QwenTextEncoder {
         })
     }
 
+    /// Load from a pre-quantized GGUF (written by `prequantize-text`): linears
+    /// come back as Q8_0 `QMatMul` directly, norms/embedding are dequantized —
+    /// so NO bf16 weight tensor is ever created on the GPU (candle's CUDA pool
+    /// stays small, unlike quantize-on-load). Fixes the resident-mode VRAM peak.
+    pub fn load_gguf(
+        cfg: &TextConfig,
+        qvb: candle_transformers::quantized_var_builder::VarBuilder,
+    ) -> Result<Self> {
+        let dev = qvb.device().clone();
+        let dt = DType::BF16;
+        let vb_m = qvb.pp("model").pp("language_model");
+        let embed_w = vb_m
+            .pp("embed_tokens")
+            .get((cfg.vocab_size, cfg.hidden_size), "weight")?
+            .dequantize(&dev)?
+            .to_dtype(dt)?;
+        let embed_tokens = Embedding::new(embed_w, cfg.hidden_size);
+        let rope = RotaryEmbedding::new(cfg, &dev, dt)?;
+        let rms = |dim: usize, vb: &candle_transformers::quantized_var_builder::VarBuilder| -> Result<RmsNorm> {
+            let w = vb.get(dim, "weight")?.dequantize(&dev)?.to_dtype(dt)?;
+            Ok(RmsNorm::new(w, cfg.rms_norm_eps))
+        };
+        let qlin = |ic: usize, oc: usize, vb: &candle_transformers::quantized_var_builder::VarBuilder| -> Result<QLinear> {
+            Ok(QLinear::Quant(candle_core::quantized::QMatMul::from_arc(
+                vb.get((oc, ic), "weight")?,
+            )?))
+        };
+        let (nh, nkv, hd, h, ii) = (
+            cfg.num_heads,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            cfg.hidden_size,
+            cfg.intermediate_size,
+        );
+        let mut layers = Vec::with_capacity(cfg.num_layers);
+        let vb_l = vb_m.pp("layers");
+        for i in 0..cfg.num_layers {
+            let vb = vb_l.pp(i);
+            let sa = vb.pp("self_attn");
+            let attn = Attention {
+                q_proj: qlin(h, nh * hd, &sa.pp("q_proj"))?,
+                k_proj: qlin(h, nkv * hd, &sa.pp("k_proj"))?,
+                v_proj: qlin(h, nkv * hd, &sa.pp("v_proj"))?,
+                o_proj: qlin(nh * hd, h, &sa.pp("o_proj"))?,
+                q_norm: rms(hd, &sa.pp("q_norm"))?,
+                k_norm: rms(hd, &sa.pp("k_norm"))?,
+                num_heads: nh,
+                num_kv_heads: nkv,
+                head_dim: hd,
+                groups: nh / nkv,
+                scale: 1.0 / (hd as f64).sqrt(),
+            };
+            let mlp = Mlp {
+                gate: qlin(h, ii, &vb.pp("mlp").pp("gate_proj"))?,
+                up: qlin(h, ii, &vb.pp("mlp").pp("up_proj"))?,
+                down: qlin(ii, h, &vb.pp("mlp").pp("down_proj"))?,
+            };
+            layers.push(DecoderLayer {
+                attn,
+                mlp,
+                input_ln: rms(h, &vb.pp("input_layernorm"))?,
+                post_attn_ln: rms(h, &vb.pp("post_attention_layernorm"))?,
+            });
+        }
+        Ok(Self {
+            embed_tokens,
+            layers,
+            rope,
+            device: dev,
+        })
+    }
+
     /// Build a causal additive mask `(1, 1, S, S)` (0 on/below diagonal, -inf above).
     fn causal_mask(&self, s: usize, dtype: DType) -> Result<Tensor> {
         let mut data = vec![0f32; s * s];

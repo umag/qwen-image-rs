@@ -64,6 +64,10 @@ enum Command {
         /// Q8_0-quantize the text encoder (weight-only, ~half VRAM).
         #[arg(long)]
         quant_text: bool,
+        /// Load the text encoder from a pre-quantized GGUF (from prequantize-text)
+        /// instead of quantizing on load — smaller VRAM pool, no ~58 s load.
+        #[arg(long)]
+        text_gguf: Option<std::path::PathBuf>,
         #[arg(long)]
         out: std::path::PathBuf,
     },
@@ -90,9 +94,12 @@ enum Command {
         #[arg(long)]
         quant_text: bool,
         /// Resident mode: load all three models once and keep them in VRAM,
-        /// streaming prompts (needs --quant-text --convrot to fit in 24 GB).
+        /// streaming prompts (needs --text-gguf --convrot to fit comfortably).
         #[arg(long)]
         resident: bool,
+        /// Load the text encoder from a pre-quantized GGUF (from prequantize-text).
+        #[arg(long)]
+        text_gguf: Option<std::path::PathBuf>,
         /// Output directory (writes 000.png, 001.png, ...).
         #[arg(long)]
         out_dir: std::path::PathBuf,
@@ -156,6 +163,17 @@ enum Command {
         #[arg(long)]
         out: std::path::PathBuf,
     },
+    /// Pre-quantize the Qwen3-VL text encoder to a Q8_0 GGUF file, so
+    /// `--text-gguf` loads it directly (no bf16-on-GPU transient, no ~58 s
+    /// quantize-on-load) — keeps the resident-mode VRAM pool small.
+    PrequantizeText {
+        /// The text_encoder/ directory (bf16 config.json + *.safetensors shards).
+        #[arg(long)]
+        weights: std::path::PathBuf,
+        /// Output .gguf file.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
     /// Pre-quantize the DiT's ConvRot linears to a weights file (rotated INT8 +
     /// col scale), so `generate --convrot` on that file skips the load-time
     /// rotate+quant and mmaps ~half the bytes. Requires the `convrot` feature.
@@ -204,9 +222,11 @@ fn main() -> Result<()> {
             convrot,
             quant_text,
             resident,
+            text_gguf,
             out_dir,
         } => batch(
-            &model, &prompts, size, steps, seed, quant, convrot, quant_text, resident, &out_dir,
+            &model, &prompts, size, steps, seed, quant, convrot, quant_text, resident,
+            text_gguf.as_deref(), &out_dir,
         ),
         Command::Info { weights } => info(&weights),
         Command::Generate {
@@ -218,10 +238,13 @@ fn main() -> Result<()> {
             quant,
             convrot,
             quant_text,
+            text_gguf,
             out,
         } => generate(
-            &model, &prompt, size, steps, seed, quant, convrot, quant_text, &out,
+            &model, &prompt, size, steps, seed, quant, convrot, quant_text,
+            text_gguf.as_deref(), &out,
         ),
+        Command::PrequantizeText { weights, out } => prequantize_text(&weights, &out),
         Command::PrequantizeConvrot { weights, out } => prequantize_convrot(&weights, &out),
         Command::VaeDecode {
             weights,
@@ -254,6 +277,27 @@ fn main() -> Result<()> {
     }
 }
 
+/// Load the text encoder, preferring a pre-quantized GGUF (`--text-gguf`) which
+/// loads Q8_0 directly (no bf16-on-GPU transient); otherwise mmap the bf16
+/// safetensors and (optionally) quantize on load.
+fn load_text_encoder(
+    model: &std::path::Path,
+    dev: &candle_core::Device,
+    dtype: DType,
+    quant_text: bool,
+    text_gguf: Option<&std::path::Path>,
+) -> Result<qwen_image_rs::model::text_encoder::QwenTextEncoder> {
+    use qwen_image_rs::model::text_encoder::{QwenTextEncoder, TextConfig};
+    if let Some(g) = text_gguf {
+        let qvb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(g, dev)?;
+        QwenTextEncoder::load_gguf(&TextConfig::default(), qvb)
+    } else {
+        let files = WeightSet::resolve(&model.join("text_encoder"))?.files;
+        let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, dev)? };
+        QwenTextEncoder::load(&TextConfig::default(), quant_text, vb)
+    }
+}
+
 /// Standalone text-to-image: prompt -> PNG. Loads the three models one at a
 /// time (text encoder -> DiT -> VAE), freeing each before the next so the
 /// pipeline fits in 24 GB.
@@ -267,11 +311,12 @@ fn generate(
     quant: bool,
     convrot: bool,
     quant_text: bool,
+    text_gguf: Option<&std::path::Path>,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
     use qwen_image_rs::model::scheduler::{FlowConfig, FlowMatchEuler};
-    use qwen_image_rs::model::text_encoder::{prompt as tmpl, QwenTextEncoder, TextConfig};
+    use qwen_image_rs::model::text_encoder::prompt as tmpl;
     use qwen_image_rs::model::{config::VaeConfig, vae};
     use tokenizers::Tokenizer;
 
@@ -305,11 +350,7 @@ fn generate(
 
     // 1. Text encoder -> prompt embeddings (freed after).
     let embeds = {
-        let te = QwenTextEncoder::load(
-            &TextConfig::default(),
-            quant_text,
-            load_vb(model.join("text_encoder"), dtype)?,
-        )?;
+        let te = load_text_encoder(model, &dev, dtype, quant_text, text_gguf.as_deref())?;
         let ids_t = Tensor::from_vec(ids, (1, seq), &dev)?;
         let hidden = te.forward(&ids_t)?;
         hidden.narrow(1, drop, seq - drop)?.contiguous()?
@@ -378,11 +419,12 @@ fn batch(
     convrot: bool,
     quant_text: bool,
     resident: bool,
+    text_gguf: Option<&std::path::Path>,
     out_dir: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
     use qwen_image_rs::model::scheduler::{FlowConfig, FlowMatchEuler};
-    use qwen_image_rs::model::text_encoder::{prompt as tmpl, QwenTextEncoder, TextConfig};
+    use qwen_image_rs::model::text_encoder::prompt as tmpl;
     use qwen_image_rs::model::{config::VaeConfig, vae};
     use tokenizers::Tokenizer;
 
@@ -437,11 +479,7 @@ fn batch(
     // 8B encoder + DiT + VAE stay under 24 GB. Amortizes the one-time loads
     // across every prompt (the batch/serve win).
     if resident {
-        let te = QwenTextEncoder::load(
-            &TextConfig::default(),
-            quant_text,
-            load_vb(model.join("text_encoder"), dtype)?,
-        )?;
+        let te = load_text_encoder(model, &dev, dtype, quant_text, text_gguf.as_deref())?;
         let dit =
             QwenImageDit::load(32, 64, quant, convrot, load_vb(model.join("transformer"), dtype)?)?;
         let vmodel = vae::QwenImageVae::load(
@@ -488,11 +526,7 @@ fn batch(
     // Phase 1: encode every prompt (text encoder loaded once, then freed).
     let mut embeds_list = Vec::with_capacity(prompts.len());
     {
-        let te = QwenTextEncoder::load(
-            &TextConfig::default(),
-            quant_text,
-            load_vb(model.join("text_encoder"), dtype)?,
-        )?;
+        let te = load_text_encoder(model, &dev, dtype, quant_text, text_gguf.as_deref())?;
         for p in &prompts {
             let ids: Vec<u32> = tok
                 .encode(tmpl::t2i_template(p), false)
@@ -981,6 +1015,74 @@ fn prequantize_convrot(weights: &std::path::Path, out: &std::path::Path) -> Resu
 #[cfg(not(feature = "convrot"))]
 fn prequantize_convrot(_: &std::path::Path, _: &std::path::Path) -> Result<()> {
     anyhow::bail!("prequantize-convrot requires the `convrot` feature")
+}
+
+/// The Qwen3-VL text-encoder decoder linears (Q8_0-quantized in the GGUF);
+/// everything else (embedding, norms) is stored F16.
+fn is_text_linear(name: &str) -> bool {
+    const SUFFIXES: [&str; 7] = [
+        ".q_proj.weight",
+        ".k_proj.weight",
+        ".v_proj.weight",
+        ".o_proj.weight",
+        ".gate_proj.weight",
+        ".up_proj.weight",
+        ".down_proj.weight",
+    ];
+    name.contains(".layers.") && SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// Pre-quantize the text encoder to a Q8_0 GGUF (linears Q8_0, embedding+norms
+/// F16), containing only the tensors the text-only encoder loads. Loaded later
+/// via `--text-gguf` without ever materializing a bf16 weight on the GPU.
+fn prequantize_text(weights: &std::path::Path, out: &std::path::Path) -> Result<()> {
+    use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
+    use std::collections::HashMap;
+
+    let set = WeightSet::resolve(weights)?;
+    tracing::info!(files = set.files.len(), "loading bf16 text encoder (CPU)");
+    let mut full: HashMap<String, Tensor> = HashMap::new();
+    for f in &set.files {
+        for (k, v) in candle_core::safetensors::load(f, &candle_core::Device::Cpu)? {
+            full.insert(k, v);
+        }
+    }
+    // Only the tensors the text-only encoder uses: the language-model embedding
+    // and decoder layers (skips the vision tower, final norm, lm_head).
+    let mut names: Vec<String> = full
+        .keys()
+        .filter(|n| {
+            n.starts_with("model.language_model.embed_tokens")
+                || n.starts_with("model.language_model.layers.")
+        })
+        .cloned()
+        .collect();
+    names.sort();
+    let mut qtensors: Vec<(String, QTensor)> = Vec::with_capacity(names.len());
+    let mut n_q8 = 0usize;
+    for name in &names {
+        let t = &full[name];
+        let dt = if is_text_linear(name) {
+            n_q8 += 1;
+            GgmlDType::Q8_0
+        } else {
+            GgmlDType::F16
+        };
+        qtensors.push((name.clone(), QTensor::quantize(t, dt)?));
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let refs: Vec<(&str, &QTensor)> = qtensors.iter().map(|(n, q)| (n.as_str(), q)).collect();
+    let mut f = std::fs::File::create(out)?;
+    gguf_file::write(&mut f, &[], &refs)?;
+    println!(
+        "wrote {} tensors ({n_q8} Q8_0 linears + {} F16) -> {}",
+        refs.len(),
+        refs.len() - n_q8,
+        out.display()
+    );
+    Ok(())
 }
 
 /// Resolve a weight directory and print format + shard count + total size.
