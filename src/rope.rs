@@ -52,7 +52,7 @@ impl candle_core::CustomOp3 for RopeBshd {
         cos: &CudaStorage,
         cl: &Layout,
         sin: &CudaStorage,
-        _sl: &Layout,
+        sl: &Layout,
     ) -> candle_core::Result<(CudaStorage, Shape)> {
         let dev = x.device().clone();
         let (b, s, h, d) = xl.shape().dims4()?;
@@ -62,6 +62,15 @@ impl candle_core::CustomOp3 for RopeBshd {
         }
         if xl.start_offset() != 0 || !xl.is_contiguous() {
             candle_core::bail!("rope-i-bshd expects a contiguous (B,S,H,D) input");
+        }
+        // The kernel indexes cos/sin as [s*Dhalf + j] assuming (S, D/2)
+        // contiguous at offset 0.
+        if cl.start_offset() != 0
+            || !cl.is_contiguous()
+            || sl.start_offset() != 0
+            || !sl.is_contiguous()
+        {
+            candle_core::bail!("rope-i-bshd expects contiguous (S, D/2) cos/sin");
         }
         let x_s = x.as_cuda_slice::<half::bf16>()?;
         let cos_s = cos.as_cuda_slice::<half::bf16>()?;

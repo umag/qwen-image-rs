@@ -255,8 +255,12 @@ impl candle_core::CustomOp3 for SageAttnBshd {
         let (_, skv, hk, _) = kl.shape().dims4()?;
         // B=1 is the validated envelope (the DiT runs one image at a time). The
         // stride-honoring bridge would also be correct for B>1, but that path is
-        // untested — assert rather than silently render an unvalidated result.
-        debug_assert_eq!(b, 1, "sage-attn-bshd validated for B=1 only");
+        // untested — hard-bail (not debug_assert, which is a no-op in the release
+        // build that actually runs sage) so a future batching change can't
+        // silently render an unvalidated result.
+        if b != 1 {
+            candle_core::bail!("sage-attn-bshd: B>1 is unsupported (untested)");
+        }
         // head_dim must be the innermost (stride-1) dimension — the kernel's
         // vectorized loads require it. True for (B,S,H,D) and its S-axis narrows.
         let qst = ql.stride();
@@ -291,11 +295,11 @@ impl candle_core::CustomOp3 for SageAttnBshd {
             let (qsp, _f) = q_scale.device_ptr(&stream);
             let (ksp, _g) = k_scale.device_ptr(&stream);
             let (op, _h) = o.device_ptr(&stream);
-            // Offset the base pointers by each view's start_offset (bf16/f16 = 2
-            // bytes) so narrowed inputs read the right slice without a copy.
-            let qp = qp as usize + ql.start_offset() * 2;
-            let kp = kp as usize + kl.start_offset() * 2;
-            let vp = vp as usize + vl.start_offset() * 2;
+            // Offset the base pointers by each view's start_offset (in elements)
+            // so narrowed inputs read the right slice without a copy.
+            let qp = qp as usize + ql.start_offset() * std::mem::size_of::<half::bf16>();
+            let kp = kp as usize + kl.start_offset() * std::mem::size_of::<half::bf16>();
+            let vp = vp as usize + vl.start_offset() * std::mem::size_of::<half::f16>();
             let st = stream.cu_stream() as *mut c_void;
             unsafe {
                 sage_quant_q_bshd(
