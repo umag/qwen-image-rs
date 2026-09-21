@@ -143,9 +143,19 @@ Q8_0 (weight-only). Exposed as `--quant-text` (generate/batch) and `--quant`
   VAE's 1024² upsampling feature maps thrash. embed quality: Q8 vs bf16 cosine
   0.9977.
 - **So caching bf16 encoder weights is the WRONG fix** (encode is 0.2–1.4 s, ~1%
-  of the time) and would add ~7.5 GB → back over 24 GB (blank returns). The right
-  lever for fast resident is **VAE tiling/slicing** (low decode peak memory).
-  Otherwise sequential `--text-gguf` (35 s/img) already beats resident (57 s).
+  of the time) and would add ~7.5 GB → back over 24 GB (blank returns).
+
+### VAE tiled decode (DONE — makes resident the fast path)
+`decode_tiled` (src/model/vae.rs) splits the latent into overlapping tile×tile
+(latent) windows, decodes each, and feather-blends into a canvas — peak decode
+memory scales with tile², not image². `--vae-tile <N>` on generate/batch
+(0=off; overlap = tile/4).
+- **Seamless: tiled vs non-tiled PSNR 48.3 dB** (maxabs 22), imperceptible.
+- **Resident `--vae-tile 32`: decode 35 s → 1.8 s (19×), per-image 57 s → 22 s.**
+  Both mug+vase correct. This is now the FASTEST path: resident+gguf+tile
+  **22 s/img** < sequential `--text-gguf` 35 s < non-tiled resident 57 s.
+- Recommended resident invocation:
+  `batch --resident --convrot --text-gguf <gguf> --vae-tile 32 ...`
 
 ### Future levers
 - **Faster resident encode** — the Q8 te forward dominates resident per-image
