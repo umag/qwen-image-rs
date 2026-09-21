@@ -63,9 +63,15 @@ impl WeightSet {
         safet.sort();
         gguf.sort();
         if !gguf.is_empty() {
-            Ok(Self { format: WeightFormat::Gguf, files: gguf })
+            Ok(Self {
+                format: WeightFormat::Gguf,
+                files: gguf,
+            })
         } else if !safet.is_empty() {
-            Ok(Self { format: WeightFormat::Safetensors, files: safet })
+            Ok(Self {
+                format: WeightFormat::Safetensors,
+                files: safet,
+            })
         } else {
             bail!("no .safetensors or .gguf files in {}", dir.display());
         }

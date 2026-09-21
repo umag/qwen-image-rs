@@ -7,7 +7,11 @@ use clap::{Parser, Subcommand};
 use qwen_image_rs::{device, loader::WeightSet, Result};
 
 #[derive(Parser)]
-#[command(name = "qwen-image-rs", version, about = "Qwen-Image-2.1 inference in Rust/CUDA")]
+#[command(
+    name = "qwen-image-rs",
+    version,
+    about = "Qwen-Image-2.1 inference in Rust/CUDA"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -37,8 +41,7 @@ enum Command {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
