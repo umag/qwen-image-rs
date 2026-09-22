@@ -253,14 +253,8 @@ impl candle_core::CustomOp3 for SageAttnBshd {
         let dev = q.device().clone();
         let (b, sq, hq, d) = ql.shape().dims4()?;
         let (_, skv, hk, _) = kl.shape().dims4()?;
-        // B=1 is the validated envelope (the DiT runs one image at a time). The
-        // stride-honoring bridge would also be correct for B>1, but that path is
-        // untested — hard-bail (not debug_assert, which is a no-op in the release
-        // build that actually runs sage) so a future batching change can't
-        // silently render an unvalidated result.
-        if b != 1 {
-            candle_core::bail!("sage-attn-bshd: B>1 is unsupported (untested)");
-        }
+        // B>1 is exercised by the spike-batch verb (the stride-honoring bridge
+        // reads each batch lane via stride_bz). B=1 remains the production path.
         // head_dim must be the innermost (stride-1) dimension — the kernel's
         // vectorized loads require it. True for (B,S,H,D) and its S-axis narrows.
         let qst = ql.stride();

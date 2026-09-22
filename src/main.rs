@@ -38,6 +38,23 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         iters: usize,
     },
+    /// SPIKE: DiT-only batched multi-seed denoise (no text encoder resident).
+    /// Repeats one embed across B, gives each batch lane its own seed, and times
+    /// the denoise. Measures whether B different-seed images fit + throughput.
+    SpikeBatch {
+        /// The transformer weights dir (or a prequantized-convrot file).
+        #[arg(long)]
+        weights: std::path::PathBuf,
+        /// A single embeds .safetensors (key `embeds`), repeated across the batch.
+        #[arg(long)]
+        embeds: std::path::PathBuf,
+        #[arg(long, default_value_t = 4)]
+        batch: usize,
+        #[arg(long, default_value_t = 40)]
+        steps: usize,
+        #[arg(long, default_value_t = 1024)]
+        size: usize,
+    },
     /// Resolve and report a component's on-disk weight set (safetensors or GGUF).
     Info {
         /// Directory holding .safetensors shards or a .gguf file.
@@ -244,6 +261,13 @@ fn main() -> Result<()> {
         Command::SageTest => sage_test(),
         Command::FusednormTest => fusednorm_test(),
         Command::Bench { seq, iters } => bench(seq, iters),
+        Command::SpikeBatch {
+            weights,
+            embeds,
+            batch,
+            steps,
+            size,
+        } => spike_batch(&weights, &embeds, batch, steps, size),
         Command::Batch {
             model,
             prompts,
@@ -1114,6 +1138,88 @@ fn fusednorm_test() -> Result<()> {
 
 /// Micro-benchmark the DiT's per-layer dominant ops in bf16 on the active
 /// device, to see whether the workload is GEMM-bound or attention-bound.
+/// SPIKE: DiT-only batched multi-seed denoise. No text encoder, no VAE — just
+/// the transformer, to measure whether B different-seed lanes fit in VRAM and
+/// how throughput compares to sequential. Peak VRAM is sampled externally.
+fn spike_batch(
+    weights: &std::path::Path,
+    embeds: &std::path::Path,
+    batch: usize,
+    steps: usize,
+    size: usize,
+) -> Result<()> {
+    use qwen_image_rs::model::dit::QwenImageDit;
+    use qwen_image_rs::model::scheduler::{FlowConfig, FlowMatchEuler};
+
+    let dev = device::best_device()?;
+    let dtype = if matches!(dev, candle_core::Device::Cuda(_)) {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    let set = WeightSet::resolve(weights)?;
+    let files = set.files.clone();
+    let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &dev)? };
+    let model = QwenImageDit::load(32, 64, false, true, vb)?; // convrot=true
+
+    // One embed, repeated across the batch (same prompt, B different seeds).
+    let emap = candle_core::safetensors::load(embeds, &dev)?;
+    let mut enc = emap
+        .get("embeds")
+        .context("embeds file needs `embeds`")?
+        .clone();
+    if enc.dims().len() == 3 {
+        enc = enc.squeeze(0)?;
+    }
+    let (txt_len, hidden) = enc.dims2()?;
+    let enc = enc
+        .to_dtype(dtype)?
+        .unsqueeze(0)?
+        .broadcast_as((batch, txt_len, hidden))?
+        .contiguous()?; // (B, txt, 4096)
+
+    let hw = size / 16; // 1024 -> 64
+    let img_seq = hw * hw;
+    // B lanes, each its own seed.
+    let mut lanes = Vec::with_capacity(batch);
+    for b in 0..batch {
+        dev.set_seed((42 + b) as u64)?;
+        lanes.push(Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?);
+    }
+    let mut latents = Tensor::cat(&lanes, 0)?.to_dtype(dtype)?; // (B, img, 64)
+
+    let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
+    let tss = sched.timesteps().to_vec();
+    let step = |latents: &Tensor, i: usize, t: f64| -> Result<Tensor> {
+        let tt = Tensor::from_vec(vec![(t / 1000.0) as f32], (1,), &dev)?;
+        let out = model.forward(&latents.to_dtype(dtype)?, &enc, &tt, hw, hw)?;
+        let (_b, joint, _) = out.dims3()?;
+        let np = out
+            .narrow(1, joint - img_seq, img_seq)?
+            .to_dtype(DType::F32)?;
+        Ok((latents + (np * sched.dt(i))?)?)
+    };
+    // warmup (builds kernels + grows the pool) then time the full loop.
+    latents = step(&latents, 0, tss[0])?;
+    dev.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for (i, t) in tss.iter().enumerate() {
+        latents = step(&latents, i, *t)?;
+    }
+    dev.synchronize()?;
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    let per_step = ms / steps as f64;
+    let imgs_per_s = batch as f64 / (ms / 1e3); // B images per full denoise
+    println!(
+        "SPIKE batch={batch} steps={steps} hw={hw}: total={ms:.0}ms per_step={per_step:.1}ms \
+         per_step_per_img={:.1}ms  throughput={:.3} img/s (denoise-only)",
+        per_step / batch as f64,
+        imgs_per_s
+    );
+    let _ = latents;
+    Ok(())
+}
+
 fn bench(seq: usize, iters: usize) -> Result<()> {
     let dev = device::best_device()?;
     let dt = if matches!(dev, candle_core::Device::Cuda(_)) {

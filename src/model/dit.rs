@@ -587,7 +587,7 @@ impl QwenImageDit {
         w: usize,
     ) -> Result<Tensor> {
         let dtype = hidden_states.dtype();
-        let (_b, txt_len, _) = encoder_hidden_states.dims3()?;
+        let (b, txt_len, _) = encoder_hidden_states.dims3()?;
         let img_tokens = h * w;
         let seq = txt_len + img_tokens;
 
@@ -606,8 +606,18 @@ impl QwenImageDit {
         let chunk = |t: &Tensor, i: usize| -> Result<Tensor> { Ok(t.narrow(1, i * INNER, INNER)?) };
         let mods: Vec<Tensor> = (0..4).map(|i| chunk(&modhad, i)).collect::<Result<_>>()?;
         // Per-token selection: image tokens use row 0 (real t), text row 1 (t=0).
-        let sel =
-            |m: &Tensor| -> Result<Tensor> { select_rows(m, txt_len, img_tokens, &self.device) };
+        // select_rows yields (1, seq, INNER); for a batch, broadcast to (b, seq,
+        // INNER) and materialize (the fused norm/gate kernels index per row and
+        // read raw pointers, so a stride-0 broadcast view won't do). B=1 keeps
+        // the (1, seq, INNER) tensor untouched.
+        let sel = |m: &Tensor| -> Result<Tensor> {
+            let r = select_rows(m, txt_len, img_tokens, &self.device)?;
+            if b > 1 {
+                Ok(r.broadcast_as((b, seq, INNER))?.contiguous()?)
+            } else {
+                Ok(r)
+            }
+        };
         let scale1 = sel(&mods[0])?;
         let gate1 = sel(&mods[1])?;
         let scale2 = sel(&mods[2])?;
@@ -631,6 +641,11 @@ impl QwenImageDit {
         // norm_out: AdaLayerNorm scale-only, then proj_out. Scale from temb rows.
         let scale_out = self.norm_out_linear.forward(&silu(&temb)?)?; // (2, INNER)
         let scale_out = select_rows(&scale_out, txt_len, img_tokens, &self.device)?; // (1,seq,INNER)
+        let scale_out = if b > 1 {
+            scale_out.broadcast_as((b, seq, INNER))?.contiguous()?
+        } else {
+            scale_out
+        };
         let x = norm_mod(&x, &scale_out, 1e-6)?;
         let out = self.proj_out.forward(&x)?; // (1, seq, out_channels)
         let _ = seq;
