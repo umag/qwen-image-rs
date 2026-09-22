@@ -1186,7 +1186,7 @@ fn spike_batch(
         dev.set_seed((42 + b) as u64)?;
         lanes.push(Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?);
     }
-    let mut latents = Tensor::cat(&lanes, 0)?.to_dtype(dtype)?; // (B, img, 64)
+    let mut latents = Tensor::cat(&lanes, 0)?; // (B, img, 64) f32 accumulator
 
     let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
     let tss = sched.timesteps().to_vec();
