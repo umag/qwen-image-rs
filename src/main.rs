@@ -38,23 +38,6 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         iters: usize,
     },
-    /// SPIKE: DiT-only batched multi-seed denoise (no text encoder resident).
-    /// Repeats one embed across B, gives each batch lane its own seed, and times
-    /// the denoise. Measures whether B different-seed images fit + throughput.
-    SpikeBatch {
-        /// The transformer weights dir (or a prequantized-convrot file).
-        #[arg(long)]
-        weights: std::path::PathBuf,
-        /// A single embeds .safetensors (key `embeds`), repeated across the batch.
-        #[arg(long)]
-        embeds: std::path::PathBuf,
-        #[arg(long, default_value_t = 4)]
-        batch: usize,
-        #[arg(long, default_value_t = 40)]
-        steps: usize,
-        #[arg(long, default_value_t = 1024)]
-        size: usize,
-    },
     /// Resolve and report a component's on-disk weight set (safetensors or GGUF).
     Info {
         /// Directory holding .safetensors shards or a .gguf file.
@@ -101,8 +84,22 @@ enum Command {
         /// Force the VAE decode in f32 (default: bf16 on CUDA).
         #[arg(long)]
         vae_f32: bool,
+        /// Number of images to generate for this prompt in ONE batched denoise,
+        /// each with its own seed (seed, seed+1, ...). 1 = single image (default).
+        /// 4 is the efficient max on a 24GB card; B>=5 pays a per-image tax.
+        #[arg(long, default_value_t = 1)]
+        batch: usize,
+        /// Output PNG (used when --batch 1). Written verbatim.
         #[arg(long)]
-        out: std::path::PathBuf,
+        out: Option<std::path::PathBuf>,
+        /// Output directory for --batch > 1: writes 000.png..00N.png (one per
+        /// seed). Required when --batch > 1.
+        #[arg(long)]
+        out_dir: Option<std::path::PathBuf>,
+        /// Debug: also save each image's final latent as NNN.latent.safetensors
+        /// (for the per-lane correctness check). Writes beside the PNG(s).
+        #[arg(long)]
+        emit_latents: bool,
     },
     /// Batch text-to-image: many prompts, each model loaded ONCE (encode all ->
     /// denoise all -> decode all), amortizing the ~24s of model loads.
@@ -261,13 +258,6 @@ fn main() -> Result<()> {
         Command::SageTest => sage_test(),
         Command::FusednormTest => fusednorm_test(),
         Command::Bench { seq, iters } => bench(seq, iters),
-        Command::SpikeBatch {
-            weights,
-            embeds,
-            batch,
-            steps,
-            size,
-        } => spike_batch(&weights, &embeds, batch, steps, size),
         Command::Batch {
             model,
             prompts,
@@ -316,7 +306,10 @@ fn main() -> Result<()> {
             guidance,
             negative,
             vae_f32,
+            batch,
             out,
+            out_dir,
+            emit_latents,
         } => generate(
             &model,
             &prompt,
@@ -331,7 +324,10 @@ fn main() -> Result<()> {
             guidance,
             &negative,
             vae_f32,
-            &out,
+            batch,
+            out.as_deref(),
+            out_dir.as_deref(),
+            emit_latents,
         ),
         Command::PrequantizeText { weights, out } => prequantize_text(&weights, &out),
         Command::PrequantizeConvrot { weights, out } => prequantize_convrot(&weights, &out),
@@ -438,8 +434,21 @@ fn generate(
     guidance: f32,
     negative: &str,
     vae_f32: bool,
-    out: &std::path::Path,
+    batch: usize,
+    out: Option<&std::path::Path>,
+    out_dir: Option<&std::path::Path>,
+    emit_latents: bool,
 ) -> Result<()> {
+    if batch < 1 {
+        anyhow::bail!("--batch must be >= 1");
+    }
+    // Output-target validation up front (before the ~20s of model loads).
+    if batch == 1 && out.is_none() {
+        anyhow::bail!("--out <file> is required for --batch 1");
+    }
+    if batch > 1 && out_dir.is_none() {
+        anyhow::bail!("--out-dir <dir> is required for --batch > 1 (writes 000.png..)");
+    }
     use qwen_image_rs::model::dit::QwenImageDit;
     use qwen_image_rs::model::scheduler::{FlowConfig, FlowMatchEuler};
     use qwen_image_rs::model::text_encoder::prompt as tmpl;
@@ -493,6 +502,23 @@ fn generate(
     };
     tracing::info!(shape = ?embeds.dims(), guidance, "prompt embeddings");
 
+    // Broadcast the (1, txt, 4096) embeds across the batch lanes (all lanes share
+    // the prompt; only the seed differs). Materialized so the fused kernels read
+    // real per-row data, not a stride-0 view. B=1 leaves the tensor untouched.
+    let embeds = if batch > 1 {
+        let (_, t, hd) = embeds.dims3()?;
+        embeds.broadcast_as((batch, t, hd))?.contiguous()?
+    } else {
+        embeds
+    };
+    let neg_embeds = match neg_embeds {
+        Some(n) if batch > 1 => {
+            let (_, t, hd) = n.dims3()?;
+            Some(n.broadcast_as((batch, t, hd))?.contiguous()?)
+        }
+        other => other,
+    };
+
     // 2. DiT + flow-match denoise -> final latent (freed after).
     let hw = size / 16; // vae spatial compression
     let img_seq = hw * hw;
@@ -504,9 +530,15 @@ fn generate(
             convrot,
             load_vb(model.join("transformer"), dtype)?,
         )?;
-        dev.set_seed(seed)?;
-        let mut latents =
-            Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?.to_dtype(DType::F32)?;
+        // One seed per lane: lane i uses (seed + i), resetting the RNG each lane
+        // so lane i is bit-identical to a sequential `generate --seed (seed+i)`.
+        // Do NOT collapse this into a single set_seed + N draws.
+        let mut lanes = Vec::with_capacity(batch);
+        for i in 0..batch {
+            dev.set_seed(seed + i as u64)?;
+            lanes.push(Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?);
+        }
+        let mut latents = Tensor::cat(&lanes, 0)?.to_dtype(DType::F32)?; // (batch, img, 64)
         let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
         for (i, t) in sched.timesteps().iter().enumerate() {
             let tt = Tensor::from_vec(vec![(*t / 1000.0) as f32], (1,), &dev)?;
@@ -542,17 +574,44 @@ fn generate(
         &f32vec("latents_std"),
         load_vb(model.join("vae"), vae_dt)?,
     )?;
-    let z = vae::unpack_latents(&latent, 64)?;
-    let img = if vae_tile > 0 {
-        vmodel.decode_tiled(&z, vae_tile, (vae_tile / 4).max(1))?
-    } else {
-        vmodel.decode(&z)?
-    };
-    let (w, h, bytes) = vae::to_rgba_u8(&img)?;
-    let buf: image::RgbaImage =
-        image::ImageBuffer::from_raw(w as u32, h as u32, bytes).context("image buffer")?;
-    buf.save(out)?;
-    println!("wrote {} ({w}x{h})", out.display());
+    // One VAE (loaded above) decodes every lane's latent in a loop.
+    if let Some(d) = out_dir {
+        if batch > 1 {
+            std::fs::create_dir_all(d)?;
+        }
+    }
+    for i in 0..batch {
+        let li = latent.narrow(0, i, 1)?; // (1, img, 64)
+        let z = vae::unpack_latents(&li, 64)?;
+        let img = if vae_tile > 0 {
+            vmodel.decode_tiled(&z, vae_tile, (vae_tile / 4).max(1))?
+        } else {
+            vmodel.decode(&z)?
+        };
+        let (w, h, bytes) = vae::to_rgba_u8(&img)?;
+        let buf: image::RgbaImage =
+            image::ImageBuffer::from_raw(w as u32, h as u32, bytes).context("image buffer")?;
+        let path = if batch == 1 {
+            out.expect("--out validated present for batch 1")
+                .to_path_buf()
+        } else {
+            out_dir
+                .expect("--out-dir validated present for batch > 1")
+                .join(format!("{i:03}.png"))
+        };
+        buf.save(&path)?;
+        if emit_latents {
+            let lp = path.with_extension("latent.safetensors");
+            let mut m = std::collections::HashMap::new();
+            m.insert("latent".to_string(), li.contiguous()?);
+            candle_core::safetensors::save(&m, &lp)?;
+        }
+        println!(
+            "wrote {} (seed {}, {w}x{h})",
+            path.display(),
+            seed + i as u64
+        );
+    }
     Ok(())
 }
 
@@ -1138,88 +1197,6 @@ fn fusednorm_test() -> Result<()> {
 
 /// Micro-benchmark the DiT's per-layer dominant ops in bf16 on the active
 /// device, to see whether the workload is GEMM-bound or attention-bound.
-/// SPIKE: DiT-only batched multi-seed denoise. No text encoder, no VAE — just
-/// the transformer, to measure whether B different-seed lanes fit in VRAM and
-/// how throughput compares to sequential. Peak VRAM is sampled externally.
-fn spike_batch(
-    weights: &std::path::Path,
-    embeds: &std::path::Path,
-    batch: usize,
-    steps: usize,
-    size: usize,
-) -> Result<()> {
-    use qwen_image_rs::model::dit::QwenImageDit;
-    use qwen_image_rs::model::scheduler::{FlowConfig, FlowMatchEuler};
-
-    let dev = device::best_device()?;
-    let dtype = if matches!(dev, candle_core::Device::Cuda(_)) {
-        DType::BF16
-    } else {
-        DType::F32
-    };
-    let set = WeightSet::resolve(weights)?;
-    let files = set.files.clone();
-    let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &dev)? };
-    let model = QwenImageDit::load(32, 64, false, true, vb)?; // convrot=true
-
-    // One embed, repeated across the batch (same prompt, B different seeds).
-    let emap = candle_core::safetensors::load(embeds, &dev)?;
-    let mut enc = emap
-        .get("embeds")
-        .context("embeds file needs `embeds`")?
-        .clone();
-    if enc.dims().len() == 3 {
-        enc = enc.squeeze(0)?;
-    }
-    let (txt_len, hidden) = enc.dims2()?;
-    let enc = enc
-        .to_dtype(dtype)?
-        .unsqueeze(0)?
-        .broadcast_as((batch, txt_len, hidden))?
-        .contiguous()?; // (B, txt, 4096)
-
-    let hw = size / 16; // 1024 -> 64
-    let img_seq = hw * hw;
-    // B lanes, each its own seed.
-    let mut lanes = Vec::with_capacity(batch);
-    for b in 0..batch {
-        dev.set_seed((42 + b) as u64)?;
-        lanes.push(Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?);
-    }
-    let mut latents = Tensor::cat(&lanes, 0)?; // (B, img, 64) f32 accumulator
-
-    let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
-    let tss = sched.timesteps().to_vec();
-    let step = |latents: &Tensor, i: usize, t: f64| -> Result<Tensor> {
-        let tt = Tensor::from_vec(vec![(t / 1000.0) as f32], (1,), &dev)?;
-        let out = model.forward(&latents.to_dtype(dtype)?, &enc, &tt, hw, hw)?;
-        let (_b, joint, _) = out.dims3()?;
-        let np = out
-            .narrow(1, joint - img_seq, img_seq)?
-            .to_dtype(DType::F32)?;
-        Ok((latents + (np * sched.dt(i))?)?)
-    };
-    // warmup (builds kernels + grows the pool) then time the full loop.
-    latents = step(&latents, 0, tss[0])?;
-    dev.synchronize()?;
-    let t0 = std::time::Instant::now();
-    for (i, t) in tss.iter().enumerate() {
-        latents = step(&latents, i, *t)?;
-    }
-    dev.synchronize()?;
-    let ms = t0.elapsed().as_secs_f64() * 1e3;
-    let per_step = ms / steps as f64;
-    let imgs_per_s = batch as f64 / (ms / 1e3); // B images per full denoise
-    println!(
-        "SPIKE batch={batch} steps={steps} hw={hw}: total={ms:.0}ms per_step={per_step:.1}ms \
-         per_step_per_img={:.1}ms  throughput={:.3} img/s (denoise-only)",
-        per_step / batch as f64,
-        imgs_per_s
-    );
-    let _ = latents;
-    Ok(())
-}
-
 fn bench(seq: usize, iters: usize) -> Result<()> {
     let dev = device::best_device()?;
     let dt = if matches!(dev, candle_core::Device::Cuda(_)) {
