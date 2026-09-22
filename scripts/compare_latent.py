@@ -19,11 +19,14 @@ import sys
 import numpy as np
 from safetensors.numpy import load_file
 
-args = [a for a in sys.argv[1:] if not a.startswith("--")]
 thr = 0.99
-for i, a in enumerate(sys.argv):
+args = []
+it = iter(sys.argv[1:])
+for a in it:
     if a == "--threshold":
-        thr = float(sys.argv[i + 1])
+        thr = float(next(it))
+    elif not a.startswith("--"):
+        args.append(a)
 
 a = load_file(args[0])["latent"].astype(np.float64).reshape(-1)
 b = load_file(args[1])["latent"].astype(np.float64).reshape(-1)

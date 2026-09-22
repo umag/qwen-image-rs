@@ -253,8 +253,8 @@ impl candle_core::CustomOp3 for SageAttnBshd {
         let dev = q.device().clone();
         let (b, sq, hq, d) = ql.shape().dims4()?;
         let (_, skv, hk, _) = kl.shape().dims4()?;
-        // B>1 is exercised by the spike-batch verb (the stride-honoring bridge
-        // reads each batch lane via stride_bz). B=1 remains the production path.
+        // B>1 is exercised by `generate --batch N` (the stride-honoring bridge
+        // reads each batch lane via stride_bz). B=1 remains the common path.
         // head_dim must be the innermost (stride-1) dimension — the kernel's
         // vectorized loads require it. True for (B,S,H,D) and its S-axis narrows.
         let qst = ql.stride();

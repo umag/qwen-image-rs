@@ -97,7 +97,7 @@ enum Command {
         #[arg(long)]
         out_dir: Option<std::path::PathBuf>,
         /// Debug: also save each image's final latent as NNN.latent.safetensors
-        /// (for the per-lane correctness check). Writes beside the PNG(s).
+        /// (for the self-consistency check / debugging). Writes beside the PNG(s).
         #[arg(long)]
         emit_latents: bool,
     },
@@ -449,6 +449,13 @@ fn generate(
     if batch > 1 && out_dir.is_none() {
         anyhow::bail!("--out-dir <dir> is required for --batch > 1 (writes 000.png..)");
     }
+    // Warn on the non-applicable output flag rather than silently ignoring it.
+    if batch == 1 && out_dir.is_some() {
+        tracing::warn!("--out-dir ignored for --batch 1 (writing --out)");
+    }
+    if batch > 1 && out.is_some() {
+        tracing::warn!("--out ignored for --batch > 1 (writing --out-dir/NNN.png)");
+    }
     use qwen_image_rs::model::dit::QwenImageDit;
     use qwen_image_rs::model::scheduler::{FlowConfig, FlowMatchEuler};
     use qwen_image_rs::model::text_encoder::prompt as tmpl;
@@ -531,11 +538,14 @@ fn generate(
             load_vb(model.join("transformer"), dtype)?,
         )?;
         // One seed per lane: lane i uses (seed + i), resetting the RNG each lane
-        // so lane i is bit-identical to a sequential `generate --seed (seed+i)`.
-        // Do NOT collapse this into a single set_seed + N draws.
+        // so lane i's NOISE is identical to a sequential `generate --seed (seed+i)`
+        // run. The resulting IMAGE is NOT bit-identical to that single run — the
+        // fast path is non-deterministic and diverges by batch size (different
+        // GEMM tiling); that divergence is intended (see HANDOVER). Do NOT
+        // collapse this into a single set_seed + N draws.
         let mut lanes = Vec::with_capacity(batch);
         for i in 0..batch {
-            dev.set_seed(seed + i as u64)?;
+            dev.set_seed(seed.wrapping_add(i as u64))?;
             lanes.push(Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?);
         }
         let mut latents = Tensor::cat(&lanes, 0)?.to_dtype(DType::F32)?; // (batch, img, 64)
@@ -609,7 +619,7 @@ fn generate(
         println!(
             "wrote {} (seed {}, {w}x{h})",
             path.display(),
-            seed + i as u64
+            seed.wrapping_add(i as u64)
         );
     }
     Ok(())
