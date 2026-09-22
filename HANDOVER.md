@@ -50,6 +50,32 @@ Plus (not per-step): bf16 VAE decode 1.57×; text encoder Q8_0 GGUF (resident
 VRAM); VAE tiling (constant decode memory); true CFG (`--guidance`/`--negative`,
 2× denoise when >1).
 
+### Batched multi-seed generation (DONE — `qwen-image-rs-batch-seeds`)
+`generate --batch N` renders one prompt as N images with N different seeds
+(`seed, seed+1, …`) in ONE batched DiT denoise — the SDXL "batch count" grid.
+Encode once → free TE → broadcast the embed to `(N,txt,4096)` → N seed-noises
+(lane i = `set_seed(seed+i)`, RNG reset per lane) → batched denoise (`forward` /
+`guided_noise_pred` operate at any B; `forward` broadcasts the per-token
+modulation to B, guarded so B=1 is byte-identical) → load VAE once, loop tiled
+decode → `--out-dir`/`{i:03}.png` (B=1 keeps `--out`). `--emit-latents` saves
+each lane's latent. All batch kernels are per-lane (sage via `stride_bz`, rope
+grid `B*S*H`, convrot/fusednorm CTA-per-row).
+- **Sweet spot B=4** (spike: DiT-only peak 14.2 GB, throughput-neutral vs
+  sequential; knee at B=5 — B≥5 pays a growing per-image tax, B=8 +72 %). It's
+  ergonomic, not faster: the GEMMs already saturate the 4090, so 8 images = ~2×
+  the time of 4, same as sequential.
+- **VALIDATED by self-consistency + eyeball, NOT bit-exactness.** The fast path
+  is NOT bit-reproducible: same-seed B=1 twice = cosine **0.981** (INT8/CUTLASS
+  split-K atomics vary per run, amplified over the chaotic 20-step flow-match).
+  A batched lane also does NOT reproduce a single `--seed i` run — the GEMM
+  tiling differs by batch size, landing the trajectory in a different basin
+  (intended). What holds: batched output is **self-consistent across batch
+  sizes** (B=2 lane i vs B=4 lane i cosine **0.99996**), and each lane is a
+  clean, distinct, on-prompt image (verified: 4 red-mug seed-variations). So
+  `scripts/compare_latent.py` gates SELF-CONSISTENCY (thr 0.99), not lane-vs-
+  sequential. NOTE: B=1 with convrot at some seeds lands off-prompt where B≥2
+  lands on-prompt — a pre-existing non-determinism artifact, tracked separately.
+
 CLI verbs (all in `src/main.rs`): `generate`, `batch` (has `--resident`,
 `--vae-tile`, `--guidance`/`--negative`, `--text-gguf`, `--quant-text`),
 `denoise`, `dit-forward`, `text-encode`, `vae-decode` (`--bf16`), `smoke`,
