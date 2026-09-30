@@ -131,11 +131,14 @@ impl candle_core::CustomOp3 for SageAttn {
         k: &CudaStorage,
         kl: &Layout,
         v: &CudaStorage,
-        _vl: &Layout,
+        vl: &Layout,
     ) -> candle_core::Result<(CudaStorage, Shape)> {
         let dev = q.device().clone();
         let (b, hq, s, d) = ql.shape().dims4()?;
         let (_, hk, skv, _) = kl.shape().dims4()?;
+        let qo = crate::layout::dense_byte_offset::<half::bf16>(ql, "sage-attn q")?;
+        let ko = crate::layout::dense_byte_offset::<half::bf16>(kl, "sage-attn k")?;
+        let vo = crate::layout::dense_byte_offset::<half::f16>(vl, "sage-attn v")?;
         let q_s = q.as_cuda_slice::<half::bf16>()?;
         let k_s = k.as_cuda_slice::<half::bf16>()?;
         let v_s = v.as_cuda_slice::<half::f16>()?;
@@ -153,6 +156,7 @@ impl candle_core::CustomOp3 for SageAttn {
             let (qp, _a) = q_s.device_ptr(&stream);
             let (kp, _b) = k_s.device_ptr(&stream);
             let (vp, _c) = v_s.device_ptr(&stream);
+            let (qp, kp, vp) = (qp + qo, kp + ko, vp + vo);
             let (qip, _d) = q_i8.device_ptr(&stream);
             let (kip, _e) = k_i8.device_ptr(&stream);
             let (qsp, _f) = q_scale.device_ptr(&stream);

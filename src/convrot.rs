@@ -7,6 +7,7 @@ use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{CpuStorage, CudaStorage, Layout, Shape, Tensor};
 
+use crate::layout::dense_byte_offset;
 use crate::Result;
 
 extern "C" {
@@ -77,6 +78,8 @@ impl candle_core::CustomOp2 for Int8Gemm {
             candle_core::bail!("int8-gemm K mismatch: {k} vs {k2}");
         }
         // U8 storage holding int8 bytes.
+        let ao = dense_byte_offset::<u8>(a_l, "int8-gemm a")?;
+        let bo = dense_byte_offset::<u8>(b_l, "int8-gemm b")?;
         let a = a.as_cuda_slice::<u8>()?;
         let b = b.as_cuda_slice::<u8>()?;
         let stream = dev.cuda_stream();
@@ -87,6 +90,10 @@ impl candle_core::CustomOp2 for Int8Gemm {
             let (a_ptr, _ga) = a.device_ptr(&stream);
             let (b_ptr, _gb) = b.device_ptr(&stream);
             let (c_ptr, _gc) = dst.device_ptr(&stream);
+            let (a_ptr, b_ptr) = (a_ptr + ao, b_ptr + bo);
+            if a_ptr % 16 != 0 || b_ptr % 16 != 0 {
+                candle_core::bail!("int8-gemm: misaligned view (a {a_ptr:#x}, b {b_ptr:#x})");
+            }
             let rc = unsafe {
                 int8_gemm_s32(
                     c_ptr as *mut i32,
@@ -151,10 +158,12 @@ impl candle_core::CustomOp2 for QuantizeRows {
         x: &CudaStorage,
         x_l: &Layout,
         s: &CudaStorage,
-        _s_l: &Layout,
+        s_l: &Layout,
     ) -> candle_core::Result<(CudaStorage, Shape)> {
         let dev = x.device().clone();
         let (m, k) = x_l.shape().dims2()?;
+        let xo = dense_byte_offset::<half::bf16>(x_l, "quantize-rows x")?;
+        let so = dense_byte_offset::<f32>(s_l, "quantize-rows inv_scale")?;
         let x = x.as_cuda_slice::<half::bf16>()?;
         let s = s.as_cuda_slice::<f32>()?;
         let stream = dev.cuda_stream();
@@ -163,6 +172,7 @@ impl candle_core::CustomOp2 for QuantizeRows {
             let (xp, _a) = x.device_ptr(&stream);
             let (sp, _b) = s.device_ptr(&stream);
             let (op, _c) = out.device_ptr(&stream);
+            let (xp, sp) = (xp + xo, sp + so);
             unsafe {
                 quantize_rows_i8(
                     op as *mut u8,
@@ -203,10 +213,12 @@ impl candle_core::CustomOp2 for QuantizeFused {
         x: &CudaStorage,
         x_l: &Layout,
         rs: &CudaStorage,
-        _rs_l: &Layout,
+        rs_l: &Layout,
     ) -> candle_core::Result<(CudaStorage, Shape)> {
         let dev = x.device().clone();
         let (m, k) = x_l.shape().dims2()?;
+        let xo = dense_byte_offset::<half::bf16>(x_l, "quantize-rows-fused x")?;
+        let ro = dense_byte_offset::<f32>(rs_l, "quantize-rows-fused row_scale")?;
         let x = x.as_cuda_slice::<half::bf16>()?;
         let rs = rs.as_cuda_slice::<f32>()?; // pre-allocated (m,), written in place
         let stream = dev.cuda_stream();
@@ -215,6 +227,7 @@ impl candle_core::CustomOp2 for QuantizeFused {
             let (xp, _a) = x.device_ptr(&stream);
             let (rp, _b) = rs.device_ptr(&stream);
             let (op, _c) = out.device_ptr(&stream);
+            let (xp, rp) = (xp + xo, rp + ro);
             unsafe {
                 quantize_rows_fused_launch(
                     op as *mut u8,
@@ -306,6 +319,9 @@ impl candle_core::CustomOp3 for Int8GemmDequant {
             );
         }
         // U8 storage holding int8 bytes; scales are f32 (col ++ row).
+        let ao = dense_byte_offset::<u8>(a_l, "int8-gemm-dequant a")?;
+        let bo = dense_byte_offset::<u8>(b_l, "int8-gemm-dequant b")?;
+        let so = dense_byte_offset::<f32>(s_l, "int8-gemm-dequant scales")?;
         let a = a.as_cuda_slice::<u8>()?;
         let b = b.as_cuda_slice::<u8>()?;
         let s = s.as_cuda_slice::<f32>()?;
@@ -313,6 +329,14 @@ impl candle_core::CustomOp3 for Int8GemmDequant {
         let (ap, _ga) = a.device_ptr(&stream);
         let (bp, _gb) = b.device_ptr(&stream);
         let (sp, _gs) = s.device_ptr(&stream);
+        let (ap, bp, sp) = (ap + ao, bp + bo, sp + so);
+        // CUTLASS 128-bit operand loads need 16-B aligned A/B; the vectorized
+        // RowBroadcast of s_col needs a 32-B aligned base (see HANDOVER).
+        if ap % 16 != 0 || bp % 16 != 0 || sp % 32 != 0 {
+            candle_core::bail!(
+                "int8-gemm-dequant: misaligned view (a {ap:#x}, b {bp:#x}, scales {sp:#x})"
+            );
+        }
         let s_col = sp as *const f32;
         // s_row follows s_col in the packed buffer (offset N floats, aligned).
         let s_row = unsafe { s_col.add(n) };
@@ -602,10 +626,12 @@ pub fn self_test_offset_views() -> Result<Vec<(&'static str, bool)>> {
         == int8_gemm(&af, &bf)?.flatten_all()?.to_vec1::<i32>()?;
 
     // Fused dequant epilogue, with the packed scales an offset view too.
-    let sv: Vec<f32> = (0..drop + n + m)
+    // 8 f32 = 32 B keeps the s_col base at the epilogue's 32-B alignment.
+    let sdrop = 8usize;
+    let sv: Vec<f32> = (0..sdrop + n + m)
         .map(|i| 1e-3 * (1.0 + i as f32 * 0.01))
         .collect();
-    let sc = Tensor::from_vec(sv, drop + n + m, &dev)?.narrow(0, drop, n + m)?;
+    let sc = Tensor::from_vec(sv, sdrop + n + m, &dev)?.narrow(0, sdrop, n + m)?;
     let scf = sc.force_contiguous()?;
     let deq = |a: &Tensor, b: &Tensor, s: &Tensor| -> Result<Vec<u16>> {
         Ok(a.apply_op3(b, s, Int8GemmDequant(EpilogueOut::Bf16))?

@@ -8,6 +8,7 @@ use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{CpuStorage, CudaStorage, Layout, Shape, Tensor};
 use std::ffi::c_void;
 
+use crate::layout::dense_byte_offset;
 use crate::Result;
 
 extern "C" {
@@ -76,6 +77,8 @@ impl candle_core::CustomOp2 for FusedNormMod {
         }
         let n = *dims.last().unwrap();
         let m: usize = dims[..dims.len() - 1].iter().product();
+        let xo = dense_byte_offset::<half::bf16>(x_l, "fused-norm-mod x")?;
+        let so = dense_byte_offset::<half::bf16>(scale_l, "fused-norm-mod scale")?;
         let x = x.as_cuda_slice::<half::bf16>()?;
         let scale = scale.as_cuda_slice::<half::bf16>()?;
         let stream = dev.cuda_stream();
@@ -83,6 +86,7 @@ impl candle_core::CustomOp2 for FusedNormMod {
         {
             let (xp, _a) = x.device_ptr(&stream);
             let (sp, _b) = scale.device_ptr(&stream);
+            let (xp, sp) = (xp + xo, sp + so);
             let (op, _c) = out.device_ptr(&stream);
             unsafe {
                 fused_norm_mod_launch(
@@ -173,6 +177,8 @@ impl candle_core::CustomOp2 for FusedRmsnormScale {
             candle_core::bail!("fused-rmsnorm-scale weight len {wn} != last dim {n}");
         }
         let m: usize = dims[..dims.len() - 1].iter().product();
+        let xo = dense_byte_offset::<half::bf16>(x_l, "fused-rmsnorm-scale x")?;
+        let wo = dense_byte_offset::<f32>(w_l, "fused-rmsnorm-scale w")?;
         let x = x.as_cuda_slice::<half::bf16>()?;
         let w = w.as_cuda_slice::<f32>()?;
         let stream = dev.cuda_stream();
@@ -180,6 +186,7 @@ impl candle_core::CustomOp2 for FusedRmsnormScale {
         {
             let (xp, _a) = x.device_ptr(&stream);
             let (wp, _b) = w.device_ptr(&stream);
+            let (xp, wp) = (xp + xo, wp + wo);
             let (op, _c) = out.device_ptr(&stream);
             unsafe {
                 fused_rmsnorm_scale_launch(
@@ -247,6 +254,9 @@ impl candle_core::CustomOp3 for FusedGatedResidual {
             );
         }
         let total: usize = dims.iter().product();
+        let ho = dense_byte_offset::<half::bf16>(h_l, "fused-gated-residual h")?;
+        let go = dense_byte_offset::<half::bf16>(gate_l, "fused-gated-residual gate")?;
+        let yo = dense_byte_offset::<half::bf16>(y_l, "fused-gated-residual y")?;
         let h = h.as_cuda_slice::<half::bf16>()?;
         let gate = gate.as_cuda_slice::<half::bf16>()?;
         let y = y.as_cuda_slice::<half::bf16>()?;
@@ -257,6 +267,7 @@ impl candle_core::CustomOp3 for FusedGatedResidual {
             let (gp, _b) = gate.device_ptr(&stream);
             let (yp, _c) = y.device_ptr(&stream);
             let (op, _d) = out.device_ptr(&stream);
+            let (hp, gp, yp) = (hp + ho, gp + go, yp + yo);
             unsafe {
                 fused_gated_residual_launch(
                     op as *mut c_void,

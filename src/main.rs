@@ -511,7 +511,12 @@ fn generate(
 
     // Broadcast the (1, txt, 4096) embeds across the batch lanes (all lanes share
     // the prompt; only the seed differs). Materialized so the fused kernels read
-    // real per-row data, not a stride-0 view. B=1 leaves the tensor untouched.
+    // real per-row data, not a stride-0 view. B=1 leaves the tensor untouched:
+    // it is the TE output narrowed past the system prefix, which candle keeps
+    // as a zero-copy view at start_offset drop*4096 (`contiguous()` is a no-op
+    // for it). Every fused bridge honors that offset (crate::layout); one that
+    // did not made B=1 condition on the system-prompt rows
+    // (qwen-image-rs-b1-off-prompt).
     let embeds = if batch > 1 {
         let (_, t, hd) = embeds.dims3()?;
         embeds.broadcast_as((batch, t, hd))?.contiguous()?

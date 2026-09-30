@@ -25,6 +25,11 @@ pub fn dense_offset(l: &Layout, what: &str) -> candle_core::Result<usize> {
     Ok(l.start_offset())
 }
 
+/// [`dense_offset`] in bytes for element type `T`, to add to a device pointer.
+pub fn dense_byte_offset<T>(l: &Layout, what: &str) -> candle_core::Result<u64> {
+    Ok((dense_offset(l, what)? * std::mem::size_of::<T>()) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::dense_offset;
@@ -44,6 +49,10 @@ mod tests {
         let t = Tensor::zeros((1, drop + n, d), DType::F32, &Device::Cpu).unwrap();
         let v = t.narrow(1, drop, n).unwrap().contiguous().unwrap();
         assert_eq!(dense_offset(v.layout(), "v").unwrap(), drop * d);
+        assert_eq!(
+            super::dense_byte_offset::<f32>(v.layout(), "v").unwrap(),
+            (drop * d * 4) as u64
+        );
     }
 
     #[test]
