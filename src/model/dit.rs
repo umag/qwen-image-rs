@@ -376,13 +376,25 @@ impl Attention {
         // the narrows below are zero-copy S-axis views the bridge reads via
         // start_offset + strides.
         debug_assert_eq!(vf.dtype(), DType::F16, "attend_bshd: V must be f16");
+        let diag = std::env::var("QIR_DIAG_VSUM").is_ok();
+        let vsum = |tag: &str| -> Result<()> {
+            if diag {
+                let v = vf.to_dtype(DType::F32)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+                eprintln!("DIAG vsum {tag} = {v:.8e}");
+            }
+            Ok(())
+        };
+        vsum("entry")?;
         let sc = scale as f32;
         let (ct, st) = (cos.narrow(0, 0, txt_len)?, sin.narrow(0, 0, txt_len)?);
         // text prefix: causal over [0, txt_len)
         let qt = rope_quant_bshd(&qh.narrow(1, 0, txt_len)?, &ct, &st, QkRole::Query)?;
+        vsum("after qt")?;
         let kt = rope_quant_bshd(&kh.narrow(1, 0, txt_len)?, &ct, &st, QkRole::Key)?;
+        vsum("after kt")?;
         let vt = vf.narrow(1, 0, txt_len)?;
         let ot = sage_attention_quantized(&qt, &kt, &vt, sc, true)?; // (B,txt,H,D)
+        vsum("after ot")?;
 
         // image queries: full non-causal attention over the whole sequence
         let qi = rope_quant_bshd(
@@ -391,7 +403,9 @@ impl Attention {
             &sin.narrow(0, txt_len, img)?,
             QkRole::Query,
         )?;
+        vsum("after qi")?;
         let kf = rope_quant_bshd(kh, cos, sin, QkRole::Key)?;
+        vsum("after kf")?;
         let oi = sage_attention_quantized(&qi, &kf, vf, sc, false)?; // (B,img,H,D)
         if std::env::var("QIR_DIAG_ATT").is_ok() {
             let vc = vf.copy()?;
