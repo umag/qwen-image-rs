@@ -17,3 +17,9 @@ no denoise regression vs the prior step). Any safeguard exit, parity drop,
 regression, or pivot-required finding stops and reports to the human instead.
 Run these lifecycles strictly sequentially (shared host build dir + main branch).
 A measured negative result (lever not worth it) is a valid clean outcome.
+
+Gate update (2026-09-30, human: "don't bother much with gates"): the dit-forward
+--convrot cosine is run-to-run noisy (baseline scatters 0.99942-0.99994), so a
+single reading is NOT a gate. Clean = no-convrot dit-forward bit-identical to the
+prior build (or cosine >= 0.99999 when the math legitimately changes) + a same-
+session A/B showing no denoise regression + images look right. Keep it light.
