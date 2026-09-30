@@ -421,6 +421,19 @@ impl Attention {
         let kf = rope_quant_bshd(kh, cos, sin, QkRole::Key)?;
         vsum("after kf")?;
         let oi = sage_attention_quantized(&qi, &kf, vf, sc, false)?; // (B,img,H,D)
+        if std::env::var("QIR_DIAG_POST").is_ok() {
+            let cs = |t: &Tensor| -> Result<f64> {
+                Ok(t.to_dtype(DType::F32)?.abs()?.sum_all()?.to_scalar::<f32>()? as f64)
+            };
+            eprintln!(
+                "DIAG post v={:.8e} qh={:.8e} kh={:.8e} ot={:.8e} oi={:.8e}",
+                cs(vf)?,
+                cs(qh)?,
+                cs(kh)?,
+                cs(&ot)?,
+                cs(&oi)?
+            );
+        }
         if std::env::var("QIR_DIAG_ATT").is_ok() {
             let vc = vf.copy()?;
             let ot2 = sage_attention_quantized(&qt, &kt, &vc.narrow(1, 0, txt_len)?, sc, true)?;
