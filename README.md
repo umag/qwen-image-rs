@@ -1,10 +1,18 @@
 # qwen-image-rs
 
 Rust + CUDA inference for **Qwen-Image-2.1** on the RTX 4090 (Ada), built on
-the [candle](https://github.com/huggingface/candle) spine with ComfyUI-class
-optimizations (FP8, SageAttention, GGUF) ported/FFI'd in.
+the [candle](https://github.com/huggingface/candle) spine. The three model
+components are ported from scratch and validated against a diffusers oracle;
+speed comes from a stack of custom CUDA kernels (INT8 linears, SageAttention,
+fused norms, a CUTLASS INT8-GEMM epilogue, BSHD-native attention), each gated
+against that oracle.
 
-Research build only — the weights are under the **Qwen Research License**.
+**~2.5× faster than the bf16 baseline: 0.62 → 0.247 s/step** at 1024², with
+`dit-forward` cosine held at 0.999934 through every optimization.
+
+Research build only — this repo ships **no weights**. The Qwen-Image-2.1 weights
+are under the **Qwen Research License** (research-only) and must be obtained
+separately.
 
 ## Pipeline (`QwenImage21Pipeline`)
 | Component | Class | ~Size | Module |
@@ -31,9 +39,8 @@ scripts/       check.sh (Mac CPU checks) · host.sh (drive the 4090 via swamp)
                setup-host.sh (latest Rust + oracle venv) · oracle.py (references)
 ```
 
-## Status: working end-to-end
-Prompt → 1024² PNG in **~69 s** on a 4090 (unoptimized bf16). All three model
-components ported to candle and numerically validated against a diffusers oracle:
+## Status: working end-to-end + optimized
+All three components ported to candle and validated against a diffusers oracle:
 
 | Component | Match vs oracle |
 |-----------|-----------------|
@@ -42,7 +49,26 @@ components ported to candle and numerically validated against a diffusers oracle
 | DiT (single forward) | cosine 0.99996 |
 | Full pipeline (40 steps) | latent 0.9977 → image 30.85 dB |
 
-See `docs/generate_standalone.png` (a red mug, from the prompt below).
+### Optimization scoreboard (1024², RTX 4090, per denoise step)
+Each step was chosen from an `nsys` profile (attack the largest kernel), then
+re-checked against the oracle before the next one.
+
+| Step | Feature | s/step |
+|---|---|---|
+| bf16 + FlashAttention-2 (baseline) | `flash-attn` | 0.62 |
+| ConvRot W8A8 INT8 linears | `convrot` | 0.51 |
+| SageAttention INT8-QK / FP16-PV | `sage` | 0.48 |
+| Fused LayerNorm+AdaLN | `fusednorm` | 0.445 |
+| Fused activation quantizer | `convrot` | 0.38 |
+| Dequant → CUTLASS EVT epilogue | `convrot` | 0.34 |
+| Fused RMSNorm×weight + gated residual | `fusednorm` | 0.27 |
+| BSHD-native attention (no transpose copies) | `sage` | **0.247** |
+
+Plus: bf16 VAE decode (1.57×) and tiled decode (constant memory); batched
+multi-seed generation (`generate --batch N`, B=4 sweet spot). Recommended fast
+build: `--features convrot,sage,fusednorm`. Resident batch ≈ 11 s/image.
+
+See `docs/generate_standalone.png` and `docs/batch/` for samples.
 
 ## Build / run
 ```sh
@@ -60,6 +86,11 @@ qwen-image-rs generate --model <snapshot> \
 Features: `cuda`, `cudnn`, `flash-attn`. Default build is CPU-only (macOS-safe).
 
 ## Host
-WSL, RTX 4090 24 GB, CUDA 13.3, latest stable Rust. Shared with the paused
-`iris-rs` CUDA port — coordinate GPU windows. Reach it only through the
-`wsl-drills` `@swamp/ssh` model.
+WSL, RTX 4090 24 GB, CUDA 13.3, latest stable Rust.
+
+## License & credits
+Apache-2.0 (see `LICENSE`). Attributions in `NOTICE`: this is an independent
+port of **Qwen-Image-2.1** (Alibaba/Qwen, Qwen Research License — weights not
+included); it vendors **thu-ml SageAttention** (Apache-2.0) under
+`kernels/sage/vendor/`, uses **NVIDIA CUTLASS** for the INT8 GEMM, and is built
+on **candle** (Hugging Face).

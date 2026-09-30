@@ -1,0 +1,25 @@
+qwen-image-rs
+Copyright 2026 Sergey (umag)
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes and builds upon third-party work:
+
+- Qwen-Image-2.1 (Alibaba / Qwen). This repository is an independent Rust
+  inference port reverse-engineered from the diffusers implementation. It
+  contains NO model weights. The weights are distributed by Qwen under the
+  Qwen Research License (research-only) and must be obtained separately.
+
+- SageAttention (thu-ml), Apache License 2.0. The sm80 INT8-QK/FP16-PV fused
+  attention kernel and its headers are vendored under kernels/sage/vendor/
+  (the torch bindings were stripped). Upstream:
+  https://github.com/thu-ml/SageAttention
+
+- NVIDIA CUTLASS, used (not vendored) for the INT8 GEMM and its epilogue.
+  https://github.com/NVIDIA/cutlass
+
+- candle (Hugging Face), the CUDA/tensor spine. Apache-2.0 / MIT.
+  https://github.com/huggingface/candle
+
+- The ConvRot W8A8 scheme follows pytorch/ao's group-wise Regular Hadamard
+  rotation for DiTs.
