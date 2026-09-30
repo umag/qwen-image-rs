@@ -393,6 +393,27 @@ impl Attention {
         )?;
         let kf = rope_quant_bshd(kh, cos, sin, QkRole::Key)?;
         let oi = sage_attention_quantized(&qi, &kf, vf, sc, false)?; // (B,img,H,D)
+        if std::env::var("QIR_DIAG_ATT").is_ok() {
+            let vc = vf.copy()?;
+            let ot2 = sage_attention_quantized(&qt, &kt, &vc.narrow(1, 0, txt_len)?, sc, true)?;
+            let oi2 = sage_attention_quantized(&qi, &kf, &vc, sc, false)?;
+            let f = |a: &Tensor, b: &Tensor| -> Result<f32> {
+                Ok((a.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?
+                    .abs()?
+                    .max_all()?
+                    .to_scalar::<f32>()?)
+            };
+            let l = vf.layout();
+            eprintln!(
+                "DIAG att txt diff={} img diff={} v layout off={} stride={:?} contig={} v shape={:?} txt_len={txt_len}",
+                f(&ot, &ot2)?,
+                f(&oi, &oi2)?,
+                l.start_offset(),
+                l.stride(),
+                vf.is_contiguous(),
+                vf.dims()
+            );
+        }
         Ok(Tensor::cat(&[ot, oi], 1)?) // (B,S,H,D)
     }
 
