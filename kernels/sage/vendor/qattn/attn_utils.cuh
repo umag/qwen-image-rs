@@ -127,7 +127,13 @@ __device__ __forceinline__ void load_global_to_share(T **lane_ptr, uint32_t &sme
 #pragma unroll
     for (uint32_t j = 0; j < smem_iters_row; j++)
     {
-      smem.load_128b_async<cp_async::SharedMemFillMode::kNoFill>(smem_offset, *lane_ptr, base_idx < max_len);
+      // LOCAL PATCH (qwen-image-rs, bf16-v-pv): upstream uses kNoFill, which
+      // leaves rows >= max_len holding stale shared memory from an earlier
+      // kernel. Their scores are masked to exactly 0, but a stale NaN/Inf V row
+      // makes P·V = 0 * NaN = NaN (seen on the text-prefix causal call, kv_len
+      // = txt_len < 64). Zero-fill (cp.async src-size 0: no global read) makes
+      // masked rows contribute exactly 0. Guarded by sage::self_test_partial_tile.
+      smem.load_128b_async<cp_async::SharedMemFillMode::kFillZero>(smem_offset, *lane_ptr, base_idx < max_len);
       *lane_ptr += (global_to_shared_line_lanes * pack_size);
       smem_offset = smem.advance_offset_by_column<global_to_shared_line_lanes>(smem_offset);
     }
