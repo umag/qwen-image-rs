@@ -10,6 +10,8 @@
 
 #include <cuda_bf16.h>
 
+#include "rope_pair.cuh" // shared no-FMA rotation (bit-identical to the fused path)
+
 static __global__ void rope_i_bshd_kernel(__nv_bfloat16 *__restrict__ out,
                                           const __nv_bfloat16 *__restrict__ in,
                                           const __nv_bfloat16 *__restrict__ cos,
@@ -28,8 +30,7 @@ static __global__ void rope_i_bshd_kernel(__nv_bfloat16 *__restrict__ out,
   float sn = __bfloat162float(sin[(size_t)s * Dhalf + j]);
   float x0 = __bfloat162float(xb[2 * j]);
   float x1 = __bfloat162float(xb[2 * j + 1]);
-  ob[2 * j] = __float2bfloat16_rn(x0 * c - x1 * sn);
-  ob[2 * j + 1] = __float2bfloat16_rn(x0 * sn + x1 * c);
+  rope_pair_bf16(x0, x1, c, sn, ob[2 * j], ob[2 * j + 1]);
 }
 
 // out, in: (B,S,H,D) bf16 contiguous. cos,sin: (S, D/2) bf16 contiguous.

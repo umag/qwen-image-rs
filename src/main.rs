@@ -1172,6 +1172,22 @@ fn sage_test() -> Result<()> {
             "sage BSHD vs BHSD (block-causal split): cosine = {bshd_cos:.6}, maxabs = {maxabs:.4} ({})",
             if bshd_ok { "OK" } else { "MISMATCH" }
         );
+        let rq = qwen_image_rs::sage::self_test_rope_quant()?;
+        let rq_ok = rq.int8_mismatches == 0
+            && rq.scale_mismatches == 0
+            && rq.attn_maxabs == 0.0
+            && rq.attn_cos > 0.9999;
+        println!(
+            "fused rope+quant vs rope->quant (4 narrows, B=1,2): int8 mismatches = {}, scale mismatches = {}, attn cosine = {:.6}, maxabs = {:.4} ({})",
+            rq.int8_mismatches,
+            rq.scale_mismatches,
+            rq.attn_cos,
+            rq.attn_maxabs,
+            if rq_ok { "OK" } else { "MISMATCH" }
+        );
+        if !rq_ok {
+            anyhow::bail!("fused rope+quant is not bit-exact vs rope->quant");
+        }
         Ok(())
     }
     #[cfg(not(feature = "sage"))]

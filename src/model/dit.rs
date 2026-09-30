@@ -275,19 +275,18 @@ impl Attention {
         #[cfg(feature = "sage")]
         {
             let _ = mask; // block-causal structure is expressed via narrows, not a mask
-                          // BSHD-native: q/k/v stay (B,S,H,D); a BSHD rope replaces
-                          // candle rope_i and the sage kernel reads/writes BSHD, so
-                          // there are no transpose->contiguous copies anywhere.
+                          // BSHD-native: q/k/v stay (B,S,H,D). RoPE is fused into the
+                          // sage INT8 quantizer (attend_bshd), so q/k are rotated and
+                          // quantized in one pass — no separate rope kernel, no
+                          // rotated-bf16 round trip, no transpose copies.
             let qh = self
                 .norm_q
-                .forward(&self.to_q.forward(x)?.reshape(shape)?)?; // (B,S,H,D)
+                .forward(&self.to_q.forward(x)?.reshape(shape)?)?; // (B,S,H,D), pre-rope
             let kh = self
                 .norm_k
                 .forward(&self.to_k.forward(x)?.reshape(shape)?)?;
-            let qh = crate::rope::rope_i_bshd(&qh, cos, sin)?;
-            let kh = crate::rope::rope_i_bshd(&kh, cos, sin)?;
             let vv = self.to_v.forward(x)?.reshape(shape)?; // (B,S,H,D)
-            let out = self.attend_bshd(&qh, &kh, &vv, txt_len, scale)?; // (B,S,H,D)
+            let out = self.attend_bshd(&qh, &kh, &vv, cos, sin, txt_len, scale)?; // (B,S,H,D)
             return self.to_out.forward(&out.reshape((b, s, INNER))?);
         }
         #[cfg(not(feature = "sage"))]
@@ -312,36 +311,47 @@ impl Attention {
     }
 
     /// With `sage`: BSHD-native block-causal SageAttention (INT8-QK / FP16-PV).
-    /// `qh,kh,vv` are all `(B,S,H,D)` — no transpose to (B,H,S,D). Image queries
-    /// attend non-causally to the whole joint sequence; the `txt_len` text
-    /// queries attend causally to the text prefix. The S-axis narrows are
-    /// zero-copy views (B=1), and the sage kernel writes `(B,S,H,D)` directly, so
-    /// this path materializes no transpose copies. Returns `(B,S,H,D)`.
+    /// `qh,kh` are PRE-rope `(B,S,H,D)`; `vv` is `(B,S,H,D)`; `cos,sin` are the
+    /// joint-sequence `(S, D/2)` RoPE tables. Image queries attend non-causally
+    /// to the whole joint sequence; the `txt_len` text queries attend causally to
+    /// the text prefix. Each attention operand is rotated + INT8-quantized by ONE
+    /// fused kernel on its own S-axis narrow (with the matching cos/sin rows), so
+    /// the per-block scales start at that call's first token — exactly the
+    /// alignment the attention kernel's per-block scale indexing expects (k is
+    /// quantized twice: text prefix and full, as before). Returns `(B,S,H,D)`.
     #[cfg(feature = "sage")]
+    #[allow(clippy::too_many_arguments)]
     fn attend_bshd(
         &self,
         qh: &Tensor,
         kh: &Tensor,
         vv: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
         txt_len: usize,
         scale: f64,
     ) -> Result<Tensor> {
+        use crate::sage::{rope_quant_bshd, sage_attention_quantized, QkRole};
         let (_b, s, _h, _d) = qh.dims4()?;
+        let img = s - txt_len;
         // V is cast to f16 once (contiguous, no transpose); the narrows below are
         // zero-copy S-axis views the bridge reads via start_offset + strides.
         let vf = vv.to_dtype(DType::F16)?; // (B,S,H,D) f16
         let sc = scale as f32;
+        let (ct, st) = (cos.narrow(0, 0, txt_len)?, sin.narrow(0, 0, txt_len)?);
         // text prefix: causal over [0, txt_len)
-        let ot = crate::sage::sage_attention_bshd(
-            &qh.narrow(1, 0, txt_len)?,
-            &kh.narrow(1, 0, txt_len)?,
-            &vf.narrow(1, 0, txt_len)?,
-            sc,
-            true,
-        )?; // (B,txt,H,D)
-            // image queries: full non-causal attention over the whole sequence
-        let qi = qh.narrow(1, txt_len, s - txt_len)?;
-        let oi = crate::sage::sage_attention_bshd(&qi, kh, &vf, sc, false)?; // (B,s-txt,H,D)
+        let qt = rope_quant_bshd(&qh.narrow(1, 0, txt_len)?, &ct, &st, QkRole::Query)?;
+        let kt = rope_quant_bshd(&kh.narrow(1, 0, txt_len)?, &ct, &st, QkRole::Key)?;
+        let ot = sage_attention_quantized(&qt, &kt, &vf.narrow(1, 0, txt_len)?, sc, true)?; // (B,txt,H,D)
+                                                                                            // image queries: full non-causal attention over the whole sequence
+        let qi = rope_quant_bshd(
+            &qh.narrow(1, txt_len, img)?,
+            &cos.narrow(0, txt_len, img)?,
+            &sin.narrow(0, txt_len, img)?,
+            QkRole::Query,
+        )?;
+        let kf = rope_quant_bshd(kh, cos, sin, QkRole::Key)?;
+        let oi = sage_attention_quantized(&qi, &kf, &vf, sc, false)?; // (B,img,H,D)
         Ok(Tensor::cat(&[ot, oi], 1)?) // (B,S,H,D)
     }
 

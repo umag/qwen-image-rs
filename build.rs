@@ -50,6 +50,7 @@ fn main() {
         // plus the BSHD interleaved-RoPE kernel used only by the sage path.
         println!("cargo:rerun-if-changed=kernels/sage/sage_ffi.cu");
         println!("cargo:rerun-if-changed=kernels/sage/rope_bshd.cu");
+        println!("cargo:rerun-if-changed=kernels/sage/rope_pair.cuh");
         let cap = std::env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".into());
         cc::Build::new()
             .cuda(true)
