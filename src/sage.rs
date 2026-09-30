@@ -297,7 +297,7 @@ fn check_qk_view(xl: &Layout, what: &str) -> candle_core::Result<(usize, usize, 
         );
     }
     // float4 = 8 bf16: base offset and every outer stride must be multiples of 8.
-    if xl.start_offset() % 8 != 0 || st[..3].iter().any(|s| s % 8 != 0) {
+    if !xl.start_offset().is_multiple_of(8) || st[..3].iter().any(|s| !s.is_multiple_of(8)) {
         candle_core::bail!(
             "{what}: view not 16-byte aligned (offset {}, strides {st:?})",
             xl.start_offset()

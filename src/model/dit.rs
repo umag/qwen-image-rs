@@ -342,8 +342,10 @@ impl Attention {
         // text prefix: causal over [0, txt_len)
         let qt = rope_quant_bshd(&qh.narrow(1, 0, txt_len)?, &ct, &st, QkRole::Query)?;
         let kt = rope_quant_bshd(&kh.narrow(1, 0, txt_len)?, &ct, &st, QkRole::Key)?;
-        let ot = sage_attention_quantized(&qt, &kt, &vf.narrow(1, 0, txt_len)?, sc, true)?; // (B,txt,H,D)
-                                                                                            // image queries: full non-causal attention over the whole sequence
+        let vt = vf.narrow(1, 0, txt_len)?;
+        let ot = sage_attention_quantized(&qt, &kt, &vt, sc, true)?; // (B,txt,H,D)
+
+        // image queries: full non-causal attention over the whole sequence
         let qi = rope_quant_bshd(
             &qh.narrow(1, txt_len, img)?,
             &cos.narrow(0, txt_len, img)?,

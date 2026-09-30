@@ -44,7 +44,8 @@ at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 d
 | fused activation quantizer | convrot | 0.38 |
 | dequant→CUTLASS-EVT epilogue | convrot | 0.34 |
 | fused RMSNorm×weight + gated residual | fusednorm | 0.27 |
-| BSHD-native attention (no transpose copies) | sage | **0.247** |
+| BSHD-native attention (no transpose copies) | sage | 0.247 |
+| RoPE fused into the INT8 Q/K quantizer | sage | **0.2295** (A/B same session: 0.2336 → 0.2295, −1.8%) |
 
 Plus (not per-step): bf16 VAE decode 1.57×; text encoder Q8_0 GGUF (resident
 VRAM); VAE tiling (constant decode memory); true CFG (`--guidance`/`--negative`,
@@ -92,9 +93,9 @@ impact/effort:
 1. ~~**BSHD-native fused attention**~~ **DONE** (`qwen-image-rs-bshd-attention`,
    commit a081ad5). See "BSHD-native fused attention" below — denoise
    0.27→0.247 s/step (~8.5%), oracle 0.999934 unchanged, sage BSHD vs BHSD
-   bit-exact. Remaining follow-on: fuse Q/K quant INTO the rope kernel
-   (SageAttention's own IO trick), and a bf16-native-V PV path (the V f16 cast
-   remains, but no longer via a transpose).
+   bit-exact. Follow-on Q/K-quant-into-rope fusion **DONE**
+   (`qwen-image-rs-rope-quant-fusion`, −1.8%). Remaining: a bf16-native-V PV
+   path (the V f16 cast remains, but no longer via a transpose).
 2. **VAE conv algorithm** (`im2col_bf16` ~10%). bf16 already; further needs
    implicit-GEMM / Winograd convs or a fused decoder — large.
 3. **Per-warp sage quant** (accuracy/speed refinement) + **SageAttention on
@@ -389,6 +390,39 @@ to end:
   trick — avoids a separate rope pass); bf16-native-V PV kernel (the V f16 cast
   survives, but no longer behind a transpose).
 
+### RoPE fused into the INT8 Q/K quantizer (DONE — `qwen-image-rs-rope-quant-fusion`)
+SageAttention's own IO trick: q/k are rotated and INT8-quantized in ONE pass.
+- `kernels/sage/sage_ffi.cu` `RopeQuantInt8Kernel` / `sage_rope_quant_bshd_launch`:
+  reads PRE-rope bf16 q/k (an S-axis BSHD view + the matching cos/sin rows),
+  rotates each 8-element pack's 4 interleaved pairs, rounds to bf16 (what the
+  unfused rope kernel stored), then runs the verbatim `QuantInt8Kernel` tail
+  (block amax → scale amax/127 → int8). int8 HND + scales laid out exactly as
+  before. `kernels/sage/rope_pair.cuh` is the shared no-FMA (`__fmul_rn` etc.)
+  rotation used by both `rope_i_bshd` (kept as oracle) and the fused kernel.
+- `src/sage.rs`: `QuantizedQk` VO (one U8 tensor = int8 region + f32 scales,
+  with dims + `QkRole::{Query(128-token blocks), Key(64)}`); `rope_quant_bshd`
+  (fused), `quant_bshd` (unfused oracle), `sage_attention_quantized`
+  (attention over pre-quantized q/k). `sage_attention_bshd` = quant_bshd ×2 +
+  sage_attention_quantized (oracle path, one attention launch path remains).
+- Block alignment: `attend_bshd` fuses PER NARROW — q[0:txt] (blk 128),
+  k[0:txt] (blk 64) with cos/sin[0:txt]; q[txt:S] with cos/sin[txt:S]; full k.
+  Scales start at each call's first token, as the kernel's `q_scale_idx` /
+  `k_scale_idx` expect. k is still quantized twice (as before).
+- **Validation:** `sage-test` new line — fused vs rope→quant on all 4 narrows,
+  B=1 and B=2, S=293/txt=37 (partial blocks): **0 int8 mismatches, 0 scale
+  mismatches, attention cosine 1.000000 maxabs 0** (sage-test now exits nonzero
+  on mismatch). dit-forward WITHOUT `--convrot` (deterministic path): output
+  **bit-identical** to the pre-change build (cos 1.000000, mse 0; vs oracle
+  0.999965 both). With `--convrot`: in-distribution with baseline (see gotcha
+  below): 8 runs 0.99952–0.999931 vs baseline 8 runs 0.99942–0.999940.
+- **Speed (A/B, same session, batch --resident 2 prompts ×40 steps, 2nd image):**
+  baseline 9330–9367 ms → fused 9171–9189 ms = **0.2336 → 0.2295 s/step
+  (−1.8%)**, matching the prediction (rope kernel = 53 ms / 10-step trace,
+  ~2%). nsys: `rope_i_bshd_kernel` gone; `RopeQuantInt8Kernel` 18.97 + 18.74 ms
+  ≈ the old `QuantInt8Kernel` 19.0 + 19.9 ms — the rotation is free.
+- Note: the absolute s/step on 2026-09-30 is lower than the 0.247 recorded
+  earlier for the same baseline commit (clock/thermal drift) — compare A/B only.
+
 ### Copy-reduction audit (`qwen-image-rs-reduce-copies` issue — NEGATIVE RESULT, superseded by BSHD attention above)
 nsys of the fast path (`convrot,sage,fusednorm`, bf16 VAE) showed `ucopy_bf16` at
 6.9% (2785 instances / 10-step denoise ≈ 278/step) — plain `.contiguous()` memory
@@ -497,6 +531,17 @@ attn: 4096 OK). ConvRotLinear input dim K = the linear's in_features.
 - **EVT scale vectors pack col-first** (`cat(col_scale,row_scale)`): the vectorized
   RowBroadcast base must be 32-B aligned; row-first faulted MISALIGNED at M=4117.
   Build the convrot .cu with `--expt-extended-lambda` (EVT visitors).
+- **dit-forward `--convrot` is NOT run-to-run deterministic** (measured
+  2026-09-30 on the pre-rope-fusion baseline: 8 runs overall_cos vs oracle
+  0.99942–0.999940, run-vs-run 0.9994). WITHOUT `--convrot` it is bit-exact
+  deterministic (0.999965 every run). So the ">= 0.99993" single-run gate is a
+  coin flip on convrot builds — gate kernel changes on the no-convrot path
+  (bit-identity vs baseline) + the convrot distribution, not one run. Root
+  cause (convrot INT8 GEMM / activation-quant nondeterminism, magnitude larger
+  than split-K atomics would suggest) is UNINVESTIGATED — open question.
+- `scripts/compare_dit.py <ours> <oracle>` = the dit-forward oracle compare
+  (overall_cos, MSE, per-token cos over the last 4096 rows); run it with the
+  oracle venv python.
 - **Fused-norm parity: pass the weight as f32** (ZeroCenter bakes `weight+1` in f32
   at load) to match candle's `weight.to_dtype(F32)`.
 
@@ -533,7 +578,8 @@ attn: 4096 OK). ConvRotLinear input dim K = the linear's in_features.
 Phase ports (complete): `-oracle`, `-vae`, `-text-encoder`, `-dit`.
 Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-dequant-epilogue` (CUTLASS EVT), `-fused-rmsnorm-gate` (RMSNorm+gated residual),
-`-vae-bf16`, `-bshd-attention` (BSHD-native fused attention).
+`-vae-bf16`, `-bshd-attention` (BSHD-native fused attention),
+`-rope-quant-fusion` (RoPE fused into the sage INT8 Q/K quantizer).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path
 `.contiguous()` load-bearing; see "Copy-reduction audit"); `-fused-dequant`
 (closed — superseded by `-dequant-epilogue` which shipped it).
