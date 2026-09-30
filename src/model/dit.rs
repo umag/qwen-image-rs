@@ -82,7 +82,18 @@ impl QLinear {
     fn forward_f16(&self, x: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "convrot")]
         if let QLinear::Convrot(c) = self {
-            return c.forward_as(x, crate::convrot::EpilogueOut::F16);
+            if std::env::var("QIR_DIAG_VCAST").is_ok() {
+                let y = c.forward(x)?;
+                let a = y.to_dtype(DType::F32)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                eprintln!("DIAG max|V| bf16 = {a}");
+                return Ok(y.to_dtype(DType::F16)?);
+            }
+            let y = c.forward_as(x, crate::convrot::EpilogueOut::F16)?;
+            if std::env::var("QIR_DIAG_VMAX").is_ok() {
+                let a = y.to_dtype(DType::F32)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                eprintln!("DIAG max|V| f16 = {a}");
+            }
+            return Ok(y);
         }
         Ok(self.forward(x)?.to_dtype(DType::F16)?)
     }
