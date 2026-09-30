@@ -528,7 +528,21 @@ impl Block {
         let h = gated_residual(h, gate1, &attn)?;
         let x = norm_mod(&h, scale2, self.eps)?;
         let m = self.mlp.forward(&x)?;
-        gated_residual(&h, gate2, &m)
+        let out = gated_residual(&h, gate2, &m)?;
+        if std::env::var("QIR_DIAG_SUM").is_ok() {
+            let cs = |t: &Tensor| -> Result<f64> {
+                Ok(t.to_dtype(DType::F32)?.abs()?.sum_all()?.to_scalar::<f32>()? as f64)
+            };
+            eprintln!(
+                "DIAG sum x1={:.6e} attn={:.6e} h={:.6e} m={:.6e} out={:.6e}",
+                cs(&norm_mod(&h, scale2, self.eps)?)?,
+                cs(&attn)?,
+                cs(&h)?,
+                cs(&m)?,
+                cs(&out)?
+            );
+        }
+        Ok(out)
     }
 }
 
