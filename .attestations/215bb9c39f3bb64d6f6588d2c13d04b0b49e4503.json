@@ -1,0 +1,77 @@
+{
+ "attestationVersion": 1,
+ "issue": "convrot the tail bf16 DiT linears (txt_in, modulation, norm_out)",
+ "commitSha": "215bb9c39f3bb64d6f6588d2c13d04b0b49e4503",
+ "branch": "main",
+ "planVersion": 1,
+ "configChecksums": {
+  "Cargo.toml": "5ee86165d928d18e56e585ca9ef5475e663602624135484be6e51098c3ee7eb9",
+  "agent-constraints/implementation-conventions.md": "5d7196119fb8c37ec4f49646dda6390f5a56517551a94f0d2873bd30993abf5a",
+  "agent-constraints/iteration-limits.md": "ac47f97a39b15ea83bb4bca83c25256fa8813bca1674e664b5c3de16413b849f",
+  "agent-constraints/verification-controls.md": "9c48f9c338d52c336b4e339247851e310e82f5eef5114a138cb3af432b74eb21"
+ },
+ "controls": [
+  {
+   "name": "fmt",
+   "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh fmt",
+   "status": "pass",
+   "exitCode": 0,
+   "durationMs": 970,
+   "runner": "local",
+   "required": true,
+   "stderrTail": "== fmt ==\n== local checks OK ==\n"
+  },
+  {
+   "name": "lint",
+   "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh clippy",
+   "status": "pass",
+   "exitCode": 0,
+   "durationMs": 1809,
+   "runner": "local",
+   "required": true,
+   "stderrTail": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.51s\n"
+  },
+  {
+   "name": "check",
+   "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh check",
+   "status": "pass",
+   "exitCode": 0,
+   "durationMs": 685,
+   "runner": "local",
+   "required": true,
+   "stderrTail": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.52s\n"
+  },
+  {
+   "name": "test",
+   "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh test",
+   "status": "pass",
+   "exitCode": 0,
+   "durationMs": 1599,
+   "runner": "local",
+   "required": true,
+   "stderrTail": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.46s\n     Running unittests src/lib.rs (/Users/mag1/.cache/qwen-image-rs-target/debug/deps/qwen_image_rs-453b6dfd9eeab634)\n     Running unittests src/main.rs (/Users/mag1/.cache/qwen-image-rs-target/debug/deps/qwen_image_rs-1d1276dbe20172b3)\n   Doc-tests qwen_image_rs\n"
+  }
+ ],
+ "reviews": [
+  {
+   "reviewer": "review-code",
+   "verdict": "PASS",
+   "critical": 0,
+   "high": 0,
+   "medium": 0,
+   "low": 0
+  },
+  {
+   "reviewer": "review-adversarial",
+   "verdict": "PASS",
+   "critical": 0,
+   "high": 0,
+   "medium": 0,
+   "low": 0
+  }
+ ],
+ "runner": "local",
+ "producedAt": "2026-09-30T21:55:40.123Z",
+ "producedBy": "navi.aopab.art",
+ "modelVersion": "2026.09.20.2"
+}
