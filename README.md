@@ -83,7 +83,14 @@ qwen-image-rs generate --model <snapshot> \
   --prompt "a red ceramic coffee mug on a wooden table, soft morning light" \
   --steps 40 --seed 42 --out out.png
 ```
-Features: `cuda`, `cudnn`, `flash-attn`. Default build is CPU-only (macOS-safe).
+Features: `cuda`, `cudnn`, `flash-attn`, `convrot`, `sage`, `fusednorm`. Default
+build is CPU-only (macOS-safe).
+
+## Weights
+Not included (Qwen Research License). Download `Qwen/Qwen-Image-2.1` and, if you
+want the low-VRAM/resident path, convert it — see **[docs/WEIGHTS.md](docs/WEIGHTS.md)**
+(links, `scripts/convert.sh`, and the `prequantize-text` / `prequantize-convrot`
+verbs).
 
 ## Host
 WSL, RTX 4090 24 GB, CUDA 13.3, latest stable Rust.
