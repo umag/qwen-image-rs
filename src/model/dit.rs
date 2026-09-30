@@ -89,6 +89,15 @@ impl QLinear {
                 return Ok(y.to_dtype(DType::F16)?);
             }
             let y = c.forward_as(x, crate::convrot::EpilogueOut::F16)?;
+            if std::env::var("QIR_DIAG_CMP").is_ok() {
+                let r = c.forward(x)?.to_dtype(DType::F16)?;
+                let yf = y.to_dtype(DType::F32)?;
+                let rf = r.to_dtype(DType::F32)?;
+                let d = (&yf - &rf)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                let a = rf.abs()?.max_all()?.to_scalar::<f32>()?;
+                let ya = yf.abs()?.max_all()?.to_scalar::<f32>()?;
+                eprintln!("DIAG cmp maxdiff={d} max|ref|={a} max|y|={ya} shape={:?} x={:?}", y.dims(), x.dims());
+            }
             if std::env::var("QIR_DIAG_SYNC").is_ok() {
                 y.device().synchronize()?;
             }
