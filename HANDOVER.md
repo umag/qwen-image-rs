@@ -101,9 +101,9 @@ impact/effort:
 3. **Per-warp sage quant** (accuracy/speed refinement) + **SageAttention on
    attention-heavier configs** (condition images / higher res) where S² matters
    more — sage's win grows there.
-4. **Convrot the remaining ≥256-dim bf16 linears** (`txt_in` 4096→4096,
-   `modulation` 4096→12288, `norm_out` 4096→4096) — small; `img_in` (in=64) /
-   `proj_out` (out=64) can't (dims <256).
+4. ~~**Convrot the remaining ≥256-dim bf16 linears**~~ **NEGATIVE — not worth it**
+   (`qwen-image-rs-convrot-tail-linears`): they are 0.13% of a step; see
+   "Tail linears through ConvRot" below.
 5. Pre-quantized convrot DiT file already exists (`prequantize-convrot`) to cut
    the ~14 s single-`generate` load; the residual is the 8 GB text-GGUF cold mmap.
 Re-profile after each: `nsys profile -o /tmp/p --trace=cuda <bin> generate ...
@@ -423,6 +423,22 @@ SageAttention's own IO trick: q/k are rotated and INT8-quantized in ONE pass.
 - Note: the absolute s/step on 2026-09-30 is lower than the 0.247 recorded
   earlier for the same baseline commit (clock/thermal drift) — compare A/B only.
 
+### Tail linears through ConvRot (`qwen-image-rs-convrot-tail-linears` — NEGATIVE RESULT, no code)
+Measured before building. nsys, 10-step trace, fast build (`convrot,sage,fusednorm`),
+denoise GPU busy 2301 ms (= 230 ms/step). The small-M bf16 GEMMs, attributed by grid:
+- `modulation` (M=2, K=4096, N=16384): `cutlass_80_wmma..16x16_128x2` grid (8,128),
+  10 inst, **168 us** each.
+- N=4096 small-M GEMMs: same kernel, grid (8,32), 50 inst = 5/step (`txt_in.in_layer`,
+  `txt_in.out_layer` at M≈txt, `norm_out.linear` + `time_embed` 2 linears at M=2), **42 us** each.
+- In scope (modulation + norm_out + txt_in ×2): **0.29 ms/step = 0.13%** of a step.
+They are already weight-bandwidth-bound (134 MB / 168 us, 33.5 MB / 42 us ≈ 800 GB/s).
+INT8 halves the weight bytes at best → ceiling ≤ 0.15 ms/step (**0.06%**), less the
+rotate + quant + dequant launches it adds. The same-session A/B noise is ~0.4%, so the
+gain cannot even be measured. Holds at any B and with CFG: `temb` is always (2, INNER),
+so modulation/norm_out stay M=2; CFG doubles every GEMM (ratio unchanged).
+Related idea, also negligible: `txt_in` is step-invariant (text embed only) and could
+be cached across steps — saves 2×42 us/step (0.04%). Not done.
+
 ### Copy-reduction audit (`qwen-image-rs-reduce-copies` issue — NEGATIVE RESULT, superseded by BSHD attention above)
 nsys of the fast path (`convrot,sage,fusednorm`, bf16 VAE) showed `ucopy_bf16` at
 6.9% (2785 instances / 10-step denoise ≈ 278/step) — plain `.contiguous()` memory
@@ -581,7 +597,8 @@ Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-vae-bf16`, `-bshd-attention` (BSHD-native fused attention),
 `-rope-quant-fusion` (RoPE fused into the sage INT8 Q/K quantizer).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path
-`.contiguous()` load-bearing; see "Copy-reduction audit"); `-fused-dequant`
+`.contiguous()` load-bearing; see "Copy-reduction audit"); `-convrot-tail-linears`
+(complete, NEGATIVE — 0.13% of a step; see "Tail linears through ConvRot"); `-fused-dequant`
 (closed — superseded by `-dequant-epilogue` which shipped it).
 
 ## Also-planned / future levers
