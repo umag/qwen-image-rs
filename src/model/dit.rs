@@ -114,6 +114,17 @@ impl QLinear {
     }
 }
 
+pub static DIAG_HOLD: std::sync::Mutex<Vec<Tensor>> = std::sync::Mutex::new(Vec::new());
+
+/// DIAG: checksum every held V (after the forward).
+pub fn diag_hold_report() -> Result<()> {
+    for (i, v) in DIAG_HOLD.lock().unwrap().iter().enumerate() {
+        let s = v.to_dtype(DType::F32)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        eprintln!("DIAG hold {i} = {s:.8e}");
+    }
+    Ok(())
+}
+
 const INNER: usize = 4096; // num_heads * head_dim = 32 * 128
 const HEADS: usize = 32;
 const HEAD_DIM: usize = 128;
@@ -324,6 +335,9 @@ impl Attention {
                 .norm_k
                 .forward(&self.to_k.forward(x)?.reshape(shape)?)?;
             let vv = self.to_v.forward_f16(x)?.reshape(shape)?; // (B,S,H,D) f16
+            if std::env::var("QIR_DIAG_HOLD").is_ok() {
+                DIAG_HOLD.lock().unwrap().push(vv.clone());
+            }
             let out = self.attend_bshd(&qh, &kh, &vv, cos, sin, txt_len, scale)?; // (B,S,H,D)
             return self.to_out.forward(&out.reshape((b, s, INNER))?);
         }

@@ -944,6 +944,8 @@ fn denoise(
     let mut map = std::collections::HashMap::new();
     map.insert("latent".to_string(), latents.contiguous()?); // (1, seq, 64)
     candle_core::safetensors::save(&map, out)?;
+    #[cfg(feature = "sage")]
+    qwen_image_rs::model::dit::diag_hold_report()?;
     println!("wrote {} ({} steps)", out.display(), steps);
     Ok(())
 }
