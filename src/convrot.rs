@@ -32,6 +32,18 @@ extern "C" {
         k: i32,
         stream: *mut std::ffi::c_void,
     ) -> i32;
+    // Same fused GEMM, f16 store: d[m,n] = f16(acc[m,n] * s_row[m] * s_col[n]).
+    fn int8_gemm_dequant_f16(
+        d: *mut std::ffi::c_void,
+        a: *const i8,
+        b: *const i8,
+        s_row: *const f32,
+        s_col: *const f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
 }
 
 struct Int8Gemm;
@@ -227,12 +239,21 @@ fn quantize_rows_fused(x: &Tensor) -> Result<(Tensor, Tensor)> {
     Ok((x_i8, row_scale))
 }
 
+/// Output precision of the fused dequant epilogue: the f32 epilogue value is
+/// rounded once to this 16-bit type on store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpilogueOut {
+    Bf16,
+    /// f16 — for SageAttention's FP16 P·V operand (V), so it needs no cast.
+    F16,
+}
+
 /// Fused INT8 GEMM + per-row/per-col dequant epilogue.
 ///
 /// `a (M,K) u8=int8` @ `Bᵀ` where `b (N,K) u8=int8`, then the CUTLASS epilogue
-/// applies `out[m,n] = acc[m,n] * s_row[m] * s_col[n]` and casts to bf16 —
-/// producing `(M,N) bf16` directly, with no i32 intermediate and no separate
-/// dequant kernel.
+/// applies `out[m,n] = acc[m,n] * s_row[m] * s_col[n]` and rounds to the
+/// requested 16-bit type (bf16 or f16) — producing `(M,N)` directly, with no
+/// i32 intermediate and no separate dequant or cast kernel.
 ///
 /// candle has no `CustomOp4`, so the two scale vectors ride in ONE packed f32
 /// tensor `scales (N+M,)` = `cat(col_scale, row_scale)`: `s_col = scales[0..N]`,
@@ -243,10 +264,13 @@ fn quantize_rows_fused(x: &Tensor) -> Result<(Tensor, Tensor)> {
 /// `col_scale` first keeps it at the buffer base. `s_row` then sits at offset N,
 /// which is 32-B aligned because N (out_features) is always a multiple of 8
 /// (the bf16 store alignment requires it anyway).
-struct Int8GemmDequant;
+struct Int8GemmDequant(EpilogueOut);
 impl candle_core::CustomOp3 for Int8GemmDequant {
     fn name(&self) -> &'static str {
-        "int8-gemm-dequant-bf16"
+        match self.0 {
+            EpilogueOut::Bf16 => "int8-gemm-dequant-bf16",
+            EpilogueOut::F16 => "int8-gemm-dequant-f16",
+        }
     }
     fn cpu_fwd(
         &self,
@@ -286,33 +310,47 @@ impl candle_core::CustomOp3 for Int8GemmDequant {
         let b = b.as_cuda_slice::<u8>()?;
         let s = s.as_cuda_slice::<f32>()?;
         let stream = dev.cuda_stream();
-        let out = unsafe { dev.alloc::<half::bf16>(m * n)? };
-        {
-            let (ap, _ga) = a.device_ptr(&stream);
-            let (bp, _gb) = b.device_ptr(&stream);
-            let (sp, _gs) = s.device_ptr(&stream);
-            let (op, _go) = out.device_ptr(&stream);
-            let s_col = sp as *const f32;
-            // s_row follows s_col in the packed buffer (offset N floats, aligned).
-            let s_row = unsafe { s_col.add(n) };
-            let rc = unsafe {
-                int8_gemm_dequant_bf16(
-                    op as *mut std::ffi::c_void,
-                    ap as *const i8,
-                    bp as *const i8,
-                    s_row,
-                    s_col,
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    stream.cu_stream() as *mut std::ffi::c_void,
-                )
-            };
-            if rc != 0 {
-                candle_core::bail!("int8_gemm_dequant_bf16 failed, rc={rc}");
+        let (ap, _ga) = a.device_ptr(&stream);
+        let (bp, _gb) = b.device_ptr(&stream);
+        let (sp, _gs) = s.device_ptr(&stream);
+        let s_col = sp as *const f32;
+        // s_row follows s_col in the packed buffer (offset N floats, aligned).
+        let s_row = unsafe { s_col.add(n) };
+        let (a_i8, b_i8) = (ap as *const i8, bp as *const i8);
+        let cu = stream.cu_stream() as *mut std::ffi::c_void;
+        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        // Both variants share every argument but the store type (and launcher).
+        let storage = match self.0 {
+            EpilogueOut::Bf16 => {
+                let out = unsafe { dev.alloc::<half::bf16>(m * n)? };
+                {
+                    let (op, _go) = out.device_ptr(&stream);
+                    let d = op as *mut std::ffi::c_void;
+                    let rc = unsafe {
+                        int8_gemm_dequant_bf16(d, a_i8, b_i8, s_row, s_col, mi, ni, ki, cu)
+                    };
+                    if rc != 0 {
+                        candle_core::bail!("int8_gemm_dequant_bf16 failed, rc={rc}");
+                    }
+                }
+                CudaStorage::wrap_cuda_slice(out, dev.clone())
             }
-        }
-        Ok((CudaStorage::wrap_cuda_slice(out, dev), (m, n).into()))
+            EpilogueOut::F16 => {
+                let out = unsafe { dev.alloc::<half::f16>(m * n)? };
+                {
+                    let (op, _go) = out.device_ptr(&stream);
+                    let d = op as *mut std::ffi::c_void;
+                    let rc = unsafe {
+                        int8_gemm_dequant_f16(d, a_i8, b_i8, s_row, s_col, mi, ni, ki, cu)
+                    };
+                    if rc != 0 {
+                        candle_core::bail!("int8_gemm_dequant_f16 failed, rc={rc}");
+                    }
+                }
+                CudaStorage::wrap_cuda_slice(out, dev.clone())
+            }
+        };
+        Ok((storage, (m, n).into()))
     }
 }
 
@@ -363,6 +401,12 @@ impl ConvRotLinear {
 
     /// Forward on `x (..., K)` bf16 -> `(..., N)` bf16.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_as(x, EpilogueOut::Bf16)
+    }
+
+    /// Forward on `x (..., K)` bf16 -> `(..., N)` in the epilogue's `out` type
+    /// (f16 feeds SageAttention's FP16 P·V without a separate cast kernel).
+    pub fn forward_as(&self, x: &Tensor, out_ty: EpilogueOut) -> Result<Tensor> {
         let dims = x.dims().to_vec();
         let k = *dims.last().unwrap();
         let m: usize = dims[..dims.len() - 1].iter().product();
@@ -374,8 +418,9 @@ impl ConvRotLinear {
         // scales[0..N] = s_col, scales[N..N+M] = s_row. col first so the
         // vectorized RowBroadcast load of s_col starts at the aligned base.
         let scales = Tensor::cat(&[&self.col_scale, &row_scale], 0)?; // (N+M,) f32
-                                                                      // Fused INT8 GEMM + per-row/per-col dequant epilogue -> (M,N) bf16.
-        let out = x_i8.apply_op3(&self.w_i8, &scales, Int8GemmDequant)?;
+
+        // Fused INT8 GEMM + per-row/per-col dequant epilogue -> (M,N) out_ty.
+        let out = x_i8.apply_op3(&self.w_i8, &scales, Int8GemmDequant(out_ty))?;
         let mut out_dims = dims[..dims.len() - 1].to_vec();
         out_dims.push(n);
         Ok(out.reshape(out_dims)?)
@@ -465,4 +510,48 @@ pub fn self_test() -> Result<i64> {
         }
     }
     Ok(maxdiff)
+}
+
+/// Bit-exactness of the fused dequant epilogue, both store types. Raw int8
+/// operands + positive f32 scales go through `Int8GemmDequant` (bf16 and f16),
+/// and a host reference applies the epilogue's exact op order —
+/// `(acc as f32 * s_row[m]) * s_col[n]`, then one round-to-nearest-even to the
+/// 16-bit type. M is odd (37) to exercise the packed-scale alignment that once
+/// faulted at M=4117. Returns the mismatch counts `(bf16, f16)` out of M·N.
+pub fn self_test_epilogue() -> Result<(usize, usize)> {
+    use candle_core::Device;
+    let dev = Device::new_cuda(0)?;
+    let (m, n, k) = (37usize, 256usize, 512usize);
+    let ai: Vec<i8> = (0..m * k).map(|i| ((i * 7) % 255) as i8).collect();
+    let bi: Vec<i8> = (0..n * k).map(|i| ((i * 13 + 5) % 255) as i8).collect();
+    // Scales spanning several binades so both 16-bit roundings are exercised.
+    let s_row: Vec<f32> = (0..m).map(|i| 1e-4 * (1.0 + i as f32 * 0.37)).collect();
+    let s_col: Vec<f32> = (0..n).map(|j| 1e-3 * (0.5 + j as f32 * 0.011)).collect();
+    let to_u8 = |v: &[i8]| v.iter().map(|&x| x as u8).collect::<Vec<u8>>();
+    let a = Tensor::from_vec(to_u8(&ai), (m, k), &dev)?;
+    let b = Tensor::from_vec(to_u8(&bi), (n, k), &dev)?;
+    let mut packed = s_col.clone();
+    packed.extend_from_slice(&s_row);
+    let scales = Tensor::from_vec(packed, n + m, &dev)?;
+    let bf = a.apply_op3(&b, &scales, Int8GemmDequant(EpilogueOut::Bf16))?;
+    let hf = a.apply_op3(&b, &scales, Int8GemmDequant(EpilogueOut::F16))?;
+    let bf: Vec<half::bf16> = bf.flatten_all()?.to_vec1()?;
+    let hf: Vec<half::f16> = hf.flatten_all()?.to_vec1()?;
+    let (mut bad_bf, mut bad_hf) = (0usize, 0usize);
+    for mi in 0..m {
+        for ni in 0..n {
+            let acc: i32 = (0..k)
+                .map(|kk| ai[mi * k + kk] as i32 * bi[ni * k + kk] as i32)
+                .sum();
+            let v = (acc as f32 * s_row[mi]) * s_col[ni];
+            let i = mi * n + ni;
+            if half::bf16::from_f32(v).to_bits() != bf[i].to_bits() {
+                bad_bf += 1;
+            }
+            if half::f16::from_f32(v).to_bits() != hf[i].to_bits() {
+                bad_hf += 1;
+            }
+        }
+    }
+    Ok((bad_bf, bad_hf))
 }

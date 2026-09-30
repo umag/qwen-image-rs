@@ -4,9 +4,11 @@
 // Two entry points:
 //   * int8_gemm_s32          — raw C(int32) = A(int8) @ Bᵀ(int8). Kept for the
 //                              bit-exact bridge self-test (host int reference).
-//   * int8_gemm_dequant_bf16 — FUSED GEMM + per-token(row) × per-channel(col)
+//   * int8_gemm_dequant_bf16 / int8_gemm_dequant_f16 — FUSED GEMM + per-token(row) × per-channel(col)
 //                              dequant in the CUTLASS epilogue, emitting bf16
-//                              directly: D(bf16) = bf16( acc·s_row[m]·s_col[n] ).
+//                              directly: D = out( acc·s_row[m]·s_col[n] ), out =
+//                              bf16 or f16 (the f16 variant feeds the sage FP16
+//                              P·V with V born f16 — no separate cast kernel).
 //                              Removes the separate dequant_i32_bf16_k kernel and
 //                              the intermediate i32 tensor. Built on the SM80
 //                              Epilogue Visitor Tree (Sm80EVT), modeled on CUTLASS
@@ -59,7 +61,7 @@ extern "C" int int8_gemm_s32(
 
 // ---------------------------------------------------------------------------
 // Fused INT8 GEMM + dequant epilogue (SM80 EVT).
-//   D[m,n] = bf16( float(acc[m,n]) * s_row[m] * s_col[n] )
+//   D[m,n] = out( float(acc[m,n]) * s_row[m] * s_col[n] ),  out = bf16 | f16
 // s_row is per-token (length M, contiguous along M → ColBroadcast).
 // s_col is per-output-channel (length N, contiguous along N → RowBroadcast).
 // ---------------------------------------------------------------------------
@@ -70,9 +72,7 @@ using ElementA = int8_t;
 using LayoutA = cutlass::layout::RowMajor;
 using ElementB = int8_t;
 using LayoutB = cutlass::layout::ColumnMajor;  // weight (N,K) row-major == K×N col-major
-using ElementC = cutlass::bfloat16_t;          // notional C/D element (output dtype)
 using LayoutC = cutlass::layout::RowMajor;
-using ElementOutput = cutlass::bfloat16_t;
 using ElementAccumulator = int32_t;
 using ElementCompute = float;
 
@@ -85,64 +85,71 @@ constexpr int NumStages = 3;
 constexpr int EVTEpilogueStages = 1;
 constexpr int AlignmentA = 16;  // 128-bit / 8-bit
 constexpr int AlignmentB = 16;
-constexpr int AlignmentC = 8;   // 128-bit / 16-bit bf16 store (all convrot N are mult of 256)
+constexpr int AlignmentC = 8;   // 128-bit / 16-bit (bf16 | f16) store (all convrot N are mult of 256)
 
-using OutputTileThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<
-    ThreadblockShape, WarpShape, ElementC, AlignmentC, EVTEpilogueStages>;
+// Everything downstream of the output element is templated on it (bf16 | f16);
+// ElementC doubles as the notional C/D element the thread map is built for.
+template <typename ElementOutput>
+struct Evt {
+  using ElementC = ElementOutput;
+  using OutputTileThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<
+      ThreadblockShape, WarpShape, ElementC, AlignmentC, EVTEpilogueStages>;
 
-// Fetch the int32 accumulator.
-using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
+  // Fetch the int32 accumulator.
+  using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
 
-// Per-row activation scale s_row[m]: a column vector (varies along M, broadcast
-// along N). Stride<_1,_0,int> = M contiguous, N broadcast, batch stride = M.
-using SRow = cutlass::epilogue::threadblock::VisitorColBroadcast<
-    OutputTileThreadMap, float, cute::Stride<_1, _0, int32_t>>;
+  // Per-row activation scale s_row[m]: a column vector (varies along M, broadcast
+  // along N). Stride<_1,_0,int> = M contiguous, N broadcast, batch stride = M.
+  using SRow = cutlass::epilogue::threadblock::VisitorColBroadcast<
+      OutputTileThreadMap, float, cute::Stride<_1, _0, int32_t>>;
 
-// Per-channel weight scale s_col[n]: a row vector (varies along N, broadcast
-// along M). Stride<_0,_1,int> = M broadcast, N contiguous, batch stride = N.
-using SCol = cutlass::epilogue::threadblock::VisitorRowBroadcast<
-    OutputTileThreadMap, float, cute::Stride<_0, _1, int32_t>>;
+  // Per-channel weight scale s_col[n]: a row vector (varies along N, broadcast
+  // along M). Stride<_0,_1,int> = M broadcast, N contiguous, batch stride = N.
+  using SCol = cutlass::epilogue::threadblock::VisitorRowBroadcast<
+      OutputTileThreadMap, float, cute::Stride<_0, _1, int32_t>>;
 
-// acc * s_row  (int32 acc and float scale converted to float).
-using MulRow = cutlass::epilogue::threadblock::VisitorCompute<
-    cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
-using EVTMulRow = cutlass::epilogue::threadblock::Sm80EVT<MulRow, Accum, SRow>;
+  // acc * s_row  (int32 acc and float scale converted to float).
+  using MulRow = cutlass::epilogue::threadblock::VisitorCompute<
+      cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
+  using EVTMulRow = cutlass::epilogue::threadblock::Sm80EVT<MulRow, Accum, SRow>;
 
-// (acc * s_row) * s_col.
-using MulCol = cutlass::epilogue::threadblock::VisitorCompute<
-    cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
-using EVTMulCol = cutlass::epilogue::threadblock::Sm80EVT<MulCol, EVTMulRow, SCol>;
+  // (acc * s_row) * s_col.
+  using MulCol = cutlass::epilogue::threadblock::VisitorCompute<
+      cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
+  using EVTMulCol = cutlass::epilogue::threadblock::Sm80EVT<MulCol, EVTMulRow, SCol>;
 
-// Store D (bf16, row-major). Stride<int64,_1,int64> = row stride N, N contiguous.
-using StoreD = cutlass::epilogue::threadblock::VisitorAuxStore<
-    OutputTileThreadMap, ElementOutput, cutlass::FloatRoundStyle::round_to_nearest,
-    cute::Stride<int64_t, _1, int64_t>>;
-using EVTD = cutlass::epilogue::threadblock::Sm80EVT<StoreD, EVTMulCol>;
+  // Store D (ElementOutput, row-major). Stride<int64,_1,int64> = row stride N, N contiguous.
+  using StoreD = cutlass::epilogue::threadblock::VisitorAuxStore<
+      OutputTileThreadMap, ElementOutput, cutlass::FloatRoundStyle::round_to_nearest,
+      cute::Stride<int64_t, _1, int64_t>>;
+  using EVTD = cutlass::epilogue::threadblock::Sm80EVT<StoreD, EVTMulCol>;
 
-using EVTKernel = typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
-    ElementA, LayoutA, cutlass::ComplexTransform::kNone, AlignmentA,
-    ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignmentB,
-    ElementC, LayoutC, AlignmentC,
-    ElementAccumulator,
-    ElementCompute,
-    OperatorClass,
-    ArchTag,
-    ThreadblockShape,
-    WarpShape,
-    InstructionShape,
-    EVTD,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-    NumStages,
-    cutlass::arch::OpMultiplyAddSaturate,  // int8 tensor-op mma (no plain OpMultiplyAdd for s8)
-    EVTEpilogueStages>::GemmKernel;
-
-using DeviceGemm = cutlass::gemm::device::GemmUniversalAdapter<EVTKernel>;
+  using EVTKernel = typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
+      ElementA, LayoutA, cutlass::ComplexTransform::kNone, AlignmentA,
+      ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignmentB,
+      ElementC, LayoutC, AlignmentC,
+      ElementAccumulator,
+      ElementCompute,
+      OperatorClass,
+      ArchTag,
+      ThreadblockShape,
+      WarpShape,
+      InstructionShape,
+      EVTD,
+      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+      NumStages,
+      cutlass::arch::OpMultiplyAddSaturate,  // int8 tensor-op mma (no plain OpMultiplyAdd for s8)
+      EVTEpilogueStages>::GemmKernel;
+  using DeviceGemm = cutlass::gemm::device::GemmUniversalAdapter<EVTKernel>;
+};
 }  // namespace convrot_evt
 
-// D(bf16, M×N row-major) = bf16( acc · s_row[m] · s_col[n] ). a int8 M×K
+// D(out, M×N row-major) = out( acc · s_row[m] · s_col[n] ), out = bf16 | f16.
+// a int8 M×K
 // row-major; b int8 N×K row-major (== K×N col-major). s_row length M, s_col
 // length N. Returns 0 on success, else the cutlass::Status as int.
-extern "C" int int8_gemm_dequant_bf16(
+template <typename ElementOutput>
+static int int8_gemm_dequant_impl(
     void* d,
     const int8_t* a,
     const int8_t* b,
@@ -150,6 +157,9 @@ extern "C" int int8_gemm_dequant_bf16(
     const float* s_col,
     int m, int n, int k, cudaStream_t stream) {
   using namespace convrot_evt;
+  using E = Evt<ElementOutput>;
+  using EVTD = typename E::EVTD;
+  using DeviceGemm = typename E::DeviceGemm;
   cutlass::gemm::GemmCoord problem(m, n, k);
 
   // EVT callback arguments: children first, node last, mirroring the tree.
@@ -199,4 +209,18 @@ extern "C" int int8_gemm_dequant_bf16(
 
   if (workspace) cudaFree(workspace);
   return s == cutlass::Status::kSuccess ? 0 : static_cast<int>(s);
+}
+
+extern "C" int int8_gemm_dequant_bf16(
+    void* d, const int8_t* a, const int8_t* b, const float* s_row, const float* s_col,
+    int m, int n, int k, cudaStream_t stream) {
+  return int8_gemm_dequant_impl<cutlass::bfloat16_t>(d, a, b, s_row, s_col, m, n, k, stream);
+}
+
+// Same GEMM, f16 store: D(f16) = f16( acc · s_row[m] · s_col[n] ) rounded once
+// from the f32 epilogue value (vs bf16 then a separate bf16->f16 cast).
+extern "C" int int8_gemm_dequant_f16(
+    void* d, const int8_t* a, const int8_t* b, const float* s_row, const float* s_col,
+    int m, int n, int k, cudaStream_t stream) {
+  return int8_gemm_dequant_impl<cutlass::half_t>(d, a, b, s_row, s_col, m, n, k, stream);
 }

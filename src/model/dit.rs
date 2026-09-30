@@ -74,6 +74,18 @@ impl QLinear {
             QLinear::Convrot(c) => c.forward(x),
         }
     }
+
+    /// Forward emitting f16 — the sage FP16 P·V operand dtype. ConvRot stores
+    /// f16 straight from its f32 dequant epilogue (one rounding, no cast
+    /// kernel); Full/Quant keep the bf16 forward + the same cast as before.
+    #[cfg(feature = "sage")]
+    fn forward_f16(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "convrot")]
+        if let QLinear::Convrot(c) = self {
+            return c.forward_as(x, crate::convrot::EpilogueOut::F16);
+        }
+        Ok(self.forward(x)?.to_dtype(DType::F16)?)
+    }
 }
 
 const INNER: usize = 4096; // num_heads * head_dim = 32 * 128
@@ -285,7 +297,7 @@ impl Attention {
             let kh = self
                 .norm_k
                 .forward(&self.to_k.forward(x)?.reshape(shape)?)?;
-            let vv = self.to_v.forward(x)?.reshape(shape)?; // (B,S,H,D)
+            let vv = self.to_v.forward_f16(x)?.reshape(shape)?; // (B,S,H,D) f16
             let out = self.attend_bshd(&qh, &kh, &vv, cos, sin, txt_len, scale)?; // (B,S,H,D)
             return self.to_out.forward(&out.reshape((b, s, INNER))?);
         }
@@ -311,7 +323,7 @@ impl Attention {
     }
 
     /// With `sage`: BSHD-native block-causal SageAttention (INT8-QK / FP16-PV).
-    /// `qh,kh` are PRE-rope `(B,S,H,D)`; `vv` is `(B,S,H,D)`; `cos,sin` are the
+    /// `qh,kh` are PRE-rope `(B,S,H,D)`; `vf` is `(B,S,H,D)` f16; `cos,sin` are the
     /// joint-sequence `(S, D/2)` RoPE tables. Image queries attend non-causally
     /// to the whole joint sequence; the `txt_len` text queries attend causally to
     /// the text prefix. Each attention operand is rotated + INT8-quantized by ONE
@@ -325,7 +337,7 @@ impl Attention {
         &self,
         qh: &Tensor,
         kh: &Tensor,
-        vv: &Tensor,
+        vf: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
         txt_len: usize,
@@ -334,9 +346,10 @@ impl Attention {
         use crate::sage::{rope_quant_bshd, sage_attention_quantized, QkRole};
         let (_b, s, _h, _d) = qh.dims4()?;
         let img = s - txt_len;
-        // V is cast to f16 once (contiguous, no transpose); the narrows below are
-        // zero-copy S-axis views the bridge reads via start_offset + strides.
-        let vf = vv.to_dtype(DType::F16)?; // (B,S,H,D) f16
+        // V arrives f16 (to_v.forward_f16 — born f16 in the ConvRot epilogue);
+        // the narrows below are zero-copy S-axis views the bridge reads via
+        // start_offset + strides.
+        debug_assert_eq!(vf.dtype(), DType::F16, "attend_bshd: V must be f16");
         let sc = scale as f32;
         let (ct, st) = (cos.narrow(0, 0, txt_len)?, sin.narrow(0, 0, txt_len)?);
         // text prefix: causal over [0, txt_len)
@@ -353,7 +366,7 @@ impl Attention {
             QkRole::Query,
         )?;
         let kf = rope_quant_bshd(kh, cos, sin, QkRole::Key)?;
-        let oi = sage_attention_quantized(&qi, &kf, &vf, sc, false)?; // (B,img,H,D)
+        let oi = sage_attention_quantized(&qi, &kf, vf, sc, false)?; // (B,img,H,D)
         Ok(Tensor::cat(&[ot, oi], 1)?) // (B,S,H,D)
     }
 

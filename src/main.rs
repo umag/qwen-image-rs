@@ -1133,6 +1133,15 @@ fn convrot_test() -> Result<()> {
                 "MISMATCH"
             }
         );
+        let (bad_bf, bad_hf) = qwen_image_rs::convrot::self_test_epilogue()?;
+        println!(
+            "convrot dequant epilogue vs host ref (M=37): bf16 mismatches = {bad_bf}, f16 mismatches = {bad_hf} ({})",
+            if bad_bf == 0 && bad_hf == 0 {
+                "EXACT"
+            } else {
+                "MISMATCH"
+            }
+        );
         let cos = qwen_image_rs::convrot::self_test_linear()?;
         println!(
             "convrot INT8 linear vs bf16: cosine = {cos:.5} ({})",
@@ -1143,6 +1152,9 @@ fn convrot_test() -> Result<()> {
             "MLP-shape timing: convrot {cr_ms:.3} ms vs bf16 {bf_ms:.3} ms ({:.2}x)",
             bf_ms / cr_ms
         );
+        if maxdiff != 0 || bad_bf != 0 || bad_hf != 0 {
+            anyhow::bail!("convrot self-test FAILED (bit-exactness)");
+        }
         Ok(())
     }
     #[cfg(not(feature = "convrot"))]
