@@ -574,3 +574,65 @@ pub fn self_test_f16_vs_cast() -> Result<(f32, f32)> {
     let a = yref.abs()?.max_all()?.to_scalar::<f32>()?;
     Ok((d, a))
 }
+
+/// Offset-view regression (`qwen-image-rs-b1-off-prompt`): every convrot
+/// bridge runs on dense views with a NONZERO storage offset (row narrows of a
+/// larger tensor, which candle keeps zero-copy) and on fresh offset-0 copies;
+/// the outputs must be bit-identical. Returns `(op, bit_identical)` per op.
+pub fn self_test_offset_views() -> Result<Vec<(&'static str, bool)>> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let (drop, m, n, k) = (5usize, 37usize, 256usize, 512usize);
+    let rows = |r: usize, cols: usize, seed: usize| -> Result<Tensor> {
+        let v: Vec<u8> = (0..(drop + r) * cols)
+            .map(|i| (((i * 7 + seed) % 255) as i8) as u8)
+            .collect();
+        Ok(Tensor::from_vec(v, (drop + r, cols), &dev)?.narrow(0, drop, r)?)
+    };
+    let (a, b) = (rows(m, k, 1)?, rows(n, k, 3)?);
+    anyhow::ensure!(
+        a.layout().start_offset() == drop * k,
+        "test premise: the narrow must be a zero-copy offset view"
+    );
+    let (af, bf) = (a.force_contiguous()?, b.force_contiguous()?);
+    let u8s = |t: &Tensor| -> Result<Vec<u8>> { Ok(t.flatten_all()?.to_vec1::<u8>()?) };
+
+    // int8 GEMM (i32 out).
+    let gemm_ok = int8_gemm(&a, &b)?.flatten_all()?.to_vec1::<i32>()?
+        == int8_gemm(&af, &bf)?.flatten_all()?.to_vec1::<i32>()?;
+
+    // Fused dequant epilogue, with the packed scales an offset view too.
+    let sv: Vec<f32> = (0..drop + n + m)
+        .map(|i| 1e-3 * (1.0 + i as f32 * 0.01))
+        .collect();
+    let sc = Tensor::from_vec(sv, drop + n + m, &dev)?.narrow(0, drop, n + m)?;
+    let scf = sc.force_contiguous()?;
+    let deq = |a: &Tensor, b: &Tensor, s: &Tensor| -> Result<Vec<u16>> {
+        Ok(a.apply_op3(b, s, Int8GemmDequant(EpilogueOut::Bf16))?
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect())
+    };
+    let deq_ok = deq(&a, &b, &sc)? == deq(&af, &bf, &scf)?;
+
+    // Activation quantizers on an offset bf16 view.
+    let x = Tensor::randn(0f32, 1f32, (drop + m, k), &dev)?
+        .to_dtype(DType::BF16)?
+        .narrow(0, drop, m)?;
+    let xf = x.force_contiguous()?;
+    let (q, rs) = quantize_rows_fused(&x)?;
+    let (qf, rsf) = quantize_rows_fused(&xf)?;
+    let fused_ok = u8s(&q)? == u8s(&qf)? && rs.to_vec1::<f32>()? == rsf.to_vec1::<f32>()?;
+    let inv = Tensor::from_vec(vec![100f32; drop + m], drop + m, &dev)?.narrow(0, drop, m)?;
+    let invf = inv.force_contiguous()?;
+    let rows_ok =
+        u8s(&x.apply_op2(&inv, QuantizeRows)?)? == u8s(&xf.apply_op2(&invf, QuantizeRows)?)?;
+    Ok(vec![
+        ("int8_gemm", gemm_ok),
+        ("int8_gemm_dequant", deq_ok),
+        ("quantize_rows_fused", fused_ok),
+        ("quantize_rows", rows_ok),
+    ])
+}

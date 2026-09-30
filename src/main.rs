@@ -1161,7 +1161,7 @@ fn convrot_test() -> Result<()> {
         if maxdiff != 0 || bad_bf != 0 || bad_hf != 0 || !f16_ok {
             anyhow::bail!("convrot self-test FAILED (bit-exactness)");
         }
-        Ok(())
+        report_offset_views("convrot", qwen_image_rs::convrot::self_test_offset_views()?)
     }
     #[cfg(not(feature = "convrot"))]
     anyhow::bail!("build with --features convrot (needs CUTLASS_DIR)")
@@ -1222,6 +1222,26 @@ fn sage_test() -> Result<()> {
 }
 
 /// Self-test the fused LayerNorm+AdaLN kernel vs the candle reference.
+/// Print the offset-view regression results and fail if any bridge read the
+/// wrong rows (`qwen-image-rs-b1-off-prompt`).
+#[cfg(any(feature = "fusednorm", feature = "convrot"))]
+fn report_offset_views(group: &str, results: Vec<(&'static str, bool)>) -> Result<()> {
+    let mut bad = Vec::new();
+    for (op, ok) in results {
+        println!(
+            "{group} {op} on a nonzero-offset view vs fresh copy: {}",
+            if ok { "BIT-IDENTICAL" } else { "MISMATCH" }
+        );
+        if !ok {
+            bad.push(op);
+        }
+    }
+    if !bad.is_empty() {
+        anyhow::bail!("{group}: bridges ignore the view offset: {bad:?}");
+    }
+    Ok(())
+}
+
 fn fusednorm_test() -> Result<()> {
     #[cfg(feature = "fusednorm")]
     {
@@ -1242,7 +1262,10 @@ fn fusednorm_test() -> Result<()> {
             "fused gated residual vs candle: cosine = {cos:.6} ({})",
             if cos > 0.9999 { "OK" } else { "TOO LOW" }
         );
-        Ok(())
+        report_offset_views(
+            "fusednorm",
+            qwen_image_rs::fusednorm::self_test_offset_views()?,
+        )
     }
     #[cfg(not(feature = "fusednorm"))]
     anyhow::bail!("build with --features fusednorm")

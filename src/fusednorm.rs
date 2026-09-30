@@ -327,3 +327,57 @@ pub fn self_test_gated() -> Result<f32> {
     let nb = oref.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
     Ok(dot / (na * nb + 1e-8))
 }
+
+/// Offset-view regression (`qwen-image-rs-b1-off-prompt`). Each fused op runs
+/// on a dense view with a NONZERO storage offset — built exactly like
+/// `generate`'s B=1 prompt embeds: `(1, drop+n, N).narrow(1, drop, n)`, which
+/// candle keeps as a zero-copy view — and on a fresh offset-0 copy of the same
+/// values. The outputs must be bit-identical; a bridge that passes the storage
+/// base pointer reads rows `0..n` instead of `drop..drop+n`. Returns
+/// `(op, bit_identical)` per op.
+pub fn self_test_offset_views() -> Result<Vec<(&'static str, bool)>> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let (drop, n, inner) = (14usize, 21usize, 4096usize);
+    // Draw a (1, drop+n, N) bf16 tensor and return its S-axis narrow (a view).
+    let view = |std: f32| -> Result<Tensor> {
+        let t = Tensor::randn(0f32, std, (1, drop + n, inner), &dev)?.to_dtype(DType::BF16)?;
+        Ok(t.narrow(1, drop, n)?)
+    };
+    let bits = |t: &Tensor| -> Result<Vec<u16>> {
+        Ok(t.flatten_all()?
+            .to_vec1::<half::bf16>()?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect())
+    };
+    let (x, s, g) = (view(1.0)?, view(0.5)?, view(1.5)?);
+    anyhow::ensure!(
+        x.contiguous()?.layout().start_offset() == drop * inner,
+        "test premise: the narrow must stay a zero-copy offset view"
+    );
+    let (xf, sf, gf) = (
+        x.force_contiguous()?,
+        s.force_contiguous()?,
+        g.force_contiguous()?,
+    );
+    // An offset f32 weight too: (drop+N,) narrowed to N.
+    let w = Tensor::randn(1f32, 0.2f32, drop + inner, &dev)?.narrow(0, drop, inner)?;
+    let wf = w.force_contiguous()?;
+    Ok(vec![
+        (
+            "fused_rmsnorm_scale",
+            bits(&fused_rmsnorm_scale(&x, &w, 1e-6)?)?
+                == bits(&fused_rmsnorm_scale(&xf, &wf, 1e-6)?)?,
+        ),
+        (
+            "fused_norm_mod",
+            bits(&fused_norm_mod(&x, &s, 1e-6)?)? == bits(&fused_norm_mod(&xf, &sf, 1e-6)?)?,
+        ),
+        (
+            "fused_gated_residual",
+            bits(&fused_gated_residual(&x, &g, &s)?)?
+                == bits(&fused_gated_residual(&xf, &gf, &sf)?)?,
+        ),
+    ])
+}
