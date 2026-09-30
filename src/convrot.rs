@@ -555,3 +555,22 @@ pub fn self_test_epilogue() -> Result<(usize, usize)> {
     }
     Ok((bad_bf, bad_hf))
 }
+
+/// The f16 epilogue at the DiT to_v shape (M=4117, K=N=4096) vs the bf16
+/// epilogue + a bf16->f16 cast (the path it replaces). Single vs double
+/// rounding differ by at most 1 bf16 ulp, so this returns `(max_abs_diff,
+/// max_abs_ref)` in f32 for a relative bound check.
+pub fn self_test_f16_vs_cast() -> Result<(f32, f32)> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let (m, n, k) = (4117usize, 4096usize, 4096usize);
+    let w = (Tensor::randn(0f32, 1f32, (n, k), &dev)? * 0.02)?.to_dtype(DType::BF16)?;
+    let x = Tensor::randn(0f32, 1f32, (m, k), &dev)?.to_dtype(DType::BF16)?;
+    let r = crate::model::rotation::regular_hadamard_256(&dev)?;
+    let cr = ConvRotLinear::from_weight(&w, &r)?;
+    let y16 = cr.forward_as(&x, EpilogueOut::F16)?.to_dtype(DType::F32)?;
+    let yref = cr.forward(&x)?.to_dtype(DType::F16)?.to_dtype(DType::F32)?;
+    let d = (&y16 - &yref)?.abs()?.max_all()?.to_scalar::<f32>()?;
+    let a = yref.abs()?.max_all()?.to_scalar::<f32>()?;
+    Ok((d, a))
+}

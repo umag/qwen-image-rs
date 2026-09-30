@@ -1142,6 +1142,12 @@ fn convrot_test() -> Result<()> {
                 "MISMATCH"
             }
         );
+        let (d16, a16) = qwen_image_rs::convrot::self_test_f16_vs_cast()?;
+        let f16_ok = d16 <= a16 / 128.0;
+        println!(
+            "convrot f16 epilogue vs bf16 epilogue + cast (to_v shape): max abs diff = {d16:.3e} of max |y| {a16:.3e} ({})",
+            if f16_ok { "OK" } else { "MISMATCH" }
+        );
         let cos = qwen_image_rs::convrot::self_test_linear()?;
         println!(
             "convrot INT8 linear vs bf16: cosine = {cos:.5} ({})",
@@ -1152,7 +1158,7 @@ fn convrot_test() -> Result<()> {
             "MLP-shape timing: convrot {cr_ms:.3} ms vs bf16 {bf_ms:.3} ms ({:.2}x)",
             bf_ms / cr_ms
         );
-        if maxdiff != 0 || bad_bf != 0 || bad_hf != 0 {
+        if maxdiff != 0 || bad_bf != 0 || bad_hf != 0 || !f16_ok {
             anyhow::bail!("convrot self-test FAILED (bit-exactness)");
         }
         Ok(())
