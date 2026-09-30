@@ -45,7 +45,8 @@ at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 d
 | dequant→CUTLASS-EVT epilogue | convrot | 0.34 |
 | fused RMSNorm×weight + gated residual | fusednorm | 0.27 |
 | BSHD-native attention (no transpose copies) | sage | 0.247 |
-| RoPE fused into the INT8 Q/K quantizer | sage | **0.2295** (A/B same session: 0.2336 → 0.2295, −1.8%) |
+| RoPE fused into the INT8 Q/K quantizer | sage | 0.2295 (A/B same session: 0.2336 → 0.2295, −1.8%) |
+| V born f16 in the ConvRot epilogue (no V cast) + sage partial-tile zero-fill | convrot,sage | **0.2266** (A/B same session: 0.2292 → 0.2266, −1.1%) |
 
 Plus (not per-step): bf16 VAE decode 1.57×; text encoder Q8_0 GGUF (resident
 VRAM); VAE tiling (constant decode memory); true CFG (`--guidance`/`--negative`,
@@ -94,8 +95,8 @@ impact/effort:
    commit a081ad5). See "BSHD-native fused attention" below — denoise
    0.27→0.247 s/step (~8.5%), oracle 0.999934 unchanged, sage BSHD vs BHSD
    bit-exact. Follow-on Q/K-quant-into-rope fusion **DONE**
-   (`qwen-image-rs-rope-quant-fusion`, −1.8%). Remaining: a bf16-native-V PV
-   path (the V f16 cast remains, but no longer via a transpose).
+   (`qwen-image-rs-rope-quant-fusion`, −1.8%). The V f16 cast is gone too
+   (`qwen-image-rs-bf16-v-pv`, −1.1%: to_v's ConvRot epilogue stores f16).
 2. **VAE conv algorithm** (`im2col_bf16` ~10%). bf16 already; further needs
    implicit-GEMM / Winograd convs or a fused decoder — large.
 3. **Per-warp sage quant** (accuracy/speed refinement) + **SageAttention on
@@ -423,6 +424,41 @@ SageAttention's own IO trick: q/k are rotated and INT8-quantized in ONE pass.
 - Note: the absolute s/step on 2026-09-30 is lower than the 0.247 recorded
   earlier for the same baseline commit (clock/thermal drift) — compare A/B only.
 
+### V born f16 in the ConvRot epilogue (DONE — `qwen-image-rs-bf16-v-pv`)
+The sage FP16 P·V takes f16 V, and `attend_bshd` used to cast V bf16→f16 every
+block, every step. nsys (10 steps): `cast_bf16_f16` 320 inst × 76 us = 24.4 ms =
+2.4 ms/step (~1%).
+- `kernels/convrot/int8_gemm.cu`: the Sm80EVT types are a template
+  `Evt<ElementOutput>` (bf16 | f16); `int8_gemm_dequant_impl<E>` holds the host
+  launcher; `int8_gemm_dequant_bf16` and the new `int8_gemm_dequant_f16` wrap it.
+  The f16 store rounds the f32 epilogue value once (the old path rounded twice:
+  f32→bf16→f16), so it is at least as accurate.
+- `src/convrot.rs`: `EpilogueOut::{Bf16, F16}`; `Int8GemmDequant(EpilogueOut)`;
+  `ConvRotLinear::forward_as(x, out)` (`forward` = Bf16).
+- `src/model/dit.rs`: `QLinear::forward_f16` (sage only): ConvRot → f16
+  epilogue; Full/Quant → forward + `to_dtype(F16)` (the old op, so the
+  no-convrot path is byte-identical). The sage branch uses it for `to_v`;
+  `attend_bshd` takes V already f16.
+- Tests (`convrot-test`): both store types bit-exact vs a host reference at
+  M=37 (odd M, alignment); f16 epilogue vs bf16 epilogue + cast at the to_v
+  shape (M=4117, K=N=4096) within 1 bf16 ulp. convrot-test now exits nonzero
+  on a bit-exactness failure.
+- **This change exposed the sage partial-tile NaN bug** (see Gotchas): the cast
+  kernel used to be the last kernel before the rope-quant/attention calls; with
+  it gone, the text-prefix attention read NaN stale shared memory every run
+  (dit-forward --convrot 0.9059). Fixed in the same issue (zero-fill).
+- **Validation:** no-convrot dit-forward byte-identical to the prior build
+  (vs oracle 0.999965). `--convrot`: 0.999944 on 4/4 runs (deterministic now;
+  prior build 0.99980–0.99995 on the same 4 runs). Speed A/B (same session,
+  batch --resident, 2 prompts × 40 steps, 2nd image): base 9169 / 9168 ms →
+  new 9057 / 9068 ms = **0.2292 → 0.2266 s/step (−1.1%)**. nsys: `cast_bf16_f16`
+  gone; to_v shows as a separate f16-epilogue GEMM (320 inst, 245 us).
+- Images match the prior build closely. NOTE: both A/B prompts ("a red mug on
+  a wooden table", "a lighthouse on a cliff at sunset") came out clean but
+  OFF-PROMPT with BOTH builds (a purple city poster, a pencil-sketch dining
+  room). This is the known "convrot B=1 lands off-prompt at some seeds" issue;
+  not caused by this change, still open.
+
 ### Tail linears through ConvRot (`qwen-image-rs-convrot-tail-linears` — NEGATIVE RESULT, no code)
 Measured before building. nsys, 10-step trace, fast build (`convrot,sage,fusednorm`),
 denoise GPU busy 2301 ms (= 230 ms/step). The small-M bf16 GEMMs, attributed by grid:
@@ -547,14 +583,23 @@ attn: 4096 OK). ConvRotLinear input dim K = the linear's in_features.
 - **EVT scale vectors pack col-first** (`cat(col_scale,row_scale)`): the vectorized
   RowBroadcast base must be 32-B aligned; row-first faulted MISALIGNED at M=4117.
   Build the convrot .cu with `--expt-extended-lambda` (EVT visitors).
-- **dit-forward `--convrot` is NOT run-to-run deterministic** (measured
-  2026-09-30 on the pre-rope-fusion baseline: 8 runs overall_cos vs oracle
-  0.99942–0.999940, run-vs-run 0.9994). WITHOUT `--convrot` it is bit-exact
-  deterministic (0.999965 every run). So the ">= 0.99993" single-run gate is a
-  coin flip on convrot builds — gate kernel changes on the no-convrot path
-  (bit-identity vs baseline) + the convrot distribution, not one run. Root
-  cause (convrot INT8 GEMM / activation-quant nondeterminism, magnitude larger
-  than split-K atomics would suggest) is UNINVESTIGATED — open question.
+- **dit-forward `--convrot` noise was a NaN bug — FIXED, now deterministic**
+  (`qwen-image-rs-bf16-v-pv`). Before: 8 runs vs oracle scattered
+  0.99942–0.999940. Root cause: the vendored sage kernel loaded K/V rows
+  `>= kv_len` of the last 64-key tile with `SharedMemFillMode::kNoFill`, so they
+  kept stale shared memory from whatever kernel ran before on that SM. Masked
+  scores are exactly 0, but `0 * NaN = NaN` in P·V. The text-prefix causal call
+  (kv_len = txt_len < 64) always has such rows, so the text outputs went NaN
+  whenever the stale bytes were NaN/Inf (it depends on which kernel ran just
+  before on each SM → run-to-run noise). The convrot INT8 activation quantizer
+  then hid it (fmaxf ignores NaN, NaN→int8 gives 0); the no-convrot path had
+  finite stale bytes by luck. Fix: `kFillZero` in the predicated
+  `load_global_to_share` (`kernels/sage/vendor/qattn/attn_utils.cuh`, LOCAL
+  PATCH). After: `--convrot` gives 0.999944 on every run; no-convrot stays
+  byte-identical. Regression test: `sage-test` "partial last K/V tile under
+  NaN-poisoned smem" (fills every SM's smem with f16 NaN first).
+  compute-sanitizer memcheck/initcheck do NOT catch this (shared memory, and
+  initcheck only tracks global memory) — poison shared memory to test for it.
 - `scripts/compare_dit.py <ours> <oracle>` = the dit-forward oracle compare
   (overall_cos, MSE, per-token cos over the last 4096 rows); run it with the
   oracle venv python.
@@ -595,7 +640,8 @@ Phase ports (complete): `-oracle`, `-vae`, `-text-encoder`, `-dit`.
 Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-dequant-epilogue` (CUTLASS EVT), `-fused-rmsnorm-gate` (RMSNorm+gated residual),
 `-vae-bf16`, `-bshd-attention` (BSHD-native fused attention),
-`-rope-quant-fusion` (RoPE fused into the sage INT8 Q/K quantizer).
+`-rope-quant-fusion` (RoPE fused into the sage INT8 Q/K quantizer),
+`-bf16-v-pv` (V born f16 in the ConvRot epilogue + sage partial-tile zero-fill).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path
 `.contiguous()` load-bearing; see "Copy-reduction audit"); `-convrot-tail-linears`
 (complete, NEGATIVE — 0.13% of a step; see "Tail linears through ConvRot"); `-fused-dequant`
