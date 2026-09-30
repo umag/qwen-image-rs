@@ -344,3 +344,27 @@ extern "C" void sage_attn_bshd(const void *q_i8, const void *k_i8,
         sbz_v, sseq_v, sh_v, sbz_o, sseq_o, sh_o, sm_scale,
         (cudaStream_t)stream);
 }
+
+// ---------------------------------------------------------------------------
+// Test helper: fill every SM's shared memory with f16 NaN (0x7E00) so a
+// following kernel that reads shared memory it never wrote sees NaN instead of
+// whatever the previous kernel left. Used by sage::self_test_partial_tile to
+// prove the predicated (out-of-range) K/V tile rows are zero-filled.
+// ---------------------------------------------------------------------------
+__global__ void poison_smem_kernel(uint32_t n_words) {
+  extern __shared__ uint32_t poison_sm[];
+  volatile uint32_t *sm = poison_sm;  // volatile: stores must not be elided
+  for (uint32_t i = threadIdx.x; i < n_words; i += blockDim.x) sm[i] = 0x7E007E00u;
+}
+
+extern "C" int sage_poison_smem_launch(void *stream) {
+  int dev = 0, smem = 0, sms = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return -1;
+  cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  if (cudaFuncSetAttribute(poison_smem_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           smem) != cudaSuccess)
+    return -2;
+  poison_smem_kernel<<<sms * 4, 1024, smem, (cudaStream_t)stream>>>((uint32_t)smem / 4);
+  return cudaGetLastError() == cudaSuccess ? 0 : -3;
+}

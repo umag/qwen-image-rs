@@ -13,6 +13,8 @@ use std::ffi::c_void;
 use crate::Result;
 
 extern "C" {
+    // Test helper (sage_ffi.cu): fill all SMs' shared memory with f16 NaN.
+    fn sage_poison_smem_launch(stream: *mut c_void) -> i32;
     fn sage_quant_q(
         inp: *const c_void,
         out_i8: *mut c_void,
@@ -855,4 +857,64 @@ pub fn self_test_rope_quant() -> Result<RopeQuantReport> {
         };
     }
     Ok(rep)
+}
+
+/// Regression for the partial-last-tile read: with kv_len not a multiple of
+/// the 64-key tile, the vendored kernel loads rows `>= kv_len` of K/V under a
+/// predicate. Their scores are masked to exactly 0, but a V row left holding
+/// stale shared memory (NaN/Inf from an earlier kernel) turns `0 * NaN` into
+/// NaN. This poisons every SM's shared memory with f16 NaN, then runs the DiT's
+/// two attention shapes at partial tiles — text-prefix causal (txt=21 < 64) and
+/// full (S=293 = 4*64+37) — and compares with an unpoisoned run.
+/// Returns `(nan_count, maxabs_diff_vs_unpoisoned)`; both must be 0.
+pub fn self_test_partial_tile() -> Result<(usize, f32)> {
+    use candle_core::Device;
+    let (b, h, s, d, txt) = (1usize, 4usize, 293usize, 128usize, 21usize);
+    let dev = Device::new_cuda(0)?;
+    dev.set_seed(11)?;
+    let sc = (1.0 / (d as f64).sqrt()) as f32;
+    let q = Tensor::randn(0f32, 1f32, (b, s, h, d), &dev)?.to_dtype(DType::BF16)?;
+    let k = Tensor::randn(0f32, 1f32, (b, s, h, d), &dev)?.to_dtype(DType::BF16)?;
+    let v = Tensor::randn(0f32, 1f32, (b, s, h, d), &dev)?.to_dtype(DType::F16)?;
+    let qt = quant_bshd(&q.narrow(1, 0, txt)?, QkRole::Query)?;
+    let kt = quant_bshd(&k.narrow(1, 0, txt)?, QkRole::Key)?;
+    let qi = quant_bshd(&q.narrow(1, txt, s - txt)?, QkRole::Query)?;
+    let kf = quant_bshd(&k, QkRole::Key)?;
+    let vt = v.narrow(1, 0, txt)?;
+    let run = || -> Result<(Tensor, Tensor)> {
+        Ok((
+            sage_attention_quantized(&qt, &kt, &vt, sc, true)?,
+            sage_attention_quantized(&qi, &kf, &v, sc, false)?,
+        ))
+    };
+    let poison = || -> Result<()> {
+        let Device::Cuda(cd) = &dev else {
+            anyhow::bail!("partial-tile self-test needs CUDA")
+        };
+        let rc = unsafe { sage_poison_smem_launch(cd.cuda_stream().cu_stream() as *mut c_void) };
+        if rc != 0 {
+            anyhow::bail!("sage_poison_smem_launch failed rc={rc}");
+        }
+        Ok(())
+    };
+    let (ct, ci) = run()?;
+    let mut nan = 0usize;
+    let mut maxabs = 0f32;
+    // Poison right before EACH call so each kernel starts on NaN shared memory.
+    poison()?;
+    let pt = sage_attention_quantized(&qt, &kt, &vt, sc, true)?;
+    poison()?;
+    let pi = sage_attention_quantized(&qi, &kf, &v, sc, false)?;
+    for (c, p) in [(&ct, &pt), (&ci, &pi)] {
+        let cv: Vec<f32> = c.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let pv: Vec<f32> = p.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        for (x, y) in cv.iter().zip(&pv) {
+            if x.is_nan() || y.is_nan() {
+                nan += 1;
+            } else {
+                maxabs = maxabs.max((x - y).abs());
+            }
+        }
+    }
+    Ok((nan, maxabs))
 }

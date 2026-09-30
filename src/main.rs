@@ -944,8 +944,6 @@ fn denoise(
     let mut map = std::collections::HashMap::new();
     map.insert("latent".to_string(), latents.contiguous()?); // (1, seq, 64)
     candle_core::safetensors::save(&map, out)?;
-    #[cfg(feature = "sage")]
-    qwen_image_rs::model::dit::diag_hold_report()?;
     println!("wrote {} ({} steps)", out.display(), steps);
     Ok(())
 }
@@ -1192,6 +1190,12 @@ fn sage_test() -> Result<()> {
             "sage BSHD vs BHSD (block-causal split): cosine = {bshd_cos:.6}, maxabs = {maxabs:.4} ({})",
             if bshd_ok { "OK" } else { "MISMATCH" }
         );
+        let (pt_nan, pt_diff) = qwen_image_rs::sage::self_test_partial_tile()?;
+        let pt_ok = pt_nan == 0 && pt_diff == 0.0;
+        println!(
+            "sage partial last K/V tile under NaN-poisoned smem (txt=21, S=293): NaN = {pt_nan}, maxabs vs clean = {pt_diff:.4} ({})",
+            if pt_ok { "OK" } else { "FAIL" }
+        );
         let rq = qwen_image_rs::sage::self_test_rope_quant()?;
         let rq_ok = rq.int8_mismatches == 0
             && rq.scale_mismatches == 0
@@ -1207,6 +1211,9 @@ fn sage_test() -> Result<()> {
         );
         if !rq_ok {
             anyhow::bail!("fused rope+quant is not bit-exact vs rope->quant");
+        }
+        if !pt_ok {
+            anyhow::bail!("sage partial-tile attention reads stale shared memory");
         }
         Ok(())
     }

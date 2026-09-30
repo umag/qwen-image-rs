@@ -82,47 +82,10 @@ impl QLinear {
     fn forward_f16(&self, x: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "convrot")]
         if let QLinear::Convrot(c) = self {
-            if std::env::var("QIR_DIAG_VCAST").is_ok() {
-                let y = c.forward(x)?;
-                let a = y.to_dtype(DType::F32)?.abs()?.max_all()?.to_scalar::<f32>()?;
-                eprintln!("DIAG max|V| bf16 = {a}");
-                return Ok(y.to_dtype(DType::F16)?);
-            }
-            let y = c.forward_as(x, crate::convrot::EpilogueOut::F16)?;
-            if std::env::var("QIR_DIAG_CMP").is_ok() {
-                let r = c.forward(x)?.to_dtype(DType::F16)?;
-                let yf = y.to_dtype(DType::F32)?;
-                let rf = r.to_dtype(DType::F32)?;
-                let d = (&yf - &rf)?.abs()?.max_all()?.to_scalar::<f32>()?;
-                let a = rf.abs()?.max_all()?.to_scalar::<f32>()?;
-                let ya = yf.abs()?.max_all()?.to_scalar::<f32>()?;
-                eprintln!("DIAG cmp maxdiff={d} max|ref|={a} max|y|={ya} shape={:?} x={:?}", y.dims(), x.dims());
-            }
-            if std::env::var("QIR_DIAG_SYNC").is_ok() {
-                y.device().synchronize()?;
-            }
-            if std::env::var("QIR_DIAG_COPY").is_ok() {
-                return Ok(y.copy()?);
-            }
-            if std::env::var("QIR_DIAG_VMAX").is_ok() {
-                let a = y.to_dtype(DType::F32)?.abs()?.max_all()?.to_scalar::<f32>()?;
-                eprintln!("DIAG max|V| f16 = {a}");
-            }
-            return Ok(y);
+            return c.forward_as(x, crate::convrot::EpilogueOut::F16);
         }
         Ok(self.forward(x)?.to_dtype(DType::F16)?)
     }
-}
-
-pub static DIAG_HOLD: std::sync::Mutex<Vec<Tensor>> = std::sync::Mutex::new(Vec::new());
-
-/// DIAG: checksum every held V (after the forward).
-pub fn diag_hold_report() -> Result<()> {
-    for (i, v) in DIAG_HOLD.lock().unwrap().iter().enumerate() {
-        let s = v.to_dtype(DType::F32)?.abs()?.sum_all()?.to_scalar::<f32>()?;
-        eprintln!("DIAG hold {i} = {s:.8e}");
-    }
-    Ok(())
 }
 
 const INNER: usize = 4096; // num_heads * head_dim = 32 * 128
@@ -335,9 +298,6 @@ impl Attention {
                 .norm_k
                 .forward(&self.to_k.forward(x)?.reshape(shape)?)?;
             let vv = self.to_v.forward_f16(x)?.reshape(shape)?; // (B,S,H,D) f16
-            if std::env::var("QIR_DIAG_HOLD").is_ok() {
-                DIAG_HOLD.lock().unwrap().push(vv.clone());
-            }
             let out = self.attend_bshd(&qh, &kh, &vv, cos, sin, txt_len, scale)?; // (B,S,H,D)
             return self.to_out.forward(&out.reshape((b, s, INNER))?);
         }
@@ -390,25 +350,13 @@ impl Attention {
         // the narrows below are zero-copy S-axis views the bridge reads via
         // start_offset + strides.
         debug_assert_eq!(vf.dtype(), DType::F16, "attend_bshd: V must be f16");
-        let diag = std::env::var("QIR_DIAG_VSUM").is_ok();
-        let vsum = |tag: &str| -> Result<()> {
-            if diag {
-                let v = vf.to_dtype(DType::F32)?.abs()?.sum_all()?.to_scalar::<f32>()?;
-                eprintln!("DIAG vsum {tag} = {v:.8e}");
-            }
-            Ok(())
-        };
-        vsum("entry")?;
         let sc = scale as f32;
         let (ct, st) = (cos.narrow(0, 0, txt_len)?, sin.narrow(0, 0, txt_len)?);
         // text prefix: causal over [0, txt_len)
         let qt = rope_quant_bshd(&qh.narrow(1, 0, txt_len)?, &ct, &st, QkRole::Query)?;
-        vsum("after qt")?;
         let kt = rope_quant_bshd(&kh.narrow(1, 0, txt_len)?, &ct, &st, QkRole::Key)?;
-        vsum("after kt")?;
         let vt = vf.narrow(1, 0, txt_len)?;
         let ot = sage_attention_quantized(&qt, &kt, &vt, sc, true)?; // (B,txt,H,D)
-        vsum("after ot")?;
 
         // image queries: full non-causal attention over the whole sequence
         let qi = rope_quant_bshd(
@@ -417,44 +365,8 @@ impl Attention {
             &sin.narrow(0, txt_len, img)?,
             QkRole::Query,
         )?;
-        vsum("after qi")?;
         let kf = rope_quant_bshd(kh, cos, sin, QkRole::Key)?;
-        vsum("after kf")?;
         let oi = sage_attention_quantized(&qi, &kf, vf, sc, false)?; // (B,img,H,D)
-        if std::env::var("QIR_DIAG_POST").is_ok() {
-            let cs = |t: &Tensor| -> Result<f64> {
-                Ok(t.to_dtype(DType::F32)?.abs()?.sum_all()?.to_scalar::<f32>()? as f64)
-            };
-            eprintln!(
-                "DIAG post v={:.8e} qh={:.8e} kh={:.8e} ot={:.8e} oi={:.8e}",
-                cs(vf)?,
-                cs(qh)?,
-                cs(kh)?,
-                cs(&ot)?,
-                cs(&oi)?
-            );
-        }
-        if std::env::var("QIR_DIAG_ATT").is_ok() {
-            let vc = vf.copy()?;
-            let ot2 = sage_attention_quantized(&qt, &kt, &vc.narrow(1, 0, txt_len)?, sc, true)?;
-            let oi2 = sage_attention_quantized(&qi, &kf, &vc, sc, false)?;
-            let f = |a: &Tensor, b: &Tensor| -> Result<f32> {
-                Ok((a.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?
-                    .abs()?
-                    .max_all()?
-                    .to_scalar::<f32>()?)
-            };
-            let l = vf.layout();
-            eprintln!(
-                "DIAG att txt diff={} img diff={} v layout off={} stride={:?} contig={} v shape={:?} txt_len={txt_len}",
-                f(&ot, &ot2)?,
-                f(&oi, &oi2)?,
-                l.start_offset(),
-                l.stride(),
-                vf.is_contiguous(),
-                vf.dims()
-            );
-        }
         Ok(Tensor::cat(&[ot, oi], 1)?) // (B,S,H,D)
     }
 
@@ -569,21 +481,7 @@ impl Block {
         let h = gated_residual(h, gate1, &attn)?;
         let x = norm_mod(&h, scale2, self.eps)?;
         let m = self.mlp.forward(&x)?;
-        let out = gated_residual(&h, gate2, &m)?;
-        if std::env::var("QIR_DIAG_SUM").is_ok() {
-            let cs = |t: &Tensor| -> Result<f64> {
-                Ok(t.to_dtype(DType::F32)?.abs()?.sum_all()?.to_scalar::<f32>()? as f64)
-            };
-            eprintln!(
-                "DIAG sum x1={:.6e} attn={:.6e} h={:.6e} m={:.6e} out={:.6e}",
-                cs(&norm_mod(&h, scale2, self.eps)?)?,
-                cs(&attn)?,
-                cs(&h)?,
-                cs(&m)?,
-                cs(&out)?
-            );
-        }
-        Ok(out)
+        gated_residual(&h, gate2, &m)
     }
 }
 
