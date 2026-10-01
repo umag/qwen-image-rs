@@ -363,6 +363,9 @@ fn resolve_entry(dir: &Path, files: &[PathBuf], root: &Path, mode: CacheMode) ->
         tracing::info!(path = %entry.display(), "convrot cache hit");
         return Ok(entry);
     };
+    // Fail fast (before ~25 s of quantization) when the entry dir cannot be made.
+    let parent = entry.parent().context("cache entry has no parent dir")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     tracing::info!(path = %entry.display(), reason, "building the convrot cache (one-time: rotate + INT8-quantize the DiT linears)");
     let t0 = std::time::Instant::now();
     let meta = HashMap::from([
