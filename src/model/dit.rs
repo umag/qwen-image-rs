@@ -905,8 +905,11 @@ mod tests {
     fn rotated_tail_linears_meet_the_convrot_shape_rules() {
         for (prefix, k, n, rot) in TAIL_LINEARS {
             if rot {
-                assert!(k % crate::model::rotation::GROUP == 0, "{prefix}: K={k}");
-                assert!(n % 8 == 0, "{prefix}: N={n}");
+                assert!(
+                    k.is_multiple_of(crate::model::rotation::GROUP),
+                    "{prefix}: K={k}"
+                );
+                assert!(n.is_multiple_of(8), "{prefix}: N={n}");
             }
         }
     }
