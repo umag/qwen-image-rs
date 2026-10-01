@@ -78,7 +78,8 @@ re-checked against the oracle before the next one.
 | f32 decoder | — | — | 1.84 s |
 | bf16 decoder | — | 0.95 s | 1.15 s |
 | cuDNN tensor-core implicit-GEMM conv (no im2col buffer; peak 15.7 → 8.9 GB) | `cudnn` | 0.51 s | 0.68 s |
-| channel RmsNorm×γ(+SiLU) one kernel, bias+residual one pass (byte-identical) | `fusednorm` | **0.27 s** | **0.38 s** |
+| channel RmsNorm×γ(+SiLU) one kernel, bias+residual one pass (byte-identical) | `fusednorm` | **0.27 s** | 0.38 s |
+| `--vae-tile auto` (default): resident 1024² decodes the whole image (fits now; no seams, 48.5 → 56.4 dB vs oracle) | — | — | **0.27 s** (whole) |
 
 Plus: tiled decode (constant memory); batched
 multi-seed generation (`generate --batch N`, B=4 sweet spot). Recommended (default)

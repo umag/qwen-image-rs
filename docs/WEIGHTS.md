@@ -77,16 +77,17 @@ warm 2.1 s → 1.1 s.
 
 ```sh
 # fastest build
-cargo build --release --features convrot,sage,fusednorm,sage2    # CUTLASS_DIR set
+# CUTLASS_DIR set; cudnn needs the user-space cuDNN wheel (scripts/setup-host.sh)
+cargo build --release --features convrot,sage,fusednorm,sage2,cudnn
 
 # resident batch: N seed-variations, ~11 s/image
 qwen-image-rs batch --model <snapshot> --prompts prompts.txt \
-  --resident --convrot --text-gguf qir-text.gguf --vae-tile 32 --steps 40 \
+  --resident --convrot --text-gguf qir-text.gguf --steps 40 \
   --out-dir out/
 
 # single image with N seeds (SDXL-style grid)
 qwen-image-rs generate --model <snapshot> --prompt "..." \
-  --convrot --text-gguf qir-text.gguf --vae-tile 32 --batch 4 --out-dir out/
+  --convrot --text-gguf qir-text.gguf --batch 4 --out-dir out/
 ```
 
 ## 4. Optional: regenerate the validation oracle

@@ -28,12 +28,13 @@ denoise 0.1522 s/step after `-residual-norm-fusion` (same-session A/B; 0.1647 af
 bit-identical to the build without `sage2`). **Most accurate fast build: `--features
 convrot,sage,fusednorm`** (0.999944). **DEFAULT (human decision 2026-10-01): the
 SA2 build** — accepted at 0.999894 for -4.8% denoise. (bf16 VAE is the
-CUDA default; `--convrot --text-gguf <gguf> --vae-tile 32`). Oracle parity held
+CUDA default; `--convrot --text-gguf <gguf>`, `--vae-tile auto` is the default). Oracle parity held
 at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 dB.
 
 ### Speed today (1024², RTX 4090, measured 2026-09-21)
 - **Denoise: 0.247 s/step** (was bf16+flash 0.62) — **~2.5×**. VAE tiled bf16
-  decode **1.19 s** (was f32 1.84).
+  decode **1.19 s** (was f32 1.84). [2026-10-01 VAE series: decode 0.27 s resident
+  (cuDNN + fused norm + auto whole-image) — see the last three sections.]
 - **Single `generate` (loads all 3 models each run): ~25 s** (40 steps); the
   ~14 s beyond compute is one-time model load (8 GB text GGUF mmap + DiT + VAE).
 - **`batch --resident` (models loaded once): ~11.1 s/image @40 steps** (enc
@@ -550,8 +551,9 @@ memory scales with tile², not image². `--vae-tile <N>` on generate/batch
 - **Resident `--vae-tile 32`: decode 35 s → 1.8 s (19×), per-image 57 s → 22 s.**
   Both mug+vase correct. This is now the FASTEST path: resident+gguf+tile
   **22 s/img** < sequential `--text-gguf` 35 s < non-tiled resident 57 s.
-- Recommended resident invocation:
-  `batch --resident --convrot --text-gguf <gguf> --vae-tile 32 ...`
+- Recommended resident invocation (since `-vae-untiled`, `--vae-tile auto` is the
+  default and picks whole-image decode at 1024²):
+  `batch --resident --convrot --text-gguf <gguf> ...`
 
 ### CFG + step count (DONE)
 - **`--steps` was already a param** (generate/batch/denoise). Denoise is a flat
@@ -1225,3 +1227,21 @@ the resident path had to tile.
   norm 13, bias_residual 6. Left: NHWC end to end (drops the 31 ms transforms + lets
   cudnnConvolutionBiasActivationForward fuse the bias), then a distilled/lightweight
   decoder is the only big lever (conv math itself is ~half of what remains).
+
+### VAE auto tiling (DONE — `qwen-image-rs-vae-untiled`)
+`--vae-tile` on generate/batch is now a `VaeTiling` policy: `auto` (default) | `0`
+(whole image) | `N` (N×N latent tiles, overlap N/4). `QwenImageVae::decode_auto` estimates
+the whole-image working set = output pixels × `decode_bytes_per_pixel` (cuDNN conv: 5 KiB
+bf16 / 10 KiB f32; im2col: 15 / 30 KiB — measured 4.5 / ~13.5 KiB at 1024²) + 1 GiB
+margin vs cuMemGetInfo free (`device::free_vram`), tiles at 32 when it would not fit, and
+retries tiled if a whole-image decode errors. It must be an estimate, not try-and-catch:
+on WSL an over-subscribed decode spills to shared memory silently (35 s, blank images).
+Each decode logs `vae decode (auto) need_mib free_mib mode`; generate now logs decode_ms.
+- **Resident 1024² (batch, 2 prompts, 40 steps):** free 7230 MiB vs need 5120+1024 → whole;
+  decode **381 → 270 ms** steady (first image 408 ms incl. cuDNN warm-up vs ~520 tiled),
+  peak 21.3 GB (tiled 18.8). Both images correct (mug + lighthouse, distinct md5).
+- **generate 1024²:** decode 609 → 422 ms (free 15.4 GB). `--batch 2`: lane 0 430 ms, lane 1 262.
+- **Quality:** whole-image decode = no tile seams: 56.4 dB vs oracle (tiled 48.5).
+- Bigger images (≥ ~1200² resident, 2048² anywhere near the models) fall back to tiles
+  automatically; f32 / non-cudnn builds tile in resident mode (unit-tested decision).
+- Pixel-identical to the prior build at a fixed policy (`vae-decode` md5, dit-forward cmp).
