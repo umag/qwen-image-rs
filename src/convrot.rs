@@ -1093,10 +1093,18 @@ impl RotQuantCase {
     /// Pass: int8 within 1 of both references; scales within 1e-5 of the
     /// f64 reference and within bf16 rounding (2^-8) of the old path.
     pub fn ok(&self) -> bool {
+        self.ok_with_old(1, 1.0 / 256.0)
+    }
+
+    /// Pass with an explicit bound vs the old path: the f64 reference is
+    /// always held to 1 int8 step and 1e-5 scale; the old path to
+    /// `old_dq` steps and `old_scale` relative scale (its own bf16 roundings
+    /// set the bound: one for the rotation GEMM, two for candle silu + mul).
+    pub fn ok_with_old(&self, old_dq: i32, old_scale: f32) -> bool {
         self.ref_max_diff <= 1
-            && self.old_max_diff <= 1
+            && self.old_max_diff <= old_dq
             && self.ref_scale_rel <= 1e-5
-            && self.old_scale_rel <= 1.0 / 256.0
+            && self.old_scale_rel <= old_scale
     }
 }
 

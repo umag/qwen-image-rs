@@ -1375,9 +1375,15 @@ fn convrot_test() -> Result<()> {
                 c.old_mismatches,
                 100.0 * c.old_mismatches as f64 / (c.m * c.k) as f64,
                 c.old_scale_rel,
-                if c.ok() { "OK" } else { "MISMATCH" }
+                if c.ok_with_old(2, 2.0 / 256.0) {
+                    "OK"
+                } else {
+                    "MISMATCH"
+                }
             );
-            swg_ok &= c.ok();
+            // The candle path rounds silu(g) and the product to bf16 (two
+            // roundings): up to 2 int8 steps / 2^-7 scale vs the fused f32.
+            swg_ok &= c.ok_with_old(2, 2.0 / 256.0);
         }
         for (what, ok) in qwen_image_rs::convrot::self_test_swiglu_views()? {
             println!(
@@ -1397,7 +1403,7 @@ fn convrot_test() -> Result<()> {
         for (what, ok) in qwen_image_rs::convrot::self_test_merged()? {
             println!(
                 "convrot merged projection: {what}: {}",
-                if ok { "BIT-IDENTICAL" } else { "MISMATCH" }
+                if ok { "OK" } else { "MISMATCH" }
             );
             swg_ok &= ok;
         }
