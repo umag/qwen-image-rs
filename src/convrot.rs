@@ -39,7 +39,7 @@ extern "C" {
     ) -> i32;
 }
 
-pub use crate::gemm_tiles::{gemm_config, gemm_plan, GemmPlan, Raster, TileConfig, GEMM_CONFIGS};
+pub use crate::gemm_tiles::{gemm_plan, GemmPlan, TileConfig, GEMM_CONFIGS};
 
 struct Int8Gemm;
 
@@ -583,9 +583,9 @@ impl candle_core::CustomOp3 for Int8GemmDequant {
                 candle_core::bail!("int8-gemm-dequant: unknown tile config {cfg}");
             }
         }
-        let esz = std::mem::size_of::<u16>(); // bf16 | f16
-                                              // Each segment is rows r0..r0+rows of A, s_row and D (all row-major):
-                                              // plain pointer offsets, the same per-element math.
+        // Each segment is rows r0..r0+rows of A, s_row and D (all row-major):
+        // plain pointer offsets, the same per-element math. D is bf16 | f16.
+        let esz = std::mem::size_of::<u16>();
         let launch = |d: *mut std::ffi::c_void, kind: i32| -> candle_core::Result<()> {
             for &(r0, rows, cfg) in &segments {
                 let rc = unsafe {
@@ -1580,133 +1580,6 @@ pub fn bench_gemm_plans(
             }
         }
         res.push((m, n, k, times, same));
-    }
-    Ok(res)
-}
-
-/// Reference for `gemm-bench`: ms of the raw `int8_gemm_s32` (stock CUTLASS
-/// default epilogue, 128x128x64 3-stage, int32 out — twice the store bytes
-/// of the dequant GEMM, no scale math) at each `(M, N, K)`, min of 3 rounds.
-pub fn bench_raw_s32(shapes: &[(usize, usize, usize)], iters: usize) -> Result<Vec<f64>> {
-    use candle_core::Device;
-    let dev = Device::new_cuda(0)?;
-    let mut res = Vec::new();
-    for &(m, n, k) in shapes {
-        let a = Tensor::zeros((m, k), candle_core::DType::U8, &dev)?;
-        let b = Tensor::zeros((n, k), candle_core::DType::U8, &dev)?;
-        int8_gemm(&a, &b)?;
-        let mut best = f64::MAX;
-        for _ in 0..3 {
-            dev.synchronize()?;
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                int8_gemm(&a, &b)?;
-            }
-            dev.synchronize()?;
-            best = best.min(t0.elapsed().as_secs_f64() * 1e3 / iters as f64);
-        }
-        res.push(best);
-    }
-    Ok(res)
-}
-
-extern "C" {
-    fn int8_gemm_spike_launch(
-        variant: i32,
-        d: *mut std::ffi::c_void,
-        a: *const i8,
-        b: *const i8,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: *mut std::ffi::c_void,
-    ) -> i32;
-}
-
-/// SPIKE (gemm-tiling-push): `iters` back-to-back launches of an epilogue
-/// probe into ONE output buffer (no per-launch allocation).
-struct SpikeOp {
-    variant: i32,
-    iters: usize,
-}
-
-impl candle_core::CustomOp2 for SpikeOp {
-    fn name(&self) -> &'static str {
-        "int8-gemm-spike"
-    }
-    fn cpu_fwd(
-        &self,
-        _: &CpuStorage,
-        _: &Layout,
-        _: &CpuStorage,
-        _: &Layout,
-    ) -> candle_core::Result<(CpuStorage, Shape)> {
-        candle_core::bail!("cuda only")
-    }
-    fn cuda_fwd(
-        &self,
-        a: &CudaStorage,
-        a_l: &Layout,
-        b: &CudaStorage,
-        b_l: &Layout,
-    ) -> candle_core::Result<(CudaStorage, Shape)> {
-        let dev = a.device().clone();
-        let (m, k) = a_l.shape().dims2()?;
-        let (n, _) = b_l.shape().dims2()?;
-        let a = a.as_cuda_slice::<u8>()?;
-        let b = b.as_cuda_slice::<u8>()?;
-        let stream = dev.cuda_stream();
-        let out = unsafe { dev.alloc::<i32>(m * n)? };
-        {
-            let (ap, _ga) = a.device_ptr(&stream);
-            let (bp, _gb) = b.device_ptr(&stream);
-            let (op, _go) = out.device_ptr(&stream);
-            for _ in 0..self.iters {
-                let rc = unsafe {
-                    int8_gemm_spike_launch(
-                        self.variant,
-                        op as *mut std::ffi::c_void,
-                        ap as *const i8,
-                        bp as *const i8,
-                        m as i32,
-                        n as i32,
-                        k as i32,
-                        stream.cu_stream() as *mut std::ffi::c_void,
-                    )
-                };
-                if rc != 0 {
-                    candle_core::bail!("spike variant {} rc={rc}", self.variant);
-                }
-            }
-        }
-        Ok((CudaStorage::wrap_cuda_slice(out, dev), (m, n).into()))
-    }
-}
-
-/// SPIKE: ms per launch of epilogue probe `variant` at each shape (min of 3).
-pub fn bench_spike(
-    variant: i32,
-    shapes: &[(usize, usize, usize)],
-    iters: usize,
-) -> Result<Vec<f64>> {
-    use candle_core::Device;
-    let dev = Device::new_cuda(0)?;
-    let mut res = Vec::new();
-    for &(m, n, k) in shapes {
-        let ai: Vec<u8> = (0..m * k).map(|i| ((i * 7 + 3) % 255) as u8).collect();
-        let bi: Vec<u8> = (0..n * k).map(|i| ((i * 13 + 5) % 255) as u8).collect();
-        let a = Tensor::from_vec(ai, (m, k), &dev)?;
-        let b = Tensor::from_vec(bi, (n, k), &dev)?;
-        a.apply_op2(&b, SpikeOp { variant, iters: 1 })?;
-        let mut best = f64::MAX;
-        for _ in 0..3 {
-            dev.synchronize()?;
-            let t0 = std::time::Instant::now();
-            let _o = a.apply_op2(&b, SpikeOp { variant, iters })?;
-            dev.synchronize()?;
-            best = best.min(t0.elapsed().as_secs_f64() * 1e3 / iters as f64);
-        }
-        res.push(best);
     }
     Ok(res)
 }

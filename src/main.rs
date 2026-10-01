@@ -1242,7 +1242,7 @@ fn gemm_bench(iters: usize, batch: usize, txt: usize) -> Result<()> {
     #[cfg(feature = "convrot")]
     {
         use qwen_image_rs::convrot::{
-            bench_gemm_plans, bench_raw_s32, gemm_plan, EpilogueOut, GemmPlan, GEMM_CONFIGS,
+            bench_gemm_plans, gemm_plan, EpilogueOut, GemmPlan, GEMM_CONFIGS,
         };
         // M = B * (txt + 4096 image tokens at 1024²).
         let m = (4096 + txt) * batch;
@@ -1257,22 +1257,21 @@ fn gemm_bench(iters: usize, batch: usize, txt: usize) -> Result<()> {
         ];
         for (i, c) in GEMM_CONFIGS.iter().enumerate() {
             println!(
-                "cfg {i}: TB {:?} warp {:?} stages {} raster {:?}",
-                c.tb, c.warp, c.stages, c.raster
+                "cfg {i}: TB {:?} warp {:?} stages {} swizzle {}",
+                c.tb, c.warp, c.stages, c.swizzle
             );
         }
-        // Every compiled config alone, then each data-parallel main config
-        // with its partial last M-tile split off to the small configs.
+        // Every compiled config alone, then each large config with the
+        // partial last M-tile (the text rows past 4096) split off to the
+        // small config 2 (`a+2`).
         let mut plans: Vec<GemmPlan> = (0..GEMM_CONFIGS.len() as u8)
             .map(GemmPlan::single)
             .collect();
-        for main in [0u8, 1, 3, 4, 5, 6, 8, 9, 10, 11] {
-            for tail in [7u8] {
-                plans.push(GemmPlan {
-                    main,
-                    tail: Some(tail),
-                });
-            }
+        for main in [0u8, 1, 3, 4] {
+            plans.push(GemmPlan {
+                main,
+                tail: Some(2),
+            });
         }
         let label = |p: &GemmPlan| match p.tail {
             None => format!("{}", p.main),
@@ -1300,27 +1299,6 @@ fn gemm_bench(iters: usize, batch: usize, txt: usize) -> Result<()> {
                 );
                 all_same &= same;
             }
-        }
-        for (v, what) in [
-            (0, "stock 128x256 s3 i32"),
-            (1, "EVT store-only 128x256 s3 bf16"),
-            (2, "EVT store-only 128x128 s3 bf16"),
-        ] {
-            for ((m, n, k), ms) in
-                shapes[..4]
-                    .iter()
-                    .zip(qwen_image_rs::convrot::bench_spike(v, &shapes[..4], iters)?)
-            {
-                let flop = 2.0 * (m * n * k) as f64;
-                println!(
-                    "spike {what} M={m} N={n} K={k}: {ms:.4}ms/{:.0}T",
-                    flop / ms / 1e9
-                );
-            }
-        }
-        for ((m, n, k), ms) in shapes[..4].iter().zip(bench_raw_s32(&shapes[..4], iters)?) {
-            let flop = 2.0 * (m * n * k) as f64;
-            println!("raw-s32 128x128x64 s3 (stock epilogue, i32 out) M={m} N={n} K={k}: {ms:.4}ms/{:.0}T", flop / ms / 1e9);
         }
         anyhow::ensure!(all_same, "launch plans disagree (must be bit-identical)");
         Ok(())
@@ -1363,6 +1341,38 @@ fn convrot_test() -> Result<()> {
                 }
             );
             epi_bad += bad_bf + bad_hf;
+        }
+        // Row-split launch plans (head + tail launch) vs one launch, byte for
+        // byte (`qwen-image-rs-gemm-tiling-push`): tails of 21 / 64 / 127 rows
+        // (one and two 64-row tail tiles) and the B = 2 M.
+        {
+            use qwen_image_rs::convrot::{bench_gemm_plans, EpilogueOut, GemmPlan};
+            let plans = [
+                GemmPlan::single(0),
+                GemmPlan::single(3),
+                GemmPlan {
+                    main: 3,
+                    tail: Some(2),
+                },
+            ];
+            let shapes = [
+                (4117, 4096, 4096),
+                (4160, 4096, 4096),
+                (4223, 4096, 4096),
+                (8234, 4096, 12288),
+            ];
+            for out in [EpilogueOut::Bf16, EpilogueOut::F16] {
+                for (m, n, k, times, same) in bench_gemm_plans(&shapes, &plans, out, 1)? {
+                    // A plan that fails to launch is skipped by the bench:
+                    // count it as a failure, not a vacuous match.
+                    let ok = same && times.iter().all(Option::is_some);
+                    println!(
+                        "convrot row-split plan vs single launch ({out:?}, M={m} N={n} K={k}): {}",
+                        if ok { "EXACT" } else { "MISMATCH" }
+                    );
+                    epi_bad += usize::from(!ok);
+                }
+            }
         }
         let (d16, a16) = qwen_image_rs::convrot::self_test_f16_vs_cast()?;
         let f16_ok = d16 <= a16 / 128.0;
