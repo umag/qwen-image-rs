@@ -49,3 +49,7 @@ Reference update (2026-10-01): fused-rotate-quant accepted (human gate stance:
 the default SA2 config: 0.999879 (QIR_SAGE=1: 0.999900). The oracle cosine reacts
 chaotically to tiny upstream changes — judge the whole config (all QIR_SAGE modes,
 no-convrot parity, self-tests vs f64/old path, clean images), not one number.
+
+Reference update (2026-10-01): fused-swiglu accepted under the same stance. New
+dit-forward --convrot vs oracle references: default SA2 0.999911, QIR_SAGE=1
+0.999881, QIR_SAGE=2f32 0.999890 (no-convrot 0.999945 unchanged).

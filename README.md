@@ -66,12 +66,13 @@ re-checked against the oracle before the next one.
 | RoPE fused into INT8 quant; V born f16 | `sage`,`convrot` | 0.2266 |
 | SageAttention2: INT8-QK per-thread + K smoothing / FP8-PV | `sage2` | 0.2149 (same-session A/B 0.2259 → 0.2149, −4.8%) |
 | SA2 quant: ten per-layer quant launches → three (L2-ordered, bit-identical) | `sage2` | 0.2127 (same-session A/B 0.2159 → 0.2127, −1.5%) |
-| Hadamard rotation fused into the INT8 activation quantizer (no bf16 rotation GEMM) | `convrot` | **0.1911** (same-session A/B 0.2125 → 0.1911, −10.1%) |
+| Hadamard rotation fused into the INT8 activation quantizer (no bf16 rotation GEMM) | `convrot` | 0.1911 (same-session A/B 0.2125 → 0.1911, −10.1%) |
+| SwiGLU `silu(g)·p` fused into the MLP-out rotate+quantize (no bf16 h, no silu/mul passes) | `convrot` | **0.1746** (same-session A/B 0.1905 → 0.1746, −8.4%) |
 
 Plus: bf16 VAE decode (1.57×) and tiled decode (constant memory); batched
 multi-seed generation (`generate --batch N`, B=4 sweet spot). Recommended (default)
 build: `--features convrot,sage,fusednorm,sage2`. Most accurate: drop `sage2`
-(dit-forward vs oracle 0.999944). The `sage2` (`convrot,sage,fusednorm,sage2`, dit-forward 0.999879 — FP8
+(dit-forward vs oracle 0.999944). The `sage2` (`convrot,sage,fusednorm,sage2`, dit-forward 0.999911 — FP8
 P·V; every DiT linear except img_in runs ConvRot INT8); in a `sage2` build `QIR_SAGE=1` selects SageAttention v1 (bit-identical to
 the build without `sage2`), `QIR_SAGE=2f32` SA2 with fp32 P·V accumulation.
 Resident batch ≈ 11 s/image. `--convrot` loads a cached prequantized DiT
