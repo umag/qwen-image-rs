@@ -14,6 +14,8 @@
 #[cfg(feature = "convrot")]
 pub mod convrot;
 pub mod convrot_cache;
+#[cfg(feature = "cudnn")]
+pub mod cudnn_conv;
 pub mod device;
 #[cfg(feature = "fusednorm")]
 pub mod fusednorm;

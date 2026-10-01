@@ -15,6 +15,35 @@
 use candle_core::{DType, Tensor, D};
 use candle_nn::{conv2d, Conv2d, Conv2dConfig, Module, VarBuilder};
 
+/// A VAE conv (stride 1): candle's `Conv2d` (im2col + GEMM), or — with the
+/// `cudnn` feature, on CUDA in bf16 — cuDNN with tensor-core math
+/// ([`crate::cudnn_conv`]). `QIR_CUDNN=0` forces the candle path.
+struct Conv {
+    inner: Conv2d,
+    #[cfg_attr(not(feature = "cudnn"), allow(dead_code))]
+    padding: usize,
+}
+
+impl Conv {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        #[cfg(feature = "cudnn")]
+        if x.device().is_cuda() && x.dtype() == DType::BF16 && cudnn_enabled() {
+            let y = crate::cudnn_conv::conv2d_bf16(x, self.inner.weight(), self.padding)?;
+            return match self.inner.bias() {
+                Some(b) => y.broadcast_add(&b.reshape((1, b.dim(0)?, 1, 1))?),
+                None => Ok(y),
+            };
+        }
+        self.inner.forward(x)
+    }
+}
+
+#[cfg(feature = "cudnn")]
+fn cudnn_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QIR_CUDNN").map_or(true, |v| v != "0"))
+}
+
 use crate::model::config::VaeConfig;
 use crate::Result;
 
@@ -60,25 +89,31 @@ impl RmsNorm {
     }
 }
 
-fn conv2d_k3(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
+fn conv2d_k3(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv> {
     let cfg = Conv2dConfig {
         padding: 1,
         ..Default::default()
     };
-    Ok(conv2d(in_c, out_c, 3, cfg, vb)?)
+    Ok(Conv {
+        inner: conv2d(in_c, out_c, 3, cfg, vb)?,
+        padding: 1,
+    })
 }
 
-fn conv2d_k1(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
-    Ok(conv2d(in_c, out_c, 1, Conv2dConfig::default(), vb)?)
+fn conv2d_k1(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv> {
+    Ok(Conv {
+        inner: conv2d(in_c, out_c, 1, Conv2dConfig::default(), vb)?,
+        padding: 0,
+    })
 }
 
 /// `QwenImage21ResidualBlock`: norm1->silu->conv1(k3)->norm2->silu->conv2(k3) + shortcut.
 struct ResidualBlock {
     norm1: RmsNorm,
-    conv1: Conv2d,
+    conv1: Conv,
     norm2: RmsNorm,
-    conv2: Conv2d,
-    shortcut: Option<Conv2d>,
+    conv2: Conv,
+    shortcut: Option<Conv>,
 }
 
 impl ResidualBlock {
@@ -115,8 +150,8 @@ impl ResidualBlock {
 /// `QwenImage21AttentionBlock`: single-head self-attention over HW tokens.
 struct AttentionBlock {
     norm: RmsNorm,
-    to_qkv: Conv2d,
-    proj: Conv2d,
+    to_qkv: Conv,
+    proj: Conv,
     dim: usize,
 }
 
@@ -178,7 +213,7 @@ impl MidBlock {
 /// Nearest-exact 2x upsample (== nearest for integer scale) + conv2d(k3).
 /// The learned resample conv of `QwenImage21Resample` (upsample2d/3d at T=1).
 struct Upsampler {
-    conv: Conv2d,
+    conv: Conv,
 }
 
 impl Upsampler {
@@ -276,11 +311,11 @@ impl ResidualUpBlock {
 
 /// `QwenImage21Decoder3d`.
 struct Decoder3d {
-    conv_in: Conv2d,
+    conv_in: Conv,
     mid_block: MidBlock,
     up_blocks: Vec<ResidualUpBlock>,
     norm_out: RmsNorm,
-    conv_out: Conv2d,
+    conv_out: Conv,
 }
 
 impl Decoder3d {
@@ -341,7 +376,7 @@ impl Decoder3d {
 
 /// The decode half of `AutoencoderKLQwenImage21`.
 pub struct QwenImageVae {
-    post_quant_conv: Conv2d,
+    post_quant_conv: Conv,
     decoder: Decoder3d,
     latents_mean: Tensor, // (1, z, 1, 1) f32
     latents_std: Tensor,  // (1, z, 1, 1) f32

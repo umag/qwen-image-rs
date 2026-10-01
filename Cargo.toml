@@ -30,7 +30,9 @@ cc = { version = "1", optional = true }
 default = []
 # CUDA path — only builds on the WSL 4090 host (needs CUDA toolkit + a GPU).
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-cudnn = ["cuda", "candle-core/cudnn"]
+# cuDNN conv2d for the VAE (tensor-core math; src/cudnn_conv.rs). Needs libcudnn
+# (pip wheel nvidia-cudnn-cu13, see scripts/setup-host.sh; QIR_CUDNN_LIB).
+cudnn = ["cuda", "candle-core/cudnn", "dep:half"]
 # FlashAttention-2 kernels (Ada/Ampere/Hopper only). ~19 min first build.
 flash-attn = ["cuda", "dep:candle-flash-attn"]
 # ConvRot INT8 W8A8: compiles kernels/convrot/*.cu (needs CUTLASS_DIR).
