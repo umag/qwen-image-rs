@@ -1421,39 +1421,52 @@ pub fn bench_gemm_configs(
                     .collect(),
             })
         };
-        let mut times = Vec::new();
+        // Configs are interleaved over ROUNDS rounds and the minimum kept, so
+        // clock / power drift during a long sweep does not favour one config.
+        const ROUNDS: usize = 3;
+        let ncfg = GEMM_CONFIGS.len();
+        let mut times: Vec<Option<f64>> = vec![None; ncfg];
+        let mut runs = vec![true; ncfg];
         let mut reference: Option<Vec<u16>> = None;
         let mut same = true;
-        for cfg in 0..GEMM_CONFIGS.len() as u8 {
-            let op = || {
-                a.apply_op3(
-                    &b,
-                    &sc,
-                    Int8GemmDequant {
-                        out,
-                        cfg: Some(cfg),
-                    },
-                )
-            };
-            let first = match op() {
-                Ok(t) => t,
-                Err(_) => {
-                    times.push(None);
+        for round in 0..ROUNDS {
+            for cfg in 0..ncfg {
+                if !runs[cfg] {
                     continue;
                 }
-            };
-            let got = bits(&first)?;
-            match &reference {
-                None => reference = Some(got),
-                Some(r) => same &= *r == got,
+                let op = || {
+                    a.apply_op3(
+                        &b,
+                        &sc,
+                        Int8GemmDequant {
+                            out,
+                            cfg: Some(cfg as u8),
+                        },
+                    )
+                };
+                let first = match op() {
+                    Ok(t) => t,
+                    Err(_) => {
+                        runs[cfg] = false;
+                        continue;
+                    }
+                };
+                if round == 0 {
+                    let got = bits(&first)?;
+                    match &reference {
+                        None => reference = Some(got),
+                        Some(r) => same &= *r == got,
+                    }
+                }
+                dev.synchronize()?;
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    op()?;
+                }
+                dev.synchronize()?;
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+                times[cfg] = Some(times[cfg].map_or(ms, |t: f64| t.min(ms)));
             }
-            dev.synchronize()?;
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                op()?;
-            }
-            dev.synchronize()?;
-            times.push(Some(t0.elapsed().as_secs_f64() * 1e3 / iters as f64));
         }
         res.push((m, n, k, times, same));
     }
