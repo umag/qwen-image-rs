@@ -1,0 +1,103 @@
+{
+  "id": "427ff3a3-7328-4a9c-968f-58464d9118b3",
+  "name": "31dc23ad1ef6c1023ef1d80dee9353c51fa3a8a6",
+  "modelId": "fcd8eec5-ce97-4d03-a552-3250fcd1e52e",
+  "modelName": "qwen-image-rs-vae-untiled",
+  "modelType": "@magistr/issue-lifecycle",
+  "version": 1,
+  "contentType": "application/json",
+  "lifetime": "infinite",
+  "garbageCollection": 20,
+  "streaming": false,
+  "tags": {
+    "type": "resource",
+    "specName": "attestation",
+    "modelName": "qwen-image-rs-vae-untiled",
+    "initiatedBy": "user:magistr"
+  },
+  "ownerDefinition": {
+    "ownerType": "model-method",
+    "ownerRef": "fcd8eec5-ce97-4d03-a552-3250fcd1e52e"
+  },
+  "createdAt": "2026-10-01T21:58:26.590Z",
+  "size": 2490,
+  "checksum": "b075543eb2e3c0666fec5788e718359f08f0110da228a14e982cec7e4b7f47a1",
+  "contentPath": "../../.swamp/repos/c8eb7040-ad64-4e9e-9c47-e2d30504659e/dev-tmp-swamp/data/@magistr/issue-lifecycle/fcd8eec5-ce97-4d03-a552-3250fcd1e52e/31dc23ad1ef6c1023ef1d80dee9353c51fa3a8a6/1/raw",
+  "content": {
+    "attestationVersion": 1,
+    "issue": "VAE decode: auto tiling — untiled when it fits next to the resident models, tiled fallback",
+    "commitSha": "31dc23ad1ef6c1023ef1d80dee9353c51fa3a8a6",
+    "branch": "main",
+    "planVersion": 2,
+    "configChecksums": {
+      "Cargo.toml": "3d0a6beb09e0f639968a0138a71fd31d49d3509cfcd9c3b78f49863839d7ab0e",
+      "agent-constraints/implementation-conventions.md": "5d7196119fb8c37ec4f49646dda6390f5a56517551a94f0d2873bd30993abf5a",
+      "agent-constraints/iteration-limits.md": "16cfe3e09afe6adac39324ed227bf15f8fc7ea19c032387a158ef8818d1bf43d",
+      "agent-constraints/verification-controls.md": "9c48f9c338d52c336b4e339247851e310e82f5eef5114a138cb3af432b74eb21"
+    },
+    "controls": [
+      {
+        "name": "fmt",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh fmt",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 375,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "== fmt ==\n== local checks OK ==\n"
+      },
+      {
+        "name": "lint",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh clippy",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 529,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.36s\n"
+      },
+      {
+        "name": "check",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh check",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 435,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.32s\n"
+      },
+      {
+        "name": "test",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh test",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 705,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s\n     Running unittests src/lib.rs (/Users/mag1/.cache/qwen-image-rs-target/debug/deps/qwen_image_rs-a8488a9f861909c8)\n     Running unittests src/main.rs (/Users/mag1/.cache/qwen-image-rs-target/debug/deps/qwen_image_rs-a51df39266a840ad)\n   Doc-tests qwen_image_rs\n"
+      }
+    ],
+    "reviews": [
+      {
+        "reviewer": "review-adversarial",
+        "verdict": "PASS",
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 2
+      },
+      {
+        "reviewer": "review-code",
+        "verdict": "PASS",
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 1
+      }
+    ],
+    "runner": "local",
+    "producedAt": "2026-10-01T21:58:26.584Z",
+    "producedBy": "navi",
+    "modelVersion": "2026.09.20.2"
+  }
+}
