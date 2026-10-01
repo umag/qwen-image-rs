@@ -33,6 +33,7 @@ fn main() {
     {
         // Fused LayerNorm+AdaLN kernel (no external deps).
         println!("cargo:rerun-if-changed=kernels/fusednorm/fused_norm.cu");
+        println!("cargo:rerun-if-changed=kernels/fusednorm/head_rmsnorm.cuh");
         let cap = std::env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".into());
         cc::Build::new()
             .cuda(true)
@@ -71,6 +72,7 @@ fn main() {
         // SageAttention2 sm89 (INT8-QK per-thread + FP8-PV): its own TU so the
         // vendored sm80/sm89 kernels' PACK_SIZE_* macros never meet.
         println!("cargo:rerun-if-changed=kernels/sage/sage2_ffi.cu");
+        println!("cargo:rerun-if-changed=kernels/fusednorm/head_rmsnorm.cuh");
         println!("cargo:rerun-if-changed=kernels/sage/vendor/qattn/qk_int_sv_f8_sm89.cuh");
         let cap = std::env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".into());
         cc::Build::new()

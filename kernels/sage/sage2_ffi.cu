@@ -26,6 +26,7 @@
 
 #include "vendor/qattn/qk_int_sv_f8_sm89.cuh" // qk_int_sv_f8_attn_kernel + enums
 #include "rope_pair.cuh"                       // shared no-FMA RoPE rotation
+#include "../fusednorm/head_rmsnorm.cuh"       // per-head q/k RMSNorm (same bits as fusednorm)
 
 namespace sage2 {
 
@@ -35,15 +36,12 @@ constexpr uint32_t CHUNK = 256;        // tokens per partial-reduction chunk
 constexpr uint32_t ROWS = 16;          // token rows per partial-reduction CTA
 constexpr uint32_t V_TILE = 64;        // CTA_K: V tokens per tile / pad unit
 
-// Rotate one 8-element pack (4 interleaved pairs) of token `tok`, rounded to
-// bf16 exactly like the v1 fused rope+quant (and the unfused rope kernel).
-__device__ __forceinline__ void rope_pack(const __nv_bfloat16 *src,
+// Rotate one 8-element bf16 pack (4 interleaved pairs) of token `tok`, rounded
+// to bf16 exactly like the v1 fused rope+quant (and the unfused rope kernel).
+__device__ __forceinline__ void rope_bf16(const __nv_bfloat16 x[8],
                                           const __nv_bfloat16 *cos,
-                                          const __nv_bfloat16 *sin,
-                                          uint32_t tok, uint32_t sseq_cs,
-                                          uint32_t d0, float out[8]) {
-  __nv_bfloat16 x[8];
-  *(float4 *)(&x[0]) = *(const float4 *)src;
+                                          const __nv_bfloat16 *sin, uint32_t tok,
+                                          uint32_t sseq_cs, uint32_t d0, float out[8]) {
   const __nv_bfloat16 *c = cos + (size_t)tok * sseq_cs + d0 / 2;
   const __nv_bfloat16 *s = sin + (size_t)tok * sseq_cs + d0 / 2;
 #pragma unroll
@@ -54,6 +52,39 @@ __device__ __forceinline__ void rope_pack(const __nv_bfloat16 *src,
     out[2 * p] = __bfloat162float(y0);
     out[2 * p + 1] = __bfloat162float(y1);
   }
+}
+
+__device__ __forceinline__ void rope_pack(const __nv_bfloat16 *src,
+                                          const __nv_bfloat16 *cos,
+                                          const __nv_bfloat16 *sin,
+                                          uint32_t tok, uint32_t sseq_cs,
+                                          uint32_t d0, float out[8]) {
+  __nv_bfloat16 x[8];
+  *(float4 *)(&x[0]) = *(const float4 *)src;
+  rope_bf16(x, cos, sin, tok, sseq_cs, d0, out);
+}
+
+// rope_pack with the per-head q/k RMSNorm in front (qwen-image-rs-qk-norm-fusion):
+// when `w` (the f32 norm weight, 128 channels) is set, the raw projection pack is
+// normalized across the token's 16-lane group exactly as the standalone
+// fused_rmsnorm_scale kernel does it (same f32 order, bf16-rounded), then
+// rotated — so the result is bit-identical to norm-then-rope and the normalized
+// q/k never round-trip through memory. ALL 16 lanes of the token's aligned
+// half-warp must call (the norm reduces over them); `w` is uniform per task.
+__device__ __forceinline__ void rope_norm_pack(const __nv_bfloat16 *src, const float *w,
+                                               float eps, const __nv_bfloat16 *cos,
+                                               const __nv_bfloat16 *sin, uint32_t tok,
+                                               uint32_t sseq_cs, uint32_t d0,
+                                               float out[8]) {
+  __nv_bfloat16 x[8];
+  *(float4 *)(&x[0]) = *(const float4 *)src;
+  if (w != nullptr) {
+    float v[8];
+#pragma unroll
+    for (uint32_t j = 0; j < 8; j++) v[j] = __bfloat162float(x[j]);
+    head_rmsnorm8(v, w + d0, eps, x);
+  }
+  rope_bf16(x, cos, sin, tok, sseq_cs, d0, out);
 }
 
 // grid (nchunk, H, B), block ROWS*TPT = 256. partial[(b*H+h)*nchunk + c][D] =
@@ -278,7 +309,8 @@ __global__ void Sage2VQuantKernel(const half *__restrict__ v,
 enum S2Kind : uint32_t { kS2Q = 0, kS2K = 1, kS2V = 2, kS2KSum = 3, kS2VAmax = 4 };
 
 // One quant task. Pointers are already offset to the view's first element (and
-// cos/sin to its first row). `nblk` = the scale layout's quant blocks per head
+// cos/sin to its first row). `w` (Q / K / K-sum only, else null): the per-head
+// RMSNorm weight (128 f32) to apply to the raw input first, with `eps`. `nblk` = the scale layout's quant blocks per head
 // (Q: ceil(n/128)*4 32-token blocks; K: ceil(n/64)); `ncta` = CTAs per head
 // (Q/K/V) or 0 (partials); `nblocks` = the task's share of the flat grid.
 struct S2Task {
@@ -288,9 +320,11 @@ struct S2Task {
   float *partial;
   void *out;
   float *scale;
+  const float *w;
   uint32_t kind, n, nchunk, nblk, ncta, nblocks;
   uint32_t sbz, sseq, sh, sseq_cs, lpad;
   float scale_max;
+  float eps;
 };
 
 constexpr uint32_t S2_MAX_TASKS = 6;
@@ -299,8 +333,8 @@ struct S2Tasks {
   uint32_t ntask, H, B;
 };
 // ABI with the #[repr(C)] mirrors in src/sage2.rs (which assert the same sizes).
-static_assert(sizeof(S2Task) == 96, "S2Task layout");
-static_assert(sizeof(S2Tasks) == 592, "S2Tasks layout");
+static_assert(sizeof(S2Task) == 112, "S2Task layout");
+static_assert(sizeof(S2Tasks) == 688, "S2Tasks layout");
 
 // 512-thread CTAs: up to three resident per SM, so one CTA's barrier stalls
 // overlap the others' loads (a 1024-thread CTA is alone on its SM).
@@ -339,10 +373,12 @@ __device__ __forceinline__ void s2_partial(const S2Task &T, uint32_t local, uint
     for (uint32_t t = c * CHUNK + row; t < end; t += ROWS) {
       if (is_k) {
         float y[8];
-        rope_pack((const __nv_bfloat16 *)T.in + (size_t)b * T.sbz + (size_t)h * T.sh +
-                      (size_t)t * T.sseq + d0,
-                  (const __nv_bfloat16 *)T.cos, (const __nv_bfloat16 *)T.sin, t, T.sseq_cs,
-                  d0, y);
+        // t is uniform across the row's 16 lanes (row = qt / TPT), as the
+        // in-group norm reduction needs.
+        rope_norm_pack((const __nv_bfloat16 *)T.in + (size_t)b * T.sbz + (size_t)h * T.sh +
+                           (size_t)t * T.sseq + d0,
+                       T.w, T.eps, (const __nv_bfloat16 *)T.cos,
+                       (const __nv_bfloat16 *)T.sin, t, T.sseq_cs, d0, y);
 #pragma unroll
         for (uint32_t j = 0; j < 8; j++) acc[j] += y[j];
       } else {
@@ -403,10 +439,11 @@ __device__ __forceinline__ void s2_quant_qk(const S2Task &T, uint32_t local, uin
   for (uint32_t i = 0; i < NT; i++) {
     const uint32_t row = row0 + i * S2_ROWS, tok = cx * blk_tok + row;
     if (tok < T.n) {
-      rope_pack((const __nv_bfloat16 *)T.in + (size_t)b * T.sbz + (size_t)h * T.sh +
-                    (size_t)tok * T.sseq + d0,
-                (const __nv_bfloat16 *)T.cos, (const __nv_bfloat16 *)T.sin, tok,
-                T.sseq_cs, d0, x[i]);
+      // tok < n is uniform across the token's 16 lanes (in-group norm).
+      rope_norm_pack((const __nv_bfloat16 *)T.in + (size_t)b * T.sbz + (size_t)h * T.sh +
+                         (size_t)tok * T.sseq + d0,
+                     T.w, T.eps, (const __nv_bfloat16 *)T.cos,
+                     (const __nv_bfloat16 *)T.sin, tok, T.sseq_cs, d0, x[i]);
       if constexpr (is_k) {
 #pragma unroll
         for (uint32_t j = 0; j < 8; j++) x[i][j] -= s_mean[d0 + j];
@@ -651,16 +688,21 @@ extern "C" int sage2_quant_layer_launch(const S2Tasks *tables, int ntables,
       const uint32_t heads = P.H * P.B;
       uint32_t want;
       switch (T.kind) {
-      case kS2KSum:
       case kS2VAmax:
+        if (T.w != nullptr) return (int)cudaErrorInvalidValue;
+        [[fallthrough]];
+      case kS2KSum:
         want = (T.nchunk * heads + S2_PART_PER_CTA - 1) / S2_PART_PER_CTA;
         break;
       case kS2Q:
         if (T.ncta != T.nblk) return (int)cudaErrorInvalidValue; // one warp block per CTA
         want = T.ncta * heads;
         break;
-      case kS2K:
-      case kS2V: want = T.ncta * heads; break;
+      case kS2K: want = T.ncta * heads; break;
+      case kS2V:
+        if (T.w != nullptr) return (int)cudaErrorInvalidValue; // no norm on V
+        want = T.ncta * heads;
+        break;
       default: return (int)cudaErrorInvalidValue;
       }
       if (T.nblocks != want) return (int)cudaErrorInvalidValue;

@@ -32,6 +32,17 @@ extern "C" {
         eps: f32,
         stream: *mut c_void,
     );
+    #[allow(clippy::too_many_arguments)]
+    fn fused_rmsnorm_scale_block_launch(
+        out: *mut c_void,
+        x: *const c_void,
+        w: *const c_void,
+        m: i32,
+        n: i32,
+        ld: std::ffi::c_long,
+        eps: f32,
+        stream: *mut c_void,
+    );
     fn fused_gated_residual_launch(
         out: *mut c_void,
         h: *const c_void,
@@ -147,6 +158,9 @@ pub fn self_test() -> Result<f32> {
 /// (Head) / `weight.to_dtype(F32) + 1` (ZeroCenter, baked at load) exactly.
 struct FusedRmsnormScale {
     eps: f32,
+    /// Always the CTA-per-row kernel (the bit-identity oracle for the N = 128
+    /// 16-lane kernel the launcher otherwise picks).
+    force_block: bool,
 }
 
 impl candle_core::CustomOp2 for FusedRmsnormScale {
@@ -197,8 +211,13 @@ impl candle_core::CustomOp2 for FusedRmsnormScale {
             let (wp, _b) = w.device_ptr(&stream);
             let (xp, wp) = (xp + xo, wp + wo);
             let (op, _c) = out.device_ptr(&stream);
+            let launch = if self.force_block {
+                fused_rmsnorm_scale_block_launch
+            } else {
+                fused_rmsnorm_scale_launch
+            };
             unsafe {
-                fused_rmsnorm_scale_launch(
+                launch(
                     op as *mut c_void,
                     xp as *const c_void,
                     wp as *const c_void,
@@ -220,13 +239,17 @@ impl candle_core::CustomOp2 for FusedRmsnormScale {
 /// viewed as `(M*H, 2*D)` and column-narrowed) is read in place; anything
 /// else is made contiguous first.
 pub fn fused_rmsnorm_scale(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
+    rmsnorm_scale_impl(x, w, eps, false)
+}
+
+fn rmsnorm_scale_impl(x: &Tensor, w: &Tensor, eps: f32, force_block: bool) -> Result<Tensor> {
     let x = if x.rank() == 2 && row_strided_2d(x.layout(), "x").is_ok() {
         x.clone()
     } else {
         x.contiguous()?
     };
     let w = w.contiguous()?;
-    Ok(x.apply_op2(&w, FusedRmsnormScale { eps })?)
+    Ok(x.apply_op2(&w, FusedRmsnormScale { eps, force_block })?)
 }
 
 /// Fused gated residual: `out = h + tanh(gate) * y`, elementwise. `h`, `gate`,
@@ -421,5 +444,56 @@ pub fn self_test_offset_views() -> Result<Vec<(&'static str, bool)>> {
             bits(&fused_gated_residual(&x, &g, &s)?)?
                 == bits(&fused_gated_residual(&xf, &gf, &sf)?)?,
         ),
+    ])
+}
+
+/// Bit-identity of the N = 128 16-lane RMSNorm kernel (`qwen-image-rs-qk-norm-fusion`)
+/// vs the CTA-per-row kernel it replaces for the per-head q/k norm: dense rows,
+/// both row-strided halves of a head-interleaved `(R, 256)` q|k matrix with a
+/// row offset, an odd row count (partial last CTA), and rows of extreme
+/// magnitude (tiny -> eps-dominated, huge, all-zero). Returns `(case, mismatches)`.
+pub fn self_test_rmsnorm128_bits() -> Result<Vec<(String, usize)>> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let bits = |t: &Tensor| -> Result<Vec<u16>> {
+        Ok(t.flatten_all()?
+            .to_vec1::<half::bf16>()?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect())
+    };
+    let cmp = |x: &Tensor, w: &Tensor| -> Result<usize> {
+        let a = bits(&rmsnorm_scale_impl(x, w, 1e-6, false)?)?;
+        let b = bits(&rmsnorm_scale_impl(x, w, 1e-6, true)?)?;
+        Ok(a.iter().zip(&b).filter(|(p, q)| p != q).count() + a.len().abs_diff(b.len()))
+    };
+    let w = Tensor::randn(1f32, 0.2f32, 128, &dev)?;
+    let rows = 4117 * 32 + 5; // a q/k call's rows + a partial last CTA
+    let dense = Tensor::randn(0f32, 1f32, (rows, 128), &dev)?.to_dtype(DType::BF16)?;
+    let qk = Tensor::randn(0f32, 3f32, (7 + 4117, 256), &dev)?
+        .to_dtype(DType::BF16)?
+        .narrow(0, 7, 4117)?;
+    // Per-row magnitudes spanning 1e-6 .. 1e6 (rsqrt near eps, large sums), plus zero rows.
+    let mag = Tensor::arange(0u32, 777, &dev)?
+        .to_dtype(DType::F32)?
+        .affine(24.0 / 776.0, -12.0)?
+        .exp()?
+        .reshape((777, 1))?;
+    let extreme = Tensor::randn(0f32, 1f32, (777, 128), &dev)?
+        .broadcast_mul(&mag)?
+        .to_dtype(DType::BF16)?;
+    let zeros = Tensor::zeros((33, 128), DType::BF16, &dev)?;
+    Ok(vec![
+        ("dense M=131749".into(), cmp(&dense, &w)?),
+        (
+            "row-strided q half (ld 256, row offset)".into(),
+            cmp(&qk.narrow(1, 0, 128)?, &w)?,
+        ),
+        (
+            "row-strided k half (ld 256, row offset)".into(),
+            cmp(&qk.narrow(1, 128, 128)?, &w)?,
+        ),
+        ("magnitudes e^-12..e^12".into(), cmp(&extreme, &w)?),
+        ("all-zero rows".into(), cmp(&zeros, &w)?),
     ])
 }

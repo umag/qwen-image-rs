@@ -1492,6 +1492,13 @@ fn sage_test() -> Result<()> {
                 r.fused_mismatches,
                 if r.fused_mismatches == 0 { "BIT-IDENTICAL" } else { "MISMATCH" }
             );
+            match r.norm_fused_mismatches {
+                Some(n) => println!(
+                    "sage2 q/k RMSNorm fused into the quant (raw head-interleaved q|k views) vs fused_rmsnorm_scale + quant (B=1,2 lanes, S-offset, txt=37/21, fp16+fp32 accum): payload/scale/output mismatches = {n} ({})",
+                    if n == 0 { "BIT-IDENTICAL" } else { "MISMATCH" }
+                ),
+                None => println!("sage2 q/k RMSNorm fusion check: skipped (needs fusednorm)"),
+            }
             r.ok()
         };
         #[cfg(not(feature = "sage2"))]
@@ -1552,6 +1559,19 @@ fn fusednorm_test() -> Result<()> {
             "fused gated residual vs candle: cosine = {cos:.6} ({})",
             if cos > 0.9999 { "OK" } else { "TOO LOW" }
         );
+        let mut bad = Vec::new();
+        for (case, diff) in qwen_image_rs::fusednorm::self_test_rmsnorm128_bits()? {
+            println!(
+                "RMSNorm N=128 16-lane vs CTA-per-row kernel, {case}: {diff} mismatches ({})",
+                if diff == 0 { "OK" } else { "FAIL" }
+            );
+            if diff != 0 {
+                bad.push(case);
+            }
+        }
+        if !bad.is_empty() {
+            anyhow::bail!("fusednorm: N=128 RMSNorm kernel not bit-identical: {bad:?}");
+        }
         report_offset_views(
             "fusednorm",
             qwen_image_rs::fusednorm::self_test_offset_views()?,

@@ -476,36 +476,16 @@ impl Attention {
     /// pre-RoPE, `(B,S,H,D)` bf16; v `(B,S,H,D)`, f16 when `v_f16` (the sage
     /// P·V operand, born f16 in the ConvRot epilogue) else bf16.
     fn project(&self, x: &Tensor, v_f16: bool) -> Result<(Tensor, Tensor, Tensor)> {
-        let (b, s, _) = x.dims3()?;
-        let shape = (b, s, HEADS, HEAD_DIM);
         match &self.qkv {
-            QkvProj::Separate { to_q, to_k, to_v } => {
-                let qh = self.norm_q.forward(&to_q.forward(x)?.reshape(shape)?)?;
-                let kh = self.norm_k.forward(&to_k.forward(x)?.reshape(shape)?)?;
-                #[cfg(feature = "sage")]
-                let v = if v_f16 {
-                    to_v.forward_f16(x)?
-                } else {
-                    to_v.forward(x)?
-                };
-                #[cfg(not(feature = "sage"))]
-                let v = {
-                    let _ = v_f16;
-                    to_v.forward(x)?
-                };
-                Ok((qh, kh, v.reshape(shape)?))
+            QkvProj::Separate { .. } => {
+                let (q, k, v) = self.project_raw(x, v_f16)?;
+                Ok((self.norm_q.forward(&q)?, self.norm_k.forward(&k)?, v))
             }
             #[cfg(feature = "convrot")]
             QkvProj::Merged { qk, v } => {
-                use crate::convrot::EpilogueOut;
-                let qa = qk.quantize(x)?;
-                let qk_out = qk.forward_quantized(&qa, EpilogueOut::Bf16)?; // (B,S,2*INNER)
-                let v_ty = if v_f16 {
-                    EpilogueOut::F16
-                } else {
-                    EpilogueOut::Bf16
-                };
-                let v = v.forward_quantized(&qa, v_ty)?.reshape(shape)?;
+                let (b, s, _) = x.dims3()?;
+                let shape = (b, s, HEADS, HEAD_DIM);
+                let (qk_out, v) = Self::merged_qk_v(qk, v, x, v_f16)?;
                 // Rows of [q_h | k_h]: q and k are ld = 2*HEAD_DIM column views.
                 let rows = qk_out.reshape((b * s * HEADS, 2 * HEAD_DIM))?;
                 let qh = self
@@ -518,6 +498,87 @@ impl Attention {
                     .reshape(shape)?;
                 Ok((qh, kh, v))
             }
+        }
+    }
+
+    /// [`Self::project`] WITHOUT the q/k RMSNorm: raw pre-RoPE q, k `(B,S,H,D)`
+    /// bf16 views (merged ConvRot: zero-copy column views of the head-interleaved
+    /// q|k output, strides `(S*2*INNER, 2*INNER, 2*HEAD_DIM, 1)`), v as in
+    /// `project`. For the SA2 quant, which applies the norm itself.
+    fn project_raw(&self, x: &Tensor, v_f16: bool) -> Result<(Tensor, Tensor, Tensor)> {
+        let (b, s, _) = x.dims3()?;
+        let shape = (b, s, HEADS, HEAD_DIM);
+        match &self.qkv {
+            QkvProj::Separate { to_q, to_k, to_v } => {
+                let q = to_q.forward(x)?.reshape(shape)?;
+                let k = to_k.forward(x)?.reshape(shape)?;
+                #[cfg(feature = "sage")]
+                let v = if v_f16 {
+                    to_v.forward_f16(x)?
+                } else {
+                    to_v.forward(x)?
+                };
+                #[cfg(not(feature = "sage"))]
+                let v = {
+                    let _ = v_f16;
+                    to_v.forward(x)?
+                };
+                Ok((q, k, v.reshape(shape)?))
+            }
+            #[cfg(feature = "convrot")]
+            QkvProj::Merged { qk, v } => {
+                let (qk_out, v) = Self::merged_qk_v(qk, v, x, v_f16)?;
+                let qk4 = qk_out.reshape((b, s, HEADS, 2 * HEAD_DIM))?;
+                Ok((
+                    qk4.narrow(3, 0, HEAD_DIM)?,
+                    qk4.narrow(3, HEAD_DIM, HEAD_DIM)?,
+                    v,
+                ))
+            }
+        }
+    }
+
+    /// Merged ConvRot projection: `x` quantized once; the head-interleaved q|k
+    /// GEMM `(B,S,2*INNER)` and v `(B,S,H,D)` (f16 when `v_f16`).
+    #[cfg(feature = "convrot")]
+    fn merged_qk_v(
+        qk: &crate::convrot::ConvRotLinear,
+        v: &crate::convrot::ConvRotLinear,
+        x: &Tensor,
+        v_f16: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        use crate::convrot::EpilogueOut;
+        let (b, s, _) = x.dims3()?;
+        let qa = qk.quantize(x)?;
+        let qk_out = qk.forward_quantized(&qa, EpilogueOut::Bf16)?; // (B,S,2*INNER)
+        let v_ty = if v_f16 {
+            EpilogueOut::F16
+        } else {
+            EpilogueOut::Bf16
+        };
+        let v = v
+            .forward_quantized(&qa, v_ty)?
+            .reshape((b, s, HEADS, HEAD_DIM))?;
+        Ok((qk_out, v))
+    }
+
+    /// Whether the q/k RMSNorm runs inside the attention quant instead of as
+    /// its own kernel (`qwen-image-rs-qk-norm-fusion`): SA2 selected, in a
+    /// `sage2` + `fusednorm` build (the fused norm is bit-identical to the
+    /// fusednorm kernel, not to the candle fallback). v1 / non-sage keep the
+    /// standalone norm.
+    #[cfg(feature = "sage")]
+    fn qk_norm_fused() -> Result<bool> {
+        #[cfg(all(feature = "sage2", feature = "fusednorm"))]
+        {
+            Ok(matches!(
+                crate::sage2::attention_impl()?,
+                crate::sage2::AttentionImpl::Sage2(_)
+            ))
+        }
+        #[cfg(not(all(feature = "sage2", feature = "fusednorm")))]
+        {
+            Ok(false)
         }
     }
 
@@ -541,8 +602,14 @@ impl Attention {
                           // sage INT8 quantizer (attend_bshd), so q/k are rotated and
                           // quantized in one pass — no separate rope kernel, no
                           // rotated-bf16 round trip, no transpose copies.
-            let (qh, kh, vv) = self.project(x, true)?; // (B,S,H,D), pre-rope; v f16
-            let out = self.attend_bshd(&qh, &kh, &vv, cos, sin, txt_len, scale)?; // (B,S,H,D)
+                          // SA2 (+fusednorm): q/k stay RAW; the quant applies the per-head norm.
+            let fused = Self::qk_norm_fused()?;
+            let (qh, kh, vv) = if fused {
+                self.project_raw(x, true)?
+            } else {
+                self.project(x, true)?
+            }; // (B,S,H,D), pre-rope; v f16
+            let out = self.attend_bshd(&qh, &kh, &vv, cos, sin, txt_len, scale, fused)?; // (B,S,H,D)
             self.to_out.forward(&out.reshape((b, s, INNER))?)
         };
         #[cfg(not(feature = "sage"))]
@@ -569,7 +636,9 @@ impl Attention {
     /// fused kernel on its own S-axis narrow (with the matching cos/sin rows), so
     /// the per-block scales start at that call's first token — exactly the
     /// alignment the attention kernel's per-block scale indexing expects (k is
-    /// quantized twice: text prefix and full, as before). Returns `(B,S,H,D)`.
+    /// quantized twice: text prefix and full, as before). `norm_fused`: `qh,kh`
+    /// are RAW projections and SA2's quant applies `norm_q`/`norm_k` itself
+    /// (only when [`Self::qk_norm_fused`]). Returns `(B,S,H,D)`.
     #[cfg(feature = "sage")]
     #[allow(clippy::too_many_arguments)]
     fn attend_bshd(
@@ -581,6 +650,7 @@ impl Attention {
         sin: &Tensor,
         txt_len: usize,
         scale: f64,
+        norm_fused: bool,
     ) -> Result<Tensor> {
         use crate::sage::{rope_quant_bshd, sage_attention_quantized, QkRole};
         let (_b, s, _h, _d) = qh.dims4()?;
@@ -593,7 +663,20 @@ impl Attention {
         // sage2 build: SageAttention2 unless QIR_SAGE=1 selects v1 (fallback / A/B).
         #[cfg(feature = "sage2")]
         if let crate::sage2::AttentionImpl::Sage2(accum) = crate::sage2::attention_impl()? {
-            return crate::sage2::attend_block_causal(qh, kh, vf, cos, sin, txt_len, sc, accum);
+            let norm = norm_fused.then_some(crate::sage2::QkNorm {
+                wq: &self.norm_q.weight,
+                wk: &self.norm_k.weight,
+                eps: self.norm_q.eps as f32,
+            });
+            if norm_fused && self.norm_k.eps != self.norm_q.eps {
+                anyhow::bail!("attend_bshd: fused q/k norm needs one eps for q and k");
+            }
+            return crate::sage2::attend_block_causal(
+                qh, kh, vf, cos, sin, txt_len, sc, accum, norm,
+            );
+        }
+        if norm_fused {
+            anyhow::bail!("attend_bshd: raw q/k reached the v1 path (norm not applied)");
         }
         let (ct, st) = (cos.narrow(0, 0, txt_len)?, sin.narrow(0, 0, txt_len)?);
         // text prefix: causal over [0, txt_len)
