@@ -97,7 +97,6 @@ impl candle_core::CustomOp2 for FusedNormMod {
                     sp as *const c_void,
                     m as i32,
                     n as i32,
-                    ld as std::ffi::c_long,
                     self.eps,
                     stream.cu_stream() as *mut c_void,
                 );
@@ -205,6 +204,7 @@ impl candle_core::CustomOp2 for FusedRmsnormScale {
                     wp as *const c_void,
                     m as i32,
                     n as i32,
+                    ld as std::ffi::c_long,
                     self.eps,
                     stream.cu_stream() as *mut c_void,
                 );
