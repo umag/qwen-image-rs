@@ -1584,6 +1584,32 @@ pub fn bench_gemm_plans(
     Ok(res)
 }
 
+/// Reference for `gemm-bench`: ms of the raw `int8_gemm_s32` (stock CUTLASS
+/// default epilogue, 128x128x64 3-stage, int32 out — twice the store bytes
+/// of the dequant GEMM, no scale math) at each `(M, N, K)`, min of 3 rounds.
+pub fn bench_raw_s32(shapes: &[(usize, usize, usize)], iters: usize) -> Result<Vec<f64>> {
+    use candle_core::Device;
+    let dev = Device::new_cuda(0)?;
+    let mut res = Vec::new();
+    for &(m, n, k) in shapes {
+        let a = Tensor::zeros((m, k), candle_core::DType::U8, &dev)?;
+        let b = Tensor::zeros((n, k), candle_core::DType::U8, &dev)?;
+        int8_gemm(&a, &b)?;
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            dev.synchronize()?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                int8_gemm(&a, &b)?;
+            }
+            dev.synchronize()?;
+            best = best.min(t0.elapsed().as_secs_f64() * 1e3 / iters as f64);
+        }
+        res.push(best);
+    }
+    Ok(res)
+}
+
 /// Merged projections vs the separate linears (`qwen-image-rs-gemm-merge-tune`),
 /// byte-for-byte, at M = 133 and M = 2 (the small-tile config): q and k out
 /// of the head-interleaved q|k GEMM (through the ld = 256 row views the DiT

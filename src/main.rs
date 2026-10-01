@@ -1242,7 +1242,7 @@ fn gemm_bench(iters: usize, batch: usize, txt: usize) -> Result<()> {
     #[cfg(feature = "convrot")]
     {
         use qwen_image_rs::convrot::{
-            bench_gemm_plans, gemm_plan, EpilogueOut, GemmPlan, GEMM_CONFIGS,
+            bench_gemm_plans, bench_raw_s32, gemm_plan, EpilogueOut, GemmPlan, GEMM_CONFIGS,
         };
         // M = B * (txt + 4096 image tokens at 1024²).
         let m = (4096 + txt) * batch;
@@ -1300,6 +1300,10 @@ fn gemm_bench(iters: usize, batch: usize, txt: usize) -> Result<()> {
                 );
                 all_same &= same;
             }
+        }
+        for ((m, n, k), ms) in shapes[..4].iter().zip(bench_raw_s32(&shapes[..4], iters)?) {
+            let flop = 2.0 * (m * n * k) as f64;
+            println!("raw-s32 128x128x64 s3 (stock epilogue, i32 out) M={m} N={n} K={k}: {ms:.4}ms/{:.0}T", flop / ms / 1e9);
         }
         anyhow::ensure!(all_same, "launch plans disagree (must be bit-identical)");
         Ok(())
