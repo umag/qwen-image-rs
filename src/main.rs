@@ -259,8 +259,13 @@ enum Command {
         weights: std::path::PathBuf,
         /// Output .safetensors file (drop it in a dir and point --model's
         /// transformer at that dir, or pass the dir to dit-forward --weights).
+        /// Omit it to (re)build this transformer's `--convrot` cache entry
+        /// instead (pre-warming the default load path).
         #[arg(long)]
-        out: std::path::PathBuf,
+        out: Option<std::path::PathBuf>,
+        /// Cache dir when --out is omitted (default as for --convrot).
+        #[arg(long)]
+        convrot_cache: Option<std::path::PathBuf>,
     },
     /// Decode a saved latent (.pt) through the VAE to an RGBA PNG (Phase 2).
     VaeDecode {
@@ -368,7 +373,11 @@ fn main() -> Result<()> {
             emit_latents,
         ),
         Command::PrequantizeText { weights, out } => prequantize_text(&weights, &out),
-        Command::PrequantizeConvrot { weights, out } => prequantize_convrot(&weights, &out),
+        Command::PrequantizeConvrot {
+            weights,
+            out,
+            convrot_cache,
+        } => prequantize_convrot(&weights, out.as_deref(), convrot_cache.as_deref()),
         Command::VaeDecode {
             weights,
             latent,
@@ -1468,10 +1477,30 @@ fn smoke(n: usize) -> Result<()> {
 /// the default `--convrot` cache (`convrot_cache`), written atomically. Each
 /// target `<prefix>.weight` (bf16) becomes `<prefix>.weight_i8` (rotated INT8,
 /// U8 bytes) + `<prefix>.col_scale` (f32); all other tensors are copied bf16.
-/// A dir holding this file is used as-is by `--convrot` (no cache).
-fn prequantize_convrot(weights: &std::path::Path, out: &std::path::Path) -> Result<()> {
+/// A dir holding this file is used as-is by `--convrot` (no cache). Without
+/// `out`, the file goes to `weights`' cache entry (what `--convrot` loads).
+fn prequantize_convrot(
+    weights: &std::path::Path,
+    out: Option<&std::path::Path>,
+    cache_dir: Option<&std::path::Path>,
+) -> Result<()> {
     use qwen_image_rs::convrot_cache as cc;
     let files = WeightSet::resolve(weights)?.files;
+    anyhow::ensure!(
+        !cc::files_hold_prequant(&files)?,
+        "{} is already prequantized (holds *.weight_i8)",
+        weights.display()
+    );
+    let out = match out {
+        Some(o) => o.to_path_buf(),
+        None => {
+            let root = cc::CacheSpec::from_cli(cache_dir, false, false)
+                .root
+                .context("no cache dir: pass --out or --convrot-cache (or set HOME)")?;
+            cc::entry_path(&root, weights)?
+        }
+    };
+    let out = out.as_path();
     let meta = std::collections::HashMap::from([
         (
             cc::META_POLICY.to_string(),

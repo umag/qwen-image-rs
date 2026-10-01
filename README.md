@@ -73,7 +73,8 @@ build: `--features convrot,sage,fusednorm,sage2`. Most accurate: drop `sage2`
 (dit-forward vs oracle 0.999944). The `sage2` (`convrot,sage,fusednorm,sage2`, dit-forward 0.999898 — FP8
 P·V; every DiT linear except img_in runs ConvRot INT8); in a `sage2` build `QIR_SAGE=1` selects SageAttention v1 (bit-identical to
 the build without `sage2`), `QIR_SAGE=2f32` SA2 with fp32 P·V accumulation.
-Resident batch ≈ 11 s/image.
+Resident batch ≈ 11 s/image. `--convrot` loads a cached prequantized DiT
+(built once on first use, ~26 s): DiT load 7.0 → 2.7 s cold, 2.1 → 1.1 s warm.
 
 See `docs/generate_standalone.png` and `docs/batch/` for samples.
 

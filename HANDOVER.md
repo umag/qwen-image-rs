@@ -113,8 +113,8 @@ impact/effort:
 4. ~~**Convrot the remaining ≥256-dim bf16 linears**~~ **NEGATIVE — not worth it**
    (`qwen-image-rs-convrot-tail-linears`): they are 0.13% of a step; see
    "Tail linears through ConvRot" below.
-5. Pre-quantized convrot DiT file already exists (`prequantize-convrot`) to cut
-   the ~14 s single-`generate` load; the residual is the 8 GB text-GGUF cold mmap.
+5. ~~Pre-quantized convrot DiT as default~~ **DONE** (`-prequant-default`: cached
+   file, DiT load cold 7.0 → 2.7 s); the residual is the 8 GB text-GGUF cold mmap.
 Re-profile after each: `nsys profile -o /tmp/p --trace=cuda <bin> generate ...
 --steps 10 ...` then `nsys stats --report cuda_gpu_kern_sum --format table
 /tmp/p.nsys-rep`. Diminishing returns — each remaining lever is substantial work
@@ -152,6 +152,37 @@ shared by handle clone. `--convrot` added to generate/batch/denoise/dit-forward.
   because flash's stable attention keeps the INT8-perturbed 40-step trajectory
   near the bf16 one. dit-forward cosine 0.999942 (unchanged). This is the
   recommended fast path.
+
+### Prequantized ConvRot DiT = the DEFAULT `--convrot` load (DONE — `qwen-image-rs-prequant-default`)
+`src/convrot_cache.rs`: every `--convrot` DiT load (generate, batch both paths,
+denoise, dit-forward) goes through `resolve_dit_files`, which returns the cache
+entry `<root>/<snapshot>-<fnv(canonical dir)>/transformer_convrot.safetensors`
+(root: `--convrot-cache` > `$QIR_CONVROT_CACHE` > `$XDG_CACHE_HOME/qwen-image-rs/convrot`
+> `~/.cache/qwen-image-rs/convrot`), building it first when missing/stale with
+the SAME builder as `prequantize-convrot` (`convrot_cache::build`, streams the
+bf16 sources via mmap, `ConvRotLinear::from_weight`, atomic tmp+fsync+rename).
+- **Validity** = safetensors `__metadata__` `qir.policy` == `dit::convrot_policy_tag()`
+  (`PREQUANT_FORMAT` + GROUP + BLOCK_LINEARS + TAIL_LINEARS with rot flags — bump
+  `PREQUANT_FORMAT` if `from_weight`'s math/layout changes) AND `qir.source` ==
+  FNV of (canonical dir, file names, sizes, mtimes) AND header-implied length ==
+  file length (torn-file check). Else rebuild in place. Any build failure (no CUDA,
+  read-only, ENOSPC) warns and falls back to on-load quant (same output).
+- Flags: `--no-convrot-cache` (old path), `--rebuild-convrot-cache`, `--convrot-cache DIR`.
+  A `--weights` dir already holding `*.weight_i8` is used as-is.
+  `prequantize-convrot --weights <transformer>` without `--out` pre-warms the
+  cache entry (`scripts/convert.sh` does that).
+- **Bit-identical:** dit-forward --convrot on build-run, cache hit, rebuild,
+  `--no-convrot-cache` and an explicit `--out` file: `cmp`-identical to the
+  prior build; no-convrot identical; B=1 and `--batch 2` PNGs identical to the
+  prior build, B=1 == lane 0.
+- **Load (dit-forward --convrot, same session, `drop_caches` for cold):**
+  cold 7.00 → **2.73 s**, warm 2.08 → **1.12 s**. One-time build 25.9 s,
+  entry 7.12 GB. nsys 10-step generate: `uabs_bf16` and `quantize_rows_i8_k`
+  gone, `fast_max_bf16` 240 → 9 (the rest are not weight quant). Denoise flat
+  (0.2122 vs 0.2126 s/step, noise).
+- Not byte-reproducible FILES: the header's `__metadata__` is a HashMap (safetensors
+  serializes it in hash order), so two builds can differ in header bytes; the
+  tensor data are identical (outputs above are).
 
 ### Pre-quantized convrot weights (commit adds `prequantize-convrot`)
 `prequantize-convrot --weights <transformer> --out <file.safetensors>` rotates+
@@ -830,7 +861,8 @@ Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-rope-quant-fusion` (RoPE fused into the sage INT8 Q/K quantizer),
 `-bf16-v-pv` (V born f16 in the ConvRot epilogue + sage partial-tile zero-fill),
 `-sageattention2` (SA2 sm89 behind `sage2` + `QIR_SAGE`),
-`-sage2-quant-fusion` (SA2 quant: 10 launches/layer → 3, bit-identical, −1.5%).
+`-sage2-quant-fusion` (SA2 quant: 10 launches/layer → 3, bit-identical, −1.5%),
+`-prequant-default` (cached prequantized DiT = default `--convrot` load; load 7.0 → 2.7 s cold).
 Bugs (complete): `-b1-off-prompt` (B=1 generate ignored the prompt: fused bridges
 ignored the view offset — see Gotchas).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path

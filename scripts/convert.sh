@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Convert Qwen-Image-2.1 weights to the quantized formats qwen-image-rs uses.
 # Run on the CUDA host after building:
-#   cargo build --release --features convrot,sage,fusednorm   (CUTLASS_DIR set)
+#   cargo build --release --features convrot,sage,fusednorm,sage2   (CUTLASS_DIR set)
 #
 #   scripts/convert.sh <snapshot-dir> [out-dir]
 #
-# Produces, in <out-dir> (default <snapshot>/qir):
-#   qir-text.gguf                  Q8_0 text encoder      -> --text-gguf
-#   transformer_convrot.safetensors  ConvRot INT8 DiT     -> --convrot (auto-detected)
+# Produces:
+#   <out-dir>/qir-text.gguf   Q8_0 text encoder (default out-dir <snapshot>/qir) -> --text-gguf
+#   the --convrot cache entry for <snapshot>/transformer (ConvRot INT8 DiT):
+#     $QIR_CONVROT_CACHE or ~/.cache/qwen-image-rs/convrot/<snapshot>-<hash>/
+#   --convrot builds that entry by itself on first use; this just pre-warms it.
 #
 # `prequantize-convrot` needs CUDA; `prequantize-text` runs on CPU too.
 # Override the binary path with QIR_BIN (default: target/release/qwen-image-rs).
@@ -24,9 +26,9 @@ mkdir -p "$OUT"
 echo "== text encoder -> Q8_0 GGUF =="
 "$BIN" prequantize-text --weights "$SNAP/text_encoder" --out "$OUT/qir-text.gguf"
 
-echo "== DiT -> ConvRot INT8 =="
-"$BIN" prequantize-convrot --weights "$SNAP/transformer" --out "$OUT/transformer_convrot.safetensors"
+echo "== DiT -> ConvRot INT8 (pre-warm the --convrot cache) =="
+"$BIN" prequantize-convrot --weights "$SNAP/transformer"
 
 echo "converted -> $OUT"
 echo "  --text-gguf $OUT/qir-text.gguf"
-echo "  --convrot   (auto-detects $OUT/transformer_convrot.safetensors)"
+echo "  --convrot   (loads the cached prequantized DiT)"
