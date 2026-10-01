@@ -24,6 +24,7 @@
 #include <cutlass/epilogue/threadblock/fusion/visitors.hpp>
 #include <cutlass/gemm/kernel/default_gemm_universal_with_visitor.h>
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/gemm/threadblock/threadblock_swizzle_streamk.h>
 
 // ---------------------------------------------------------------------------
 // Raw INT8 GEMM: C(int32) = A(int8, M×K row-major) @ B(int8, N×K row-major =
@@ -92,13 +93,16 @@ constexpr int AlignmentC = 8;   // 128-bit / 16-bit (bf16 | f16) store (all conv
 // Swizzle = GemmIdentityThreadblockSwizzle<Swizzle>: CTAs are rastered in
 // groups of up to Swizzle N-tiles so a wave reuses A (and B) tiles from L2
 // instead of streaming all of A once per N-column wave.
-template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages, int Swizzle>
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages, class Swizzle>
 struct TileCfg {
   using ThreadblockShape = cutlass::gemm::GemmShape<TBM, TBN, TBK>;
   using WarpShape = cutlass::gemm::GemmShape<WM, WN, WK>;
   static constexpr int NumStages = Stages;
-  using Swz = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<Swizzle>;
+  using Swz = Swizzle;
 };
+template <int N>
+using Raster = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<N>;
+using StreamK = cutlass::gemm::threadblock::ThreadblockSwizzleStreamK;
 
 // Everything downstream of the output element is templated on it (bf16 | f16)
 // and on the tile config; ElementC doubles as the notional C/D element the
@@ -160,6 +164,30 @@ struct Evt {
 };
 }  // namespace convrot_evt
 
+// One process-lifetime device workspace shared by every launch (stream-K
+// partials + barrier flags; the data-parallel configs need none). Launches are
+// stream-ordered, so reuse is safe; it only grows (the old buffer is freed
+// after the stream drains). The barrier part is re-zeroed by CUTLASS
+// (cudaMemsetAsync in init_workspace) on every launch. 0 = ok, -1 = alloc fail.
+static int workspace_for(size_t bytes, cudaStream_t stream, void** out) {
+  static void* ws = nullptr;
+  static size_t ws_bytes = 0;
+  *out = nullptr;
+  if (bytes == 0) return 0;
+  if (bytes > ws_bytes) {
+    if (ws) {
+      if (cudaStreamSynchronize(stream) != cudaSuccess) return -1;
+      cudaFree(ws);
+      ws = nullptr;
+      ws_bytes = 0;
+    }
+    if (cudaMalloc(&ws, bytes) != cudaSuccess) return -1;
+    ws_bytes = bytes;
+  }
+  *out = ws;
+  return 0;
+}
+
 // D(out, M×N row-major) = out( acc · s_row[m] · s_col[n] ), out = bf16 | f16.
 // a int8 M×K
 // row-major; b int8 N×K row-major (== K×N col-major). s_row length M, s_col
@@ -214,26 +242,28 @@ static int int8_gemm_dequant_impl(
   cutlass::Status s = gemm.can_implement(args);
   if (s != cutlass::Status::kSuccess) return static_cast<int>(s);
 
-  size_t workspace_size = DeviceGemm::get_workspace_size(args);
   void* workspace = nullptr;
-  if (workspace_size > 0) {
-    if (cudaMalloc(&workspace, workspace_size) != cudaSuccess) return -1;
-  }
+  if (workspace_for(DeviceGemm::get_workspace_size(args), stream, &workspace) != 0) return -1;
 
   s = gemm.initialize(args, workspace, stream);
   if (s == cutlass::Status::kSuccess) s = gemm(stream);
-
-  if (workspace) cudaFree(workspace);
   return s == cutlass::Status::kSuccess ? 0 : static_cast<int>(s);
 }
 
 // The tile configs, by index (TB MxNxK / warp MxNxK / stages / swizzle).
 // Keep in sync with `gemm_tiles::GEMM_CONFIGS` (selection: `gemm_config`).
-using Cfg0 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, 1>;
-using Cfg1 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, 4>;
-using Cfg2 = convrot_evt::TileCfg<64, 128, 64, 32, 64, 64, 4, 1>;
-using Cfg3 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, 4>;
-static constexpr int kNumCfgs = 4;
+using convrot_evt::Raster;
+using convrot_evt::StreamK;
+using Cfg0 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, Raster<1>>;
+using Cfg1 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, Raster<4>>;
+using Cfg2 = convrot_evt::TileCfg<64, 128, 64, 32, 64, 64, 4, Raster<1>>;
+using Cfg3 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, Raster<4>>;
+// SPIKE (gemm-tiling-push): stream-K and alternates
+using Cfg4 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, StreamK>;
+using Cfg5 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, StreamK>;
+using Cfg6 = convrot_evt::TileCfg<256, 128, 64, 64, 64, 64, 3, Raster<1>>;
+using Cfg7 = convrot_evt::TileCfg<64, 64, 64, 32, 32, 64, 6, Raster<1>>;
+static constexpr int kNumCfgs = 8;
 
 template <typename ElementOutput>
 static int int8_gemm_dequant_dispatch(
@@ -242,7 +272,7 @@ static int int8_gemm_dequant_dispatch(
 #define QIR_CFG(i) \
   case i: return int8_gemm_dequant_impl<ElementOutput, Cfg##i>(d, a, b, s_row, s_col, m, n, k, stream);
   switch (cfg) {
-    QIR_CFG(0) QIR_CFG(1) QIR_CFG(2) QIR_CFG(3)
+    QIR_CFG(0) QIR_CFG(1) QIR_CFG(2) QIR_CFG(3) QIR_CFG(4) QIR_CFG(5) QIR_CFG(6) QIR_CFG(7)
   }
 #undef QIR_CFG
   return -2;  // unknown config

@@ -39,7 +39,7 @@ extern "C" {
     ) -> i32;
 }
 
-pub use crate::gemm_tiles::{gemm_config, TileConfig, GEMM_CONFIGS};
+pub use crate::gemm_tiles::{gemm_config, gemm_plan, GemmPlan, Raster, TileConfig, GEMM_CONFIGS};
 
 struct Int8Gemm;
 
@@ -503,13 +503,13 @@ pub enum EpilogueOut {
 /// (the bf16 store alignment requires it anyway).
 struct Int8GemmDequant {
     out: EpilogueOut,
-    /// Tile config index (`GEMM_CONFIGS`); `None` = `gemm_config(M, N, K)`.
-    cfg: Option<u8>,
+    /// Launch plan (`GEMM_CONFIGS` indices); `None` = `gemm_plan(M, N, K)`.
+    plan: Option<GemmPlan>,
 }
 
 impl Int8GemmDequant {
     fn auto(out: EpilogueOut) -> Self {
-        Self { out, cfg: None }
+        Self { out, plan: None }
     }
 }
 impl candle_core::CustomOp3 for Int8GemmDequant {
@@ -576,22 +576,39 @@ impl candle_core::CustomOp3 for Int8GemmDequant {
         let s_row = unsafe { s_col.add(n) };
         let (a_i8, b_i8) = (ap as *const i8, bp as *const i8);
         let cu = stream.cu_stream() as *mut std::ffi::c_void;
-        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
-        let cfg = self.cfg.unwrap_or_else(|| gemm_config(m, n, k));
-        if cfg as usize >= GEMM_CONFIGS.len() {
-            candle_core::bail!("int8-gemm-dequant: unknown tile config {cfg}");
+        let plan = self.plan.unwrap_or_else(|| gemm_plan(m, n, k));
+        let segments = plan.segments(m);
+        for &(_, _, cfg) in &segments {
+            if cfg as usize >= GEMM_CONFIGS.len() {
+                candle_core::bail!("int8-gemm-dequant: unknown tile config {cfg}");
+            }
         }
+        let esz = std::mem::size_of::<u16>(); // bf16 | f16
+                                              // Each segment is rows r0..r0+rows of A, s_row and D (all row-major):
+                                              // plain pointer offsets, the same per-element math.
         let launch = |d: *mut std::ffi::c_void, kind: i32| -> candle_core::Result<()> {
-            let rc = unsafe {
-                int8_gemm_dequant_cfg_launch(
-                    kind, cfg as i32, d, a_i8, b_i8, s_row, s_col, mi, ni, ki, cu,
-                )
-            };
-            if rc != 0 {
-                candle_core::bail!(
-                    "int8_gemm_dequant (out {:?}, cfg {cfg}, M={m} N={n} K={k}) failed, rc={rc}",
-                    self.out
-                );
+            for &(r0, rows, cfg) in &segments {
+                let rc = unsafe {
+                    int8_gemm_dequant_cfg_launch(
+                        kind,
+                        cfg as i32,
+                        (d as *mut u8).add(r0 * n * esz) as *mut std::ffi::c_void,
+                        a_i8.add(r0 * k),
+                        b_i8,
+                        s_row.add(r0),
+                        s_col,
+                        rows as i32,
+                        n as i32,
+                        k as i32,
+                        cu,
+                    )
+                };
+                if rc != 0 {
+                    candle_core::bail!(
+                        "int8_gemm_dequant (out {:?}, cfg {cfg}, rows {r0}+{rows} of M={m} N={n} K={k}) failed, rc={rc}",
+                        self.out
+                    );
+                }
             }
             Ok(())
         };
@@ -1479,13 +1496,16 @@ pub fn bench_swiglu_quant(iters: usize) -> Result<(f64, f64)> {
     Ok((fused, unfused))
 }
 
-/// Time one fused INT8 GEMM + dequant per tile config at each `(M, N, K)`,
-/// and check every config's output is bit-identical to config 0. Returns
-/// `(m, n, k, per-config ms or None when the config cannot run the shape,
+/// Time one fused INT8 GEMM + dequant per launch plan at each `(M, N, K)`,
+/// and check every plan's output is bit-identical to the first plan's.
+/// Plans are interleaved over 3 rounds and the minimum kept, so clock /
+/// power drift during a long sweep does not favour one plan. Returns
+/// `(m, n, k, per-plan ms or None when a config cannot run the shape,
 /// all_identical)`.
 #[allow(clippy::type_complexity)]
-pub fn bench_gemm_configs(
+pub fn bench_gemm_plans(
     shapes: &[(usize, usize, usize)],
+    plans: &[GemmPlan],
     out: EpilogueOut,
     iters: usize,
 ) -> Result<Vec<(usize, usize, usize, Vec<Option<f64>>, bool)>> {
@@ -1515,17 +1535,14 @@ pub fn bench_gemm_configs(
                     .collect(),
             })
         };
-        // Configs are interleaved over ROUNDS rounds and the minimum kept, so
-        // clock / power drift during a long sweep does not favour one config.
         const ROUNDS: usize = 3;
-        let ncfg = GEMM_CONFIGS.len();
-        let mut times: Vec<Option<f64>> = vec![None; ncfg];
-        let mut runs = vec![true; ncfg];
+        let mut times: Vec<Option<f64>> = vec![None; plans.len()];
+        let mut runs = vec![true; plans.len()];
         let mut reference: Option<Vec<u16>> = None;
         let mut same = true;
         for round in 0..ROUNDS {
-            for cfg in 0..ncfg {
-                if !runs[cfg] {
+            for (pi, &plan) in plans.iter().enumerate() {
+                if !runs[pi] {
                     continue;
                 }
                 let op = || {
@@ -1534,14 +1551,14 @@ pub fn bench_gemm_configs(
                         &sc,
                         Int8GemmDequant {
                             out,
-                            cfg: Some(cfg as u8),
+                            plan: Some(plan),
                         },
                     )
                 };
                 let first = match op() {
                     Ok(t) => t,
                     Err(_) => {
-                        runs[cfg] = false;
+                        runs[pi] = false;
                         continue;
                     }
                 };
@@ -1559,7 +1576,7 @@ pub fn bench_gemm_configs(
                 }
                 dev.synchronize()?;
                 let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
-                times[cfg] = Some(times[cfg].map_or(ms, |t: f64| t.min(ms)));
+                times[pi] = Some(times[pi].map_or(ms, |t: f64| t.min(ms)));
             }
         }
         res.push((m, n, k, times, same));

@@ -60,9 +60,12 @@ enum Command {
         /// Timed launches per (shape, config).
         #[arg(long, default_value_t = 30)]
         iters: usize,
-        /// Batch size B (M = B * 4117 for the image-sequence shapes).
+        /// Batch size B (M = B * (txt + 4096) for the image-sequence shapes).
         #[arg(long, default_value_t = 1)]
         batch: usize,
+        /// Text tokens per lane (the prompt length after the system prefix).
+        #[arg(long, default_value_t = 21)]
+        txt: usize,
     },
     /// Self-test the SageAttention INT8-QK/FP16-PV kernel vs an f32 reference.
     SageTest,
@@ -320,7 +323,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Smoke { n } => smoke(n),
         Command::ConvrotTest => convrot_test(),
-        Command::GemmBench { iters, batch } => gemm_bench(iters, batch),
+        Command::GemmBench { iters, batch, txt } => gemm_bench(iters, batch, txt),
         Command::SageTest => sage_test(),
         Command::FusednormTest => fusednorm_test(),
         Command::CudnnTest => cudnn_test(),
@@ -1234,16 +1237,18 @@ fn vae_decode(
     Ok(())
 }
 
-/// `gemm-bench`: ms per tile config for each DiT INT8 GEMM shape.
-fn gemm_bench(iters: usize, batch: usize) -> Result<()> {
+/// `gemm-bench`: ms per launch plan for each DiT INT8 GEMM shape.
+fn gemm_bench(iters: usize, batch: usize, txt: usize) -> Result<()> {
     #[cfg(feature = "convrot")]
     {
-        use qwen_image_rs::convrot::{bench_gemm_configs, gemm_config, EpilogueOut, GEMM_CONFIGS};
-        let m = 4117 * batch;
+        use qwen_image_rs::convrot::{
+            bench_gemm_plans, gemm_plan, EpilogueOut, GemmPlan, GEMM_CONFIGS,
+        };
+        // M = B * (txt + 4096 image tokens at 1024²).
+        let m = (4096 + txt) * batch;
         let shapes = [
-            (m, 4096, 4096),  // to_q / to_k / to_out
+            (m, 4096, 4096),  // to_v / to_out
             (m, 8192, 4096),  // merged q|k
-            (m, 12288, 4096), // gate / proj (or merged q|k|v)
             (m, 24576, 4096), // merged gate|proj
             (m, 4096, 12288), // mlp out
             (m, 64, 4096),    // proj_out
@@ -1252,39 +1257,56 @@ fn gemm_bench(iters: usize, batch: usize) -> Result<()> {
         ];
         for (i, c) in GEMM_CONFIGS.iter().enumerate() {
             println!(
-                "cfg {i}: TB {:?} warp {:?} stages {} swizzle {}",
-                c.tb, c.warp, c.stages, c.swizzle
+                "cfg {i}: TB {:?} warp {:?} stages {} raster {:?}",
+                c.tb, c.warp, c.stages, c.raster
             );
         }
+        // Every compiled config alone, then each data-parallel main config
+        // with its partial last M-tile split off to the small configs.
+        let mut plans: Vec<GemmPlan> = (0..GEMM_CONFIGS.len() as u8)
+            .map(GemmPlan::single)
+            .collect();
+        for main in [0u8, 1, 3, 6] {
+            for tail in [2u8, 7] {
+                plans.push(GemmPlan {
+                    main,
+                    tail: Some(tail),
+                });
+            }
+        }
+        let label = |p: &GemmPlan| match p.tail {
+            None => format!("{}", p.main),
+            Some(t) => format!("{}+{t}", p.main),
+        };
         let mut all_same = true;
         for (out, list) in [
             (EpilogueOut::Bf16, &shapes[..]),
             (EpilogueOut::F16, &shapes[..1]),
         ] {
-            for (m, n, k, times, same) in bench_gemm_configs(list, out, iters)? {
+            for (m, n, k, times, same) in bench_gemm_plans(list, &plans, out, iters)? {
                 let flop = 2.0 * (m * n * k) as f64;
                 let cells: Vec<String> = times
                     .iter()
-                    .enumerate()
-                    .map(|(i, t)| match t {
-                        Some(ms) => format!("{i}:{ms:.4}ms/{:.0}T", flop / ms / 1e9),
-                        None => format!("{i}:n/a"),
+                    .zip(&plans)
+                    .map(|(t, p)| match t {
+                        Some(ms) => format!("{}:{ms:.4}ms/{:.0}T", label(p), flop / ms / 1e9),
+                        None => format!("{}:n/a", label(p)),
                     })
                     .collect();
                 println!(
-                    "{out:?} M={m} N={n} K={k} [selected cfg {}] {} bit-identical={same}",
-                    gemm_config(m, n, k),
+                    "{out:?} M={m} N={n} K={k} [selected {}] {} bit-identical={same}",
+                    label(&gemm_plan(m, n, k)),
                     cells.join(" ")
                 );
                 all_same &= same;
             }
         }
-        anyhow::ensure!(all_same, "tile configs disagree (must be bit-identical)");
+        anyhow::ensure!(all_same, "launch plans disagree (must be bit-identical)");
         Ok(())
     }
     #[cfg(not(feature = "convrot"))]
     {
-        let _ = (iters, batch);
+        let _ = (iters, batch, txt);
         anyhow::bail!("build with --features convrot (needs CUTLASS_DIR)")
     }
 }
