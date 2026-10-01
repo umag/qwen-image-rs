@@ -7,7 +7,7 @@ use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{CpuStorage, CudaStorage, Layout, Shape, Tensor};
 
-use crate::layout::dense_byte_offset;
+use crate::layout::{dense_byte_offset, row_strided_2d};
 use crate::Result;
 
 extern "C" {
@@ -141,6 +141,20 @@ extern "C" {
     fn rotate_quantize_rows_launch(
         out: *mut u8,
         x: *const std::ffi::c_void,
+        row_scale: *mut f32,
+        m: i32,
+        k: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+    // Fused SwiGLU (silu(g) * p in f32) + rotation + per-row INT8 quantize;
+    // g/p rows `ld_g`/`ld_p` elements apart. Same return codes.
+    #[allow(clippy::too_many_arguments)]
+    fn swiglu_rotate_quantize_rows_launch(
+        out: *mut u8,
+        g: *const std::ffi::c_void,
+        ld_g: std::ffi::c_long,
+        p: *const std::ffi::c_void,
+        ld_p: std::ffi::c_long,
         row_scale: *mut f32,
         m: i32,
         k: i32,
@@ -338,6 +352,124 @@ fn rotate_quantize_rows_fused(x: &Tensor) -> Result<(Tensor, Tensor)> {
     }
     let row_scale = Tensor::zeros(m, candle_core::DType::F32, x.device())?;
     let x_i8 = x.apply_op2(&row_scale, RotateQuantizeFused)?;
+    Ok((x_i8, row_scale))
+}
+
+/// Fused SwiGLU + rotate + quantize (`qwen-image-rs-fused-swiglu`): `g, p
+/// (M,K) bf16` -> rotated int8 of `h = silu(g) * p` (`u8 (M,K)`, dense), with
+/// the per-row scale written IN PLACE into the pre-allocated `row_scale (M,)
+/// f32` third input (the `QuantizeFused` contract). `g` and `p` may be
+/// row-strided views (unit inner stride, `ld >= K`, see
+/// [`row_strided_2d`]) — two tensors or the column halves of one `(M, 2K)`
+/// merged GEMM output — so the product `h` is never materialized.
+struct SwiGluRotateQuantize;
+impl candle_core::CustomOp3 for SwiGluRotateQuantize {
+    fn name(&self) -> &'static str {
+        "swiglu-rotate-quantize-rows"
+    }
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda-only")
+    }
+    fn cuda_fwd(
+        &self,
+        g: &CudaStorage,
+        g_l: &Layout,
+        p: &CudaStorage,
+        p_l: &Layout,
+        rs: &CudaStorage,
+        rs_l: &Layout,
+    ) -> candle_core::Result<(CudaStorage, Shape)> {
+        let dev = g.device().clone();
+        let (m, k) = g_l.shape().dims2()?;
+        if p_l.shape().dims2()? != (m, k) {
+            candle_core::bail!(
+                "swiglu-rotate-quantize: g {:?} and p {:?} differ in shape",
+                g_l.shape(),
+                p_l.shape()
+            );
+        }
+        if k == 0 || !k.is_multiple_of(crate::model::rotation::GROUP) || k > ROTATE_QUANT_MAX_K {
+            candle_core::bail!(
+                "swiglu-rotate-quantize: K={k} must be a positive multiple of 256 and <= {ROTATE_QUANT_MAX_K}"
+            );
+        }
+        if rs_l.shape().dims1()? != m {
+            candle_core::bail!("swiglu-rotate-quantize: row_scale len != M={m}");
+        }
+        let (go, ld_g) = row_strided_2d(g_l, "swiglu-rotate-quantize g")?;
+        let (po, ld_p) = row_strided_2d(p_l, "swiglu-rotate-quantize p")?;
+        if !ld_g.is_multiple_of(8) || !ld_p.is_multiple_of(8) {
+            candle_core::bail!(
+                "swiglu-rotate-quantize: row strides ld_g={ld_g}, ld_p={ld_p} must be multiples of 8 (16-B rows)"
+            );
+        }
+        let ro = dense_byte_offset::<f32>(rs_l, "swiglu-rotate-quantize row_scale")?;
+        let g = g.as_cuda_slice::<half::bf16>()?;
+        let p = p.as_cuda_slice::<half::bf16>()?;
+        let rs = rs.as_cuda_slice::<f32>()?; // pre-allocated (m,), written in place
+        let stream = dev.cuda_stream();
+        let out = unsafe { dev.alloc::<u8>(m * k)? };
+        {
+            let (gp, _a) = g.device_ptr(&stream);
+            let (pp, _b) = p.device_ptr(&stream);
+            let (rp, _c) = rs.device_ptr(&stream);
+            let (op, _d) = out.device_ptr(&stream);
+            let (gp, pp, rp) = (gp + 2 * go as u64, pp + 2 * po as u64, rp + ro);
+            if !gp.is_multiple_of(16) || !pp.is_multiple_of(16) {
+                candle_core::bail!(
+                    "swiglu-rotate-quantize: g/p views not 16-B aligned (g {gp:#x}, p {pp:#x})"
+                );
+            }
+            let rc = unsafe {
+                swiglu_rotate_quantize_rows_launch(
+                    op as *mut u8,
+                    gp as *const std::ffi::c_void,
+                    ld_g as std::ffi::c_long,
+                    pp as *const std::ffi::c_void,
+                    ld_p as std::ffi::c_long,
+                    rp as *mut f32,
+                    m as i32,
+                    k as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                )
+            };
+            if rc != 0 {
+                candle_core::bail!(
+                    "swiglu_rotate_quantize_rows_launch failed rc={rc} (M={m}, K={k}, ld_g={ld_g}, ld_p={ld_p})"
+                );
+            }
+        }
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), (m, k).into()))
+    }
+}
+
+/// Fused SwiGLU + rotate + quantize: `g, p (M,K) bf16` (row-strided views
+/// allowed) -> (`rotated int8 of silu(g)*p (M,K) u8`, `row_scale (M,) f32`).
+fn swiglu_rotate_quantize_rows_fused(g: &Tensor, p: &Tensor) -> Result<(Tensor, Tensor)> {
+    let (m, k) = g.dims2()?;
+    anyhow::ensure!(
+        p.dims2()? == (m, k),
+        "swiglu-rotate-quantize: g {:?} vs p {:?}",
+        g.dims(),
+        p.dims()
+    );
+    if m == 0 {
+        let dev = g.device();
+        return Ok((
+            Tensor::zeros((0, k), candle_core::DType::U8, dev)?,
+            Tensor::zeros(0, candle_core::DType::F32, dev)?,
+        ));
+    }
+    let row_scale = Tensor::zeros(m, candle_core::DType::F32, g.device())?;
+    let x_i8 = g.apply_op3(p, &row_scale, SwiGluRotateQuantize)?;
     Ok((x_i8, row_scale))
 }
 
@@ -544,8 +676,34 @@ impl ConvRotLinear {
         })
     }
 
-    /// Shared tail of both forwards: `quant` maps the `(M,K)` bf16 activation
-    /// to (rotated int8, row scale); then the fused INT8 GEMM + dequant.
+    /// SwiGLU input: `self` is the MLP out linear and its input is
+    /// `h = silu(g) * p`, with `g, p (..., K)` bf16 the gate and proj outputs.
+    /// One kernel computes h in f32, rotates and quantizes it, so h is never
+    /// stored; then the usual INT8 GEMM + dequant. 2-D `g`/`p` may be
+    /// row-strided views (the column halves of a merged `(M, 2K)` gate|proj
+    /// output) and are read in place; higher-rank inputs are flattened with
+    /// `reshape` (free for contiguous tensors).
+    pub fn forward_swiglu(&self, g: &Tensor, p: &Tensor, out_ty: EpilogueOut) -> Result<Tensor> {
+        anyhow::ensure!(
+            g.dims() == p.dims(),
+            "forward_swiglu: gate {:?} vs proj {:?}",
+            g.dims(),
+            p.dims()
+        );
+        let dims = g.dims().to_vec();
+        let k = *dims.last().unwrap();
+        let m: usize = dims[..dims.len() - 1].iter().product();
+        let (g2, p2) = if dims.len() == 2 {
+            (g.clone(), p.clone())
+        } else {
+            (g.reshape((m, k))?, p.reshape((m, k))?)
+        };
+        let (x_i8, row_scale) = swiglu_rotate_quantize_rows_fused(&g2, &p2)?;
+        self.gemm_dequant(&dims[..dims.len() - 1], &x_i8, &row_scale, out_ty)
+    }
+
+    /// Shared head of the plain forwards: `quant` maps the `(M,K)` bf16
+    /// activation to (rotated int8, row scale); then [`Self::gemm_dequant`].
     fn forward_with(
         &self,
         x: &Tensor,
@@ -557,15 +715,27 @@ impl ConvRotLinear {
         let m: usize = dims[..dims.len() - 1].iter().product();
         let x2 = x.reshape((m, k))?;
         let (x_i8, row_scale) = quant(&x2)?;
+        self.gemm_dequant(&dims[..dims.len() - 1], &x_i8, &row_scale, out_ty)
+    }
+
+    /// Fused INT8 GEMM + dequant of a quantized `(M,K)` activation, reshaped
+    /// to `(lead..., N)`.
+    fn gemm_dequant(
+        &self,
+        lead: &[usize],
+        x_i8: &Tensor,
+        row_scale: &Tensor,
+        out_ty: EpilogueOut,
+    ) -> Result<Tensor> {
         let n = self.col_scale.dim(0)?;
         // Pack the two scale vectors into one tensor (candle has no CustomOp4):
         // scales[0..N] = s_col, scales[N..N+M] = s_row. col first so the
         // vectorized RowBroadcast load of s_col starts at the aligned base.
-        let scales = Tensor::cat(&[&self.col_scale, &row_scale], 0)?; // (N+M,) f32
+        let scales = Tensor::cat(&[&self.col_scale, row_scale], 0)?; // (N+M,) f32
 
         // Fused INT8 GEMM + per-row/per-col dequant epilogue -> (M,N) out_ty.
         let out = x_i8.apply_op3(&self.w_i8, &scales, Int8GemmDequant(out_ty))?;
-        let mut out_dims = dims[..dims.len() - 1].to_vec();
+        let mut out_dims = lead.to_vec();
         out_dims.push(n);
         Ok(out.reshape(out_dims)?)
     }
@@ -972,4 +1142,217 @@ pub fn bench_rotate_quant(iters: usize) -> Result<Vec<(usize, f64, f64)>> {
         out.push((k, fused, unfused));
     }
     Ok(out)
+}
+
+/// bf16 `(M, K)` gate/proj test inputs on the host and the device: row 0 is
+/// all zero, row 1 carries 60x outliers in `p`, the rest are randn (`g`
+/// scaled by 2 so silu sees both tails).
+fn swiglu_inputs(
+    m: usize,
+    k: usize,
+    dev: &candle_core::Device,
+) -> Result<(Vec<f32>, Vec<f32>, Tensor, Tensor)> {
+    use candle_core::{DType, Device};
+    let mut g: Vec<f32> = (Tensor::randn(0f32, 1f32, (m, k), &Device::Cpu)? * 2.0)?
+        .flatten_all()?
+        .to_vec1()?;
+    let mut p: Vec<f32> = Tensor::randn(0f32, 1f32, (m, k), &Device::Cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+    g[..k].fill(0.0);
+    p[..k].fill(0.0);
+    if m > 1 {
+        for j in (0..k).step_by(97) {
+            p[k + j] *= 60.0;
+        }
+    }
+    let gb = Tensor::from_vec(g, (m, k), &Device::Cpu)?.to_dtype(DType::BF16)?;
+    let pb = Tensor::from_vec(p, (m, k), &Device::Cpu)?.to_dtype(DType::BF16)?;
+    let gh: Vec<f32> = gb.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let ph: Vec<f32> = pb.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    Ok((gh, ph, gb.to_device(dev)?, pb.to_device(dev)?))
+}
+
+/// Fused SwiGLU + rotate + quantize vs (a) a host reference (silu(g)*p and
+/// R256 · chunk in f64, then the kernel's quantize formula in f32) and (b)
+/// the old path (candle silu + mul in bf16, then the fused rotate+quantize),
+/// at each `(M, K)`. Reuses `RotQuantCase` (`old_*` = the candle path).
+pub fn self_test_swiglu_rotate_quant(shapes: &[(usize, usize)]) -> Result<Vec<RotQuantCase>> {
+    use candle_core::Device;
+    let dev = Device::new_cuda(0)?;
+    let gsz = crate::model::rotation::GROUP;
+    let r_cpu: Vec<f32> = crate::model::rotation::regular_hadamard_256(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+    let i8s = |t: &Tensor| -> Result<Vec<i8>> {
+        Ok(t.flatten_all()?
+            .to_vec1::<u8>()?
+            .iter()
+            .map(|&b| b as i8)
+            .collect())
+    };
+    let mut cases = Vec::new();
+    for &(m, k) in shapes {
+        let (gh, ph, g, p) = swiglu_inputs(m, k, &dev)?;
+        let (q, s) = swiglu_rotate_quantize_rows_fused(&g, &p)?;
+        let (q, s) = (i8s(&q)?, s.to_vec1::<f32>()?);
+        let h_old = (candle_nn::ops::silu(&g)? * &p)?;
+        let (qo, so) = rotate_quantize_rows_fused(&h_old)?;
+        let (qo, so) = (i8s(&qo)?, so.to_vec1::<f32>()?);
+        let mut c = RotQuantCase {
+            m,
+            k,
+            ref_max_diff: 0,
+            ref_mismatches: 0,
+            ref_scale_rel: 0.0,
+            old_max_diff: 0,
+            old_mismatches: 0,
+            old_scale_rel: 0.0,
+        };
+        let rel = |a: f32, b: f32| if b == 0.0 { a.abs() } else { (a - b).abs() / b };
+        for row in 0..m {
+            let h: Vec<f64> = (0..k)
+                .map(|j| {
+                    let (a, b) = (gh[row * k + j] as f64, ph[row * k + j] as f64);
+                    a / (1.0 + (-a).exp()) * b
+                })
+                .collect();
+            let mut y = vec![0f32; k];
+            for ch in 0..k / gsz {
+                for i in 0..gsz {
+                    let acc: f64 = (0..gsz)
+                        .map(|j| r_cpu[i * gsz + j] as f64 * h[ch * gsz + j])
+                        .sum();
+                    y[ch * gsz + i] = acc as f32;
+                }
+            }
+            let amax = y.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let scale = amax * (1.0 / 127.0);
+            let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+            c.ref_scale_rel = c.ref_scale_rel.max(rel(s[row], scale));
+            c.old_scale_rel = c.old_scale_rel.max(rel(s[row], so[row]));
+            for (i, yv) in y.iter().enumerate() {
+                let want = (yv * inv).round_ties_even().clamp(-127.0, 127.0) as i32;
+                let got = q[row * k + i] as i32;
+                let d_ref = (got - want).abs();
+                let d_old = (got - qo[row * k + i] as i32).abs();
+                c.ref_max_diff = c.ref_max_diff.max(d_ref);
+                c.old_max_diff = c.old_max_diff.max(d_old);
+                c.ref_mismatches += usize::from(d_ref != 0);
+                c.old_mismatches += usize::from(d_old != 0);
+            }
+        }
+        cases.push(c);
+    }
+    Ok(cases)
+}
+
+/// View contracts of the fused SwiGLU quantizer. (1) g/p as the column
+/// halves of one `(drop+M, 2K)` matrix, row-narrowed past `drop` (nonzero
+/// start offset, row stride 2K) vs fresh dense copies: bit-identical int8
+/// and scales. (2) Rejections: K = 128, a row stride not a multiple of 8,
+/// g/p shape mismatch. (3) M = 0 returns empty tensors. Returns
+/// `(check, ok)` per check.
+pub fn self_test_swiglu_views() -> Result<Vec<(&'static str, bool)>> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let (drop, m, k) = (3usize, 37usize, 4096usize);
+    let gp = Tensor::randn(0f32, 1f32, (drop + m, 2 * k), &dev)?
+        .to_dtype(DType::BF16)?
+        .narrow(0, drop, m)?;
+    let (g, p) = (gp.narrow(1, 0, k)?, gp.narrow(1, k, k)?);
+    anyhow::ensure!(
+        p.layout().start_offset() == drop * 2 * k + k && p.stride()[0] == 2 * k,
+        "test premise: p must be a strided, offset view"
+    );
+    let (gf, pf) = (g.force_contiguous()?, p.force_contiguous()?);
+    let (q, s) = swiglu_rotate_quantize_rows_fused(&g, &p)?;
+    let (qf, sf) = swiglu_rotate_quantize_rows_fused(&gf, &pf)?;
+    let merged_ok = q.flatten_all()?.to_vec1::<u8>()? == qf.flatten_all()?.to_vec1::<u8>()?
+        && s.to_vec1::<f32>()? == sf.to_vec1::<f32>()?;
+
+    let z = |r: usize, c: usize| Tensor::zeros((r, c), DType::BF16, &dev);
+    let bad_k = swiglu_rotate_quantize_rows_fused(&z(2, 128)?, &z(2, 128)?).is_err();
+    let wide = z(2, k + 4)?.narrow(1, 0, k)?; // row stride K+4: not 16-B rows
+    let bad_ld = swiglu_rotate_quantize_rows_fused(&wide, &wide).is_err();
+    let bad_shape = swiglu_rotate_quantize_rows_fused(&z(2, k)?, &z(3, k)?).is_err();
+    let (qe, se) = swiglu_rotate_quantize_rows_fused(&z(0, k)?, &z(0, k)?)?;
+    let empty_ok = qe.dims() == [0, k] && se.dims() == [0];
+    Ok(vec![
+        (
+            "swiglu merged halves + row offset == dense copies",
+            merged_ok,
+        ),
+        ("swiglu rejects K=128", bad_k),
+        ("swiglu rejects row stride % 8 != 0", bad_ld),
+        ("swiglu rejects g/p shape mismatch", bad_shape),
+        ("swiglu M=0 -> empty", empty_ok),
+    ])
+}
+
+/// `forward_swiglu` (fused) vs `forward(silu(g) * p)` (the candle product,
+/// then the plain fused quantizer) at the DiT MLP-out shape class (K =
+/// 12288), on 3-D `(1, M, K)` inputs (the reshape path) and on the 2-D
+/// column halves of a merged `(M, 2K)` matrix. Returns `(case, cosine)`.
+pub fn self_test_linear_swiglu() -> Result<Vec<(&'static str, f32)>> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let r = crate::model::rotation::regular_hadamard_256(&dev)?;
+    let (m, n, k) = (257usize, 4096usize, 12288usize);
+    let w = (Tensor::randn(0f32, 1f32, (n, k), &dev)? * 0.02)?.to_dtype(DType::BF16)?;
+    let cr = ConvRotLinear::from_weight(&w, &r)?;
+    let cos = |a: &Tensor, b: &Tensor| -> Result<f32> {
+        let (a, b) = (a.to_dtype(DType::F32)?, b.to_dtype(DType::F32)?);
+        let dot = (&a * &b)?.sum_all()?.to_scalar::<f32>()?;
+        let na = a.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+        let nb = b.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+        Ok(dot / (na * nb + 1e-12))
+    };
+    let gp = (Tensor::randn(0f32, 1f32, (m, 2 * k), &dev)? * 2.0)?.to_dtype(DType::BF16)?;
+    let (g2, p2) = (gp.narrow(1, 0, k)?, gp.narrow(1, k, k)?);
+    let (g3, p3) = (
+        g2.contiguous()?.unsqueeze(0)?,
+        p2.contiguous()?.unsqueeze(0)?,
+    );
+    let reference = cr.forward(&(candle_nn::ops::silu(&g3)? * &p3)?)?;
+    let fused3 = cr.forward_swiglu(&g3, &p3, EpilogueOut::Bf16)?;
+    let fused2 = cr.forward_swiglu(&g2, &p2, EpilogueOut::Bf16)?;
+    anyhow::ensure!(fused3.dims() == [1, m, n] && fused2.dims() == [m, n]);
+    Ok(vec![
+        ("3-D (1,M,K) inputs", cos(&fused3, &reference)?),
+        (
+            "merged (M,2K) halves",
+            cos(&fused2, &reference.squeeze(0)?)?,
+        ),
+    ])
+}
+
+/// Time the MLP-out activation path at M = 4117, K = 12288: fused SwiGLU +
+/// rotate + quantize vs candle silu + mul + the fused rotate + quantize.
+/// Returns `(fused_ms, unfused_ms)`.
+pub fn bench_swiglu_quant(iters: usize) -> Result<(f64, f64)> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let (m, k) = (4117usize, 12288usize);
+    let g = Tensor::randn(0f32, 1f32, (m, k), &dev)?.to_dtype(DType::BF16)?;
+    let p = Tensor::randn(0f32, 1f32, (m, k), &dev)?.to_dtype(DType::BF16)?;
+    let time = |f: &dyn Fn() -> Result<()>| -> Result<f64> {
+        f()?;
+        dev.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            f()?;
+        }
+        dev.synchronize()?;
+        Ok(t0.elapsed().as_secs_f64() * 1e3 / iters as f64)
+    };
+    let fused = time(&|| {
+        swiglu_rotate_quantize_rows_fused(&g, &p)?;
+        Ok(())
+    })?;
+    let unfused = time(&|| {
+        rotate_quantize_rows_fused(&(candle_nn::ops::silu(&g)? * &p)?)?;
+        Ok(())
+    })?;
+    Ok((fused, unfused))
 }

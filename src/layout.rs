@@ -30,9 +30,31 @@ pub fn dense_byte_offset<T>(l: &Layout, what: &str) -> candle_core::Result<u64> 
     Ok((dense_offset(l, what)? * std::mem::size_of::<T>()) as u64)
 }
 
+/// A 2-D `(M, K)` view whose rows are each dense (unit inner stride) but may
+/// sit `ld >= K` elements apart — e.g. a column narrow of a wider matrix, such
+/// as one half of a merged `(M, 2K)` GEMM output. Returns `(start_offset, ld)`
+/// in elements. For `M <= 1` the row stride is irrelevant and `ld = K`.
+/// Errors on a non-unit inner stride or overlapping rows (`ld < K`).
+pub fn row_strided_2d(l: &Layout, what: &str) -> candle_core::Result<(usize, usize)> {
+    let (m, k) = l.shape().dims2()?;
+    let st = l.stride();
+    if k > 1 && st[1] != 1 {
+        candle_core::bail!(
+            "{what}: kernel needs unit-stride rows, got shape {:?} strides {:?}",
+            l.shape(),
+            st
+        );
+    }
+    let ld = if m <= 1 { k } else { st[0] };
+    if ld < k {
+        candle_core::bail!("{what}: overlapping rows (row stride {ld} < K = {k})");
+    }
+    Ok((l.start_offset(), ld))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::dense_offset;
+    use super::{dense_offset, row_strided_2d};
     use candle_core::{DType, Device, Tensor};
 
     #[test]
@@ -67,5 +89,43 @@ mod tests {
         let t = Tensor::zeros((8, 16), DType::F32, &Device::Cpu).unwrap();
         let v = t.t().unwrap();
         assert!(dense_offset(v.layout(), "v").is_err());
+    }
+
+    #[test]
+    fn dense_matrix_is_row_strided_with_ld_k() {
+        let t = Tensor::zeros((5, 32), DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(row_strided_2d(t.layout(), "t").unwrap(), (0, 32));
+    }
+
+    /// The merged gate|proj case: the two column halves of an (M, 2K) matrix.
+    #[test]
+    fn column_halves_have_ld_2k_and_offsets() {
+        let (m, k) = (7usize, 16usize);
+        let t = Tensor::zeros((m, 2 * k), DType::F32, &Device::Cpu).unwrap();
+        let g = t.narrow(1, 0, k).unwrap();
+        let p = t.narrow(1, k, k).unwrap();
+        assert_eq!(row_strided_2d(g.layout(), "g").unwrap(), (0, 2 * k));
+        assert_eq!(row_strided_2d(p.layout(), "p").unwrap(), (k, 2 * k));
+        // A row narrow of a column half adds drop * ld.
+        let pr = p.narrow(0, 3, 4).unwrap();
+        assert_eq!(
+            row_strided_2d(pr.layout(), "pr").unwrap(),
+            (3 * 2 * k + k, 2 * k)
+        );
+    }
+
+    #[test]
+    fn single_row_ignores_row_stride() {
+        let t = Tensor::zeros((4, 64), DType::F32, &Device::Cpu).unwrap();
+        let v = t.narrow(0, 2, 1).unwrap().narrow(1, 8, 32).unwrap();
+        assert_eq!(row_strided_2d(v.layout(), "v").unwrap(), (2 * 64 + 8, 32));
+    }
+
+    #[test]
+    fn row_strided_rejects_transpose_and_non_2d() {
+        let t = Tensor::zeros((8, 16), DType::F32, &Device::Cpu).unwrap();
+        assert!(row_strided_2d(t.t().unwrap().layout(), "v").is_err());
+        let t3 = Tensor::zeros((2, 8, 16), DType::F32, &Device::Cpu).unwrap();
+        assert!(row_strided_2d(t3.layout(), "v3").is_err());
     }
 }

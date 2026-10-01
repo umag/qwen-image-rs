@@ -108,19 +108,62 @@ __device__ __forceinline__ void hadamard256_warp(float (&v)[8]) {
 static constexpr int RQ_WARPS = 8;
 static constexpr int RQ_MAX_CPW = 8; // chunks per warp kept in registers -> K <= 16384
 
+// Row loaders: where the 8 contiguous bf16 inputs of one lane come from.
+// Plain: one activation row (row stride K). SwiGlu
+// (qwen-image-rs-fused-swiglu): the SwiGLU product h = silu(g) * p of two
+// rows read through independent row strides, so g/p may be two tensors or
+// the two column halves of one merged (M, 2N) GEMM output; silu and the
+// product run in f32 and h never exists in memory.
+struct PlainRow {
+  const __nv_bfloat16* x;
+  long ld;
+  __device__ __forceinline__ void load(long row, int col, float (&v)[8]) const {
+    uint4 raw = *reinterpret_cast<const uint4*>(x + row * ld + col);
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      float2 f = __bfloat1622float2(h[e]);
+      v[2 * e] = f.x;
+      v[2 * e + 1] = f.y;
+    }
+  }
+};
+
+struct SwiGluRow {
+  const __nv_bfloat16* g;
+  long ld_g;
+  const __nv_bfloat16* p;
+  long ld_p;
+  __device__ __forceinline__ void load(long row, int col, float (&v)[8]) const {
+    uint4 rg = *reinterpret_cast<const uint4*>(g + row * ld_g + col);
+    uint4 rp = *reinterpret_cast<const uint4*>(p + row * ld_p + col);
+    const __nv_bfloat162* hg = reinterpret_cast<const __nv_bfloat162*>(&rg);
+    const __nv_bfloat162* hp = reinterpret_cast<const __nv_bfloat162*>(&rp);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      float2 a = __bfloat1622float2(hg[e]);
+      float2 b = __bfloat1622float2(hp[e]);
+      // silu(a) = a / (1 + e^-a), candle's formula, here without the bf16
+      // rounding of silu(g) and of the product.
+      v[2 * e] = (a.x / (1.0f + expf(-a.x))) * b.x;
+      v[2 * e + 1] = (a.y / (1.0f + expf(-a.y))) * b.y;
+    }
+  }
+};
+
 // One CTA per row. Warp w handles chunks w, w + 8, ... (up to CPW of them),
 // keeping the rotated f32 values in registers until the row amax is known.
 // Same output contract as quantize_rows_fused_k: int8 bytes + row_scale[row]
-// = amax/127 (0 for an all-zero row, which quantizes to zeros).
-template <int CPW>
+// = amax/127 (0 for an all-zero row, which quantizes to zeros). The int8
+// output is always dense (row stride K).
+template <int CPW, class Loader>
 __global__ void __launch_bounds__(RQ_WARPS * 32) rotate_quantize_rows_k(
-    unsigned char* out, const __nv_bfloat16* x, float* row_scale, int K) {
+    unsigned char* out, Loader src, float* row_scale, int K) {
   __shared__ float wmax[RQ_WARPS];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const long row = blockIdx.x;
   const int nchunks = K >> 8;
-  const __nv_bfloat16* xr = x + row * (long)K;
   unsigned char* orow = out + row * (long)K;
 
   float v[CPW][8];
@@ -131,14 +174,7 @@ __global__ void __launch_bounds__(RQ_WARPS * 32) rotate_quantize_rows_k(
     // `chunk` depends only on the warp id: this branch is warp-uniform, so the
     // full-mask shuffles inside hadamard256_warp are safe.
     if (chunk < nchunks) {
-      uint4 raw = *reinterpret_cast<const uint4*>(xr + chunk * 256 + lane * 8);
-      const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
-#pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        float2 f = __bfloat1622float2(h[e]);
-        v[c][2 * e] = f.x;
-        v[c][2 * e + 1] = f.y;
-      }
+      src.load(row, chunk * 256 + lane * 8, v[c]);
       hadamard256_warp(v[c]);
 #pragma unroll
       for (int e = 0; e < 8; ++e) local = fmaxf(local, fabsf(v[c][e]));
@@ -188,27 +224,53 @@ extern "C" void quantize_rows_fused_launch(
   quantize_rows_fused_k<<<M, QFUSE_THREADS, 0, s>>>(out, x, row_scale, (long)K);
 }
 
+// Shared dispatch on CPW = ceil(K / 256 / 8) for any row loader.
+template <class Loader>
+static int launch_rotate_quantize(
+    unsigned char* out, Loader src, float* row_scale, int M, int K, cudaStream_t s) {
+  const int nchunks = K / 256;
+  const int cpw = (nchunks + RQ_WARPS - 1) / RQ_WARPS;
+  const int t = RQ_WARPS * 32;
+  switch (cpw) {
+    case 1: rotate_quantize_rows_k<1, Loader><<<M, t, 0, s>>>(out, src, row_scale, K); break;
+    case 2: rotate_quantize_rows_k<2, Loader><<<M, t, 0, s>>>(out, src, row_scale, K); break;
+    case 3: rotate_quantize_rows_k<3, Loader><<<M, t, 0, s>>>(out, src, row_scale, K); break;
+    case 4: rotate_quantize_rows_k<4, Loader><<<M, t, 0, s>>>(out, src, row_scale, K); break;
+    case 5: rotate_quantize_rows_k<5, Loader><<<M, t, 0, s>>>(out, src, row_scale, K); break;
+    case 6: rotate_quantize_rows_k<6, Loader><<<M, t, 0, s>>>(out, src, row_scale, K); break;
+    case 7: rotate_quantize_rows_k<7, Loader><<<M, t, 0, s>>>(out, src, row_scale, K); break;
+    case 8: rotate_quantize_rows_k<8, Loader><<<M, t, 0, s>>>(out, src, row_scale, K); break;
+    default: return 1;
+  }
+  return (int)cudaGetLastError();
+}
+
+static inline bool rq_k_ok(int K) {
+  return K > 0 && K % 256 == 0 && K <= 256 * RQ_WARPS * RQ_MAX_CPW;
+}
+
 // Fused rotate + quantize. Returns 0 on success, 1 for an unsupported K
 // (K % 256 != 0 or K > 256 * RQ_WARPS * RQ_MAX_CPW), 2 for a misaligned x
 // (16-B vector loads) or out (8-B stores), else the CUDA launch error.
 extern "C" int rotate_quantize_rows_launch(
     unsigned char* out, const __nv_bfloat16* x, float* row_scale, int M, int K, cudaStream_t s) {
-  if (K <= 0 || K % 256 != 0 || K > 256 * RQ_WARPS * RQ_MAX_CPW) return 1;
+  if (!rq_k_ok(K)) return 1;
   if (((size_t)x & 15) != 0 || ((size_t)out & 7) != 0) return 2;
   if (M <= 0) return 0;
-  const int nchunks = K / 256;
-  const int cpw = (nchunks + RQ_WARPS - 1) / RQ_WARPS;
-  const int t = RQ_WARPS * 32;
-  switch (cpw) {
-    case 1: rotate_quantize_rows_k<1><<<M, t, 0, s>>>(out, x, row_scale, K); break;
-    case 2: rotate_quantize_rows_k<2><<<M, t, 0, s>>>(out, x, row_scale, K); break;
-    case 3: rotate_quantize_rows_k<3><<<M, t, 0, s>>>(out, x, row_scale, K); break;
-    case 4: rotate_quantize_rows_k<4><<<M, t, 0, s>>>(out, x, row_scale, K); break;
-    case 5: rotate_quantize_rows_k<5><<<M, t, 0, s>>>(out, x, row_scale, K); break;
-    case 6: rotate_quantize_rows_k<6><<<M, t, 0, s>>>(out, x, row_scale, K); break;
-    case 7: rotate_quantize_rows_k<7><<<M, t, 0, s>>>(out, x, row_scale, K); break;
-    case 8: rotate_quantize_rows_k<8><<<M, t, 0, s>>>(out, x, row_scale, K); break;
-    default: return 1;
-  }
-  return (int)cudaGetLastError();
+  return launch_rotate_quantize(out, PlainRow{x, (long)K}, row_scale, M, K, s);
+}
+
+// Fused SwiGLU + rotate + quantize: the int8 rows of R256-rotated
+// h = silu(g) * p, h never stored. g/p rows are ld_g/ld_p elements apart
+// (>= K). Returns 0 on success, 1 for an unsupported K, 2 for a misaligned
+// g/p base or a row stride that breaks the 16-B row loads (ld % 8 != 0) or
+// overlaps rows (ld < K), or a misaligned out; else the CUDA launch error.
+extern "C" int swiglu_rotate_quantize_rows_launch(
+    unsigned char* out, const __nv_bfloat16* g, long ld_g, const __nv_bfloat16* p, long ld_p,
+    float* row_scale, int M, int K, cudaStream_t s) {
+  if (!rq_k_ok(K)) return 1;
+  if (((size_t)g & 15) != 0 || ((size_t)p & 15) != 0 || ((size_t)out & 7) != 0) return 2;
+  if (ld_g % 8 != 0 || ld_p % 8 != 0 || ld_g < K || ld_p < K) return 2;
+  if (M <= 0) return 0;
+  return launch_rotate_quantize(out, SwiGluRow{g, ld_g, p, ld_p}, row_scale, M, K, s);
 }

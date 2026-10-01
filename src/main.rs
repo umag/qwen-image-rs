@@ -1288,7 +1288,50 @@ fn convrot_test() -> Result<()> {
                 u / f
             );
         }
-        if maxdiff != 0 || epi_bad != 0 || !f16_ok || !rq_ok || !rq_rej {
+        // Fused SwiGLU + rotate + quantize (silu(g)*p never stored).
+        let mut swg_ok = true;
+        for c in qwen_image_rs::convrot::self_test_swiglu_rotate_quant(&[
+            (37, 256),
+            (300, 4096),
+            (64, 12288),
+            (5, 16384),
+        ])? {
+            println!(
+                "convrot fused swiglu+rotate+quant (M={} K={}): vs f64 ref max|dq|={} ({} of {} differ), scale rel {:.1e}; vs candle silu*mul + rotate+quant max|dq|={} ({} differ, {:.3}%), scale rel {:.1e} ({})",
+                c.m,
+                c.k,
+                c.ref_max_diff,
+                c.ref_mismatches,
+                c.m * c.k,
+                c.ref_scale_rel,
+                c.old_max_diff,
+                c.old_mismatches,
+                100.0 * c.old_mismatches as f64 / (c.m * c.k) as f64,
+                c.old_scale_rel,
+                if c.ok() { "OK" } else { "MISMATCH" }
+            );
+            swg_ok &= c.ok();
+        }
+        for (what, ok) in qwen_image_rs::convrot::self_test_swiglu_views()? {
+            println!(
+                "convrot fused swiglu view contract: {what}: {}",
+                if ok { "OK" } else { "MISMATCH" }
+            );
+            swg_ok &= ok;
+        }
+        for (what, c) in qwen_image_rs::convrot::self_test_linear_swiglu()? {
+            println!(
+                "convrot linear forward_swiglu vs forward(silu(g)*p) ({what}, M=257 N=4096 K=12288): cosine = {c:.7} ({})",
+                if c > 0.9999 { "OK" } else { "TOO LOW" }
+            );
+            swg_ok &= c > 0.9999;
+        }
+        let (sf, su) = qwen_image_rs::convrot::bench_swiglu_quant(50)?;
+        println!(
+            "MLP-out activation path (M=4117 K=12288): fused swiglu+rotate+quant {sf:.3} ms vs silu + mul + rotate+quant {su:.3} ms ({:.2}x)",
+            su / sf
+        );
+        if maxdiff != 0 || epi_bad != 0 || !f16_ok || !rq_ok || !rq_rej || !swg_ok {
             anyhow::bail!("convrot self-test FAILED (bit-exactness / rotate+quant bounds)");
         }
         report_offset_views("convrot", qwen_image_rs::convrot::self_test_offset_views()?)

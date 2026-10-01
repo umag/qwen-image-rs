@@ -612,7 +612,15 @@ impl SwiGlu {
             out: QLinear::load(INNER * 3, INNER, opts, vb.pp("out"))?,
         })
     }
+    /// `out(silu(gate(x)) * proj(x))`. Under ConvRot the out linear's
+    /// activation quantizer computes `silu(g) * p` itself (f32, in registers),
+    /// so the product is never stored; otherwise the candle ops.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "convrot")]
+        if let QLinear::Convrot(out) = &self.out {
+            let (g, p) = (self.gate.forward(x)?, self.proj.forward(x)?);
+            return out.forward_swiglu(&g, &p, crate::convrot::EpilogueOut::Bf16);
+        }
         let g = silu(&self.gate.forward(x)?)?;
         self.out.forward(&(g * self.proj.forward(x)?)?)
     }
