@@ -87,4 +87,22 @@ fn main() {
             .compile("sage2_attn");
         println!("cargo:rustc-link-lib=dylib=cudart");
     }
+
+    #[cfg(feature = "cudnn")]
+    {
+        // cudarc links `-lcudnn` (candle enables its `dynamic-linking`). cuDNN is
+        // not a system package on the host: it comes from the NVIDIA pip wheel
+        // `nvidia-cudnn-cu13` unpacked in user space (scripts/setup-host.sh), so
+        // point the linker at it and bake an rpath so the binary runs without
+        // LD_LIBRARY_PATH. Override the dir with QIR_CUDNN_LIB.
+        println!("cargo:rerun-if-env-changed=QIR_CUDNN_LIB");
+        let lib = std::env::var("QIR_CUDNN_LIB").unwrap_or_else(|_| {
+            format!(
+                "{}/dev_tmp/cudnn/py/nvidia/cudnn/lib",
+                std::env::var("HOME").unwrap_or_default()
+            )
+        });
+        println!("cargo:rustc-link-search=native={lib}");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{lib}");
+    }
 }

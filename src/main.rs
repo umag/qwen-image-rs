@@ -292,6 +292,14 @@ enum Command {
         /// Output PNG path.
         #[arg(long)]
         out: std::path::PathBuf,
+        /// Tiled decode with this latent tile size (0 = whole image), overlap
+        /// tile/4 — the same path generate/batch use with `--vae-tile`.
+        #[arg(long, default_value_t = 0)]
+        tile: usize,
+        /// Decode this many times and print each wall time (the first includes
+        /// warm-up: cuDNN algo pick, allocator growth).
+        #[arg(long, default_value_t = 1)]
+        iters: usize,
     },
 }
 
@@ -395,7 +403,9 @@ fn main() -> Result<()> {
             latent,
             bf16,
             out,
-        } => vae_decode(&weights, &latent, bf16, &out),
+            tile,
+            iters,
+        } => vae_decode(&weights, &latent, bf16, &out, tile, iters),
         Command::TextEncode {
             weights,
             input_ids,
@@ -1142,6 +1152,8 @@ fn vae_decode(
     latent: &std::path::Path,
     bf16: bool,
     out: &std::path::Path,
+    tile: usize,
+    iters: usize,
 ) -> Result<()> {
     use qwen_image_rs::model::{config::VaeConfig, vae};
 
@@ -1200,7 +1212,19 @@ fn vae_decode(
     let z = vae::unpack_latents(&packed, cfg.latent_channels)?;
     tracing::info!(shape = ?z.dims(), "unpacked latent");
 
-    let img = model.decode(&z)?;
+    let mut img = None;
+    for it in 0..iters.max(1) {
+        let t = std::time::Instant::now();
+        let out = if tile > 0 {
+            model.decode_tiled(&z, tile, (tile / 4).max(1))?
+        } else {
+            model.decode(&z)?
+        };
+        dev.synchronize()?;
+        println!("decode iter {it}: {} ms", t.elapsed().as_millis());
+        img = Some(out);
+    }
+    let img = img.context("no decode ran")?;
     tracing::info!(shape = ?img.dims(), "decoded image");
     let (w, h, bytes) = vae::to_rgba_u8(&img)?;
     let buf: image::RgbaImage =
