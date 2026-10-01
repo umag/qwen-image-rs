@@ -13,6 +13,7 @@
 
 #[cfg(feature = "convrot")]
 pub mod convrot;
+pub mod convrot_cache;
 pub mod device;
 #[cfg(feature = "fusednorm")]
 pub mod fusednorm;

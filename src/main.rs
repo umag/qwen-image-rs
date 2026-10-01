@@ -17,6 +17,32 @@ struct Cli {
     command: Command,
 }
 
+/// Where `--convrot` finds its prequantized DiT weights (`convrot_cache`).
+#[derive(clap::Args, Clone, Debug)]
+struct ConvrotCacheArgs {
+    /// Cache dir for the prequantized ConvRot DiT (built once per transformer,
+    /// then loaded on every --convrot run). Default: $QIR_CONVROT_CACHE, else
+    /// $XDG_CACHE_HOME/qwen-image-rs/convrot, else ~/.cache/qwen-image-rs/convrot.
+    #[arg(long)]
+    convrot_cache: Option<std::path::PathBuf>,
+    /// Do not use the cache: rotate + INT8-quantize the DiT on load.
+    #[arg(long, conflicts_with = "rebuild_convrot_cache")]
+    no_convrot_cache: bool,
+    /// Rebuild this transformer's cache entry, then load it.
+    #[arg(long)]
+    rebuild_convrot_cache: bool,
+}
+
+impl ConvrotCacheArgs {
+    fn spec(&self) -> qwen_image_rs::convrot_cache::CacheSpec {
+        qwen_image_rs::convrot_cache::CacheSpec::from_cli(
+            self.convrot_cache.as_deref(),
+            self.no_convrot_cache,
+            self.rebuild_convrot_cache,
+        )
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// GPU/CPU smoke test: allocate, matmul, reduce — proves the backend end to end.
@@ -63,6 +89,8 @@ enum Command {
         /// ConvRot W8A8 INT8 for the DiT attn/MLP linears (`convrot` feature).
         #[arg(long)]
         convrot: bool,
+        #[command(flatten)]
+        cache: ConvrotCacheArgs,
         /// Q8_0-quantize the text encoder (weight-only, ~half VRAM).
         #[arg(long)]
         quant_text: bool,
@@ -120,6 +148,8 @@ enum Command {
         /// ConvRot W8A8 INT8 for the DiT attn/MLP linears (`convrot` feature).
         #[arg(long)]
         convrot: bool,
+        #[command(flatten)]
+        cache: ConvrotCacheArgs,
         /// Q8_0-quantize the text encoder (weight-only, ~half VRAM).
         #[arg(long)]
         quant_text: bool,
@@ -183,6 +213,8 @@ enum Command {
         /// ConvRot W8A8 INT8 for the DiT attn/MLP linears (`convrot` feature).
         #[arg(long)]
         convrot: bool,
+        #[command(flatten)]
+        cache: ConvrotCacheArgs,
         /// Output final latent safetensors path.
         #[arg(long)]
         out: std::path::PathBuf,
@@ -201,6 +233,8 @@ enum Command {
         /// ConvRot W8A8 INT8 for the DiT attn/MLP linears (`convrot` feature).
         #[arg(long)]
         convrot: bool,
+        #[command(flatten)]
+        cache: ConvrotCacheArgs,
         /// Output safetensors path (joint output tensor).
         #[arg(long)]
         out: std::path::PathBuf,
@@ -266,6 +300,7 @@ fn main() -> Result<()> {
             seed,
             quant,
             convrot,
+            cache,
             quant_text,
             resident,
             text_gguf,
@@ -282,6 +317,7 @@ fn main() -> Result<()> {
             seed,
             quant,
             convrot,
+            &cache.spec(),
             quant_text,
             resident,
             text_gguf.as_deref(),
@@ -300,6 +336,7 @@ fn main() -> Result<()> {
             seed,
             quant,
             convrot,
+            cache,
             quant_text,
             text_gguf,
             vae_tile,
@@ -318,6 +355,7 @@ fn main() -> Result<()> {
             seed,
             quant,
             convrot,
+            &cache.spec(),
             quant_text,
             text_gguf.as_deref(),
             vae_tile,
@@ -349,8 +387,9 @@ fn main() -> Result<()> {
             inputs,
             quant,
             convrot,
+            cache,
             out,
-        } => dit_forward(&weights, &inputs, quant, convrot, &out),
+        } => dit_forward(&weights, &inputs, quant, convrot, &cache.spec(), &out),
         Command::Denoise {
             weights,
             noise,
@@ -358,8 +397,18 @@ fn main() -> Result<()> {
             steps,
             quant,
             convrot,
+            cache,
             out,
-        } => denoise(&weights, &noise, &embeds, steps, quant, convrot, &out),
+        } => denoise(
+            &weights,
+            &noise,
+            &embeds,
+            steps,
+            quant,
+            convrot,
+            &cache.spec(),
+            &out,
+        ),
     }
 }
 
@@ -395,6 +444,20 @@ fn guided_noise_pred(
     Ok(v_cond)
 }
 
+/// The DiT's VarBuilder over the files `convrot_cache::resolve_dit_files`
+/// picks: under `--convrot` the cached prequantized file (built on first use),
+/// else the transformer dir's own safetensors.
+fn dit_vb(
+    dir: &std::path::Path,
+    convrot: bool,
+    cache: &qwen_image_rs::convrot_cache::CacheSpec,
+    dtype: DType,
+    dev: &candle_core::Device,
+) -> Result<candle_nn::VarBuilder<'static>> {
+    let files = qwen_image_rs::convrot_cache::resolve_dit_files(dir, convrot, cache)?;
+    Ok(unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, dev)? })
+}
+
 /// Load the text encoder, preferring a pre-quantized GGUF (`--text-gguf`) which
 /// loads Q8_0 directly (no bf16-on-GPU transient); otherwise mmap the bf16
 /// safetensors and (optionally) quantize on load.
@@ -428,6 +491,7 @@ fn generate(
     seed: u64,
     quant: bool,
     convrot: bool,
+    cache: &qwen_image_rs::convrot_cache::CacheSpec,
     quant_text: bool,
     text_gguf: Option<&std::path::Path>,
     vae_tile: usize,
@@ -540,7 +604,7 @@ fn generate(
             64,
             quant,
             convrot,
-            load_vb(model.join("transformer"), dtype)?,
+            dit_vb(&model.join("transformer"), convrot, cache, dtype, &dev)?,
         )?;
         // One seed per lane: lane i uses (seed + i), resetting the RNG each lane
         // so lane i's NOISE is identical to a sequential `generate --seed (seed+i)`
@@ -642,6 +706,7 @@ fn batch(
     seed: u64,
     quant: bool,
     convrot: bool,
+    cache: &qwen_image_rs::convrot_cache::CacheSpec,
     quant_text: bool,
     resident: bool,
     text_gguf: Option<&std::path::Path>,
@@ -717,7 +782,7 @@ fn batch(
             64,
             quant,
             convrot,
-            load_vb(model.join("transformer"), dtype)?,
+            dit_vb(&model.join("transformer"), convrot, cache, dtype, &dev)?,
         )?;
         let vmodel = vae::QwenImageVae::load(
             &VaeConfig::default(),
@@ -836,7 +901,7 @@ fn batch(
             64,
             quant,
             convrot,
-            load_vb(model.join("transformer"), dtype)?,
+            dit_vb(&model.join("transformer"), convrot, cache, dtype, &dev)?,
         )?;
         let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
         for (i, emb) in embeds_list.iter().enumerate() {
@@ -883,6 +948,7 @@ fn batch(
 }
 
 /// Phase 4: full flow-match denoise loop -> final latent.
+#[allow(clippy::too_many_arguments)]
 fn denoise(
     weights: &std::path::Path,
     noise: &std::path::Path,
@@ -890,6 +956,7 @@ fn denoise(
     steps: usize,
     quant: bool,
     convrot: bool,
+    cache: &qwen_image_rs::convrot_cache::CacheSpec,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -903,9 +970,7 @@ fn denoise(
     };
     tracing::info!(device = device::label(&dev), steps, "denoise");
 
-    let set = WeightSet::resolve(weights)?;
-    let files = set.files.clone();
-    let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &dev)? };
+    let vb = dit_vb(weights, convrot, cache, dtype, &dev)?;
     let model = QwenImageDit::load(32, 64, quant, convrot, vb)?;
 
     let nmap = candle_core::safetensors::load(noise, &dev)?;
@@ -959,6 +1024,7 @@ fn dit_forward(
     inputs: &std::path::Path,
     quant: bool,
     convrot: bool,
+    cache: &qwen_image_rs::convrot_cache::CacheSpec,
     out: &std::path::Path,
 ) -> Result<()> {
     use qwen_image_rs::model::dit::QwenImageDit;
@@ -971,9 +1037,7 @@ fn dit_forward(
     };
     tracing::info!(device = device::label(&dev), "dit-forward");
 
-    let set = WeightSet::resolve(weights)?;
-    let files = set.files.clone();
-    let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, dtype, &dev)? };
+    let vb = dit_vb(weights, convrot, cache, dtype, &dev)?;
     let model = QwenImageDit::load(32, 64, quant, convrot, vb)?;
 
     let m = candle_core::safetensors::load(inputs, &dev)?;
@@ -1400,72 +1464,30 @@ fn smoke(n: usize) -> Result<()> {
 
 /// Pre-quantize the DiT's ConvRot linears (every weight
 /// `dit::is_convrot_target` names: the 224 block linears + the rotated tail
-/// linears) to a single safetensors file: each
+/// linears) to one safetensors file — the same builder (and header tags) as
+/// the default `--convrot` cache (`convrot_cache`), written atomically. Each
 /// target `<prefix>.weight` (bf16) becomes `<prefix>.weight_i8` (rotated INT8,
 /// U8 bytes) + `<prefix>.col_scale` (f32); all other tensors are copied bf16.
-/// `QwenImageDit::load` auto-detects `weight_i8` and skips the load-time
-/// rotate+quant. The heavy math runs on the GPU (QuantizeRows is CUDA-only).
-#[cfg(feature = "convrot")]
+/// A dir holding this file is used as-is by `--convrot` (no cache).
 fn prequantize_convrot(weights: &std::path::Path, out: &std::path::Path) -> Result<()> {
-    use qwen_image_rs::convrot::ConvRotLinear;
-    use qwen_image_rs::model::rotation::regular_hadamard_256;
-    use std::collections::HashMap;
-
-    let dev = device::best_device()?;
-    if !matches!(dev, candle_core::Device::Cuda(_)) {
-        anyhow::bail!("prequantize-convrot needs CUDA (the quantize kernel is CUDA-only)");
-    }
-    let set = WeightSet::resolve(weights)?;
-    tracing::info!(files = set.files.len(), "loading bf16 transformer (CPU)");
-    let mut full: HashMap<String, Tensor> = HashMap::new();
-    for f in &set.files {
-        for (k, v) in candle_core::safetensors::load(f, &candle_core::Device::Cpu)? {
-            full.insert(k, v);
-        }
-    }
-
-    let r = regular_hadamard_256(&dev)?;
-    let mut outmap: HashMap<String, Tensor> = HashMap::new();
-    let mut n_quant = 0usize;
-    for (name, t) in &full {
-        // The loader's own precision policy decides which weights are stored
-        // rotated INT8, so the file and `QwenImageDit::load` always agree.
-        let target = name
-            .strip_suffix(".weight")
-            .is_some_and(qwen_image_rs::model::dit::is_convrot_target);
-        if target {
-            let w = t.to_device(&dev)?.to_dtype(DType::BF16)?; // (N,K) bf16 on GPU
-            let cr = ConvRotLinear::from_weight(&w, &r)?;
-            let (wi8, cs) = cr.export();
-            let base = name.strip_suffix(".weight").unwrap();
-            outmap.insert(
-                format!("{base}.weight_i8"),
-                wi8.to_device(&candle_core::Device::Cpu)?,
-            );
-            outmap.insert(
-                format!("{base}.col_scale"),
-                cs.to_device(&candle_core::Device::Cpu)?,
-            );
-            n_quant += 1;
-        } else {
-            outmap.insert(name.clone(), t.clone());
-        }
-    }
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    candle_core::safetensors::save(&outmap, out)?;
+    use qwen_image_rs::convrot_cache as cc;
+    let files = WeightSet::resolve(weights)?.files;
+    let meta = std::collections::HashMap::from([
+        (
+            cc::META_POLICY.to_string(),
+            qwen_image_rs::model::dit::convrot_policy_tag(),
+        ),
+        (
+            cc::META_SOURCE.to_string(),
+            cc::source_fingerprint(weights, &files)?,
+        ),
+    ]);
+    let n_quant = cc::build(&files, out, meta)?;
     println!(
-        "prequantized {n_quant} convrot linears + copied {} bf16 tensors -> {}",
-        outmap.len() - 2 * n_quant,
+        "prequantized {n_quant} convrot linears -> {}",
         out.display()
     );
     Ok(())
-}
-
-#[cfg(not(feature = "convrot"))]
-fn prequantize_convrot(_: &std::path::Path, _: &std::path::Path) -> Result<()> {
-    anyhow::bail!("prequantize-convrot requires the `convrot` feature")
 }
 
 /// The Qwen3-VL text-encoder decoder linears (Q8_0-quantized in the GGUF);

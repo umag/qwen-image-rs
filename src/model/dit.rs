@@ -99,6 +99,33 @@ pub fn is_convrot_target(prefix: &str) -> bool {
     linear_precision(prefix, false, true) == Some(LinearPrecision::ConvRot)
 }
 
+/// Version of the stored ConvRot weight format and its quantizer math
+/// (`ConvRotLinear::from_weight`: fold `W Rᵀ`, per-row amax/127, round to
+/// int8). Bump it whenever that math or the tensor layout changes, so every
+/// cached prequantized file (`crate::convrot_cache`) is rebuilt.
+pub const PREQUANT_FORMAT: u32 = 1;
+
+/// The precision-policy tag stored in a prequantized file: the format
+/// version, the rotation group and every DiT linear's ConvRot decision. Two
+/// builds agree on a cached file iff their tags are equal; flipping a
+/// `TAIL_LINEARS` flag or editing `BLOCK_LINEARS` changes it.
+pub fn convrot_policy_tag() -> String {
+    policy_tag(&BLOCK_LINEARS, &TAIL_LINEARS)
+}
+
+fn policy_tag(block: &[&str], tail: &[(&str, usize, usize, bool)]) -> String {
+    let tail: Vec<String> = tail
+        .iter()
+        .map(|&(p, k, n, rot)| format!("{p}:{k}x{n}:{}", u8::from(rot)))
+        .collect();
+    format!(
+        "qir-convrot-v{PREQUANT_FORMAT};group={};block={};tail={}",
+        crate::model::rotation::GROUP,
+        block.join(","),
+        tail.join(",")
+    )
+}
+
 /// Load-time precision switches shared by every DiT linear.
 #[derive(Clone, Copy)]
 struct LinearOpts<'a> {
@@ -912,6 +939,21 @@ mod tests {
                 assert!(n.is_multiple_of(8), "{prefix}: N={n}");
             }
         }
+    }
+
+    #[test]
+    fn policy_tag_tracks_every_table_entry() {
+        let base = policy_tag(&BLOCK_LINEARS, &TAIL_LINEARS);
+        assert_eq!(base, convrot_policy_tag());
+        assert!(base.starts_with(&format!("qir-convrot-v{PREQUANT_FORMAT};")));
+        // Flipping any one tail flag changes the tag.
+        for i in 0..TAIL_LINEARS.len() {
+            let mut t = TAIL_LINEARS;
+            t[i].3 = !t[i].3;
+            assert_ne!(policy_tag(&BLOCK_LINEARS, &t), base, "{}", t[i].0);
+        }
+        // Dropping a block linear changes it too.
+        assert_ne!(policy_tag(&BLOCK_LINEARS[1..], &TAIL_LINEARS), base);
     }
 
     #[test]

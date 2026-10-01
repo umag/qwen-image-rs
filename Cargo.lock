@@ -1877,7 +1877,7 @@ dependencies = [
  "clap",
  "half",
  "image",
- "safetensors 0.4.5",
+ "safetensors 0.8.0",
  "serde",
  "serde_json",
  "tokenizers 0.21.4",
