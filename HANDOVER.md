@@ -22,7 +22,7 @@ reference. ~36 commits. This doc = pick-up point for a fresh session.
 
 ## Status: DONE + heavily optimized (all accuracy-neutral vs oracle)
 End-to-end works: `generate --model <snapshot> --prompt "..." --out x.png`.
-**Fastest build: `--features convrot,sage,fusednorm,sage2`** (SageAttention2,
+**Fastest build: `--features convrot,sage,fusednorm,sage2,cudnn`** (`cudnn` = VAE convs on cuDNN, see "VAE convs on cuDNN" at the end; SageAttention2,
 dit-forward 0.999911 since `-fused-swiglu` (0.999879 after `-fused-rotate-quant`, chaos) — FP8 P·V;
 denoise 0.1522 s/step after `-residual-norm-fusion` (same-session A/B; 0.1647 after `-qk-norm-fusion` in its session); `QIR_SAGE=1` in that binary = SageAttention v1,
 bit-identical to the build without `sage2`). **Most accurate fast build: `--features
@@ -1087,6 +1087,11 @@ attn: 4096 OK). ConvRotLinear input dim K = the linear's in_features.
   `src/layout.rs`. Isolation recipe that found it: same seed B=1 vs `--batch 2` lane
   0 (identical noise + embeds) → if they differ in CONTENT, suspect a B-dependent
   input layout, not numerics.
+- **candle's own `cudnn` conv is SLOWER than its im2col path for bf16** (it leaves
+  `CUDNN_DEFAULT_MATH` → heuristics pick FP32-SIMT `implicit_convolve_sgemm` /
+  `ampere_sgemm`: VAE decode 950 → 1443 ms). Our `cudnn` feature therefore depends on
+  cudarc's `cudnn` module directly (NOT `candle-core/cudnn`) and runs its own bridge with
+  `CUDNN_TENSOR_OP_MATH` (src/cudnn_conv.rs).
 - `scripts/compare_dit.py <ours> <oracle>` = the dit-forward oracle compare
   (overall_cos, MSE, per-token cos over the last 4096 rows); run it with the
   oracle venv python.
@@ -1097,7 +1102,7 @@ attn: 4096 OK). ConvRotLinear input dim K = the linear's in_features.
 - **Build/run on the 4090 ONLY via `scripts/host.sh`** (git-archive→copy→build over
   the `wsl-drills` @swamp/ssh model). COMMIT before `sync` (uses `git archive HEAD`).
   Host build: `export CUTLASS_DIR=$HOME/dev_tmp/cutlass/include; cargo build
-  --release --features convrot,sage,fusednorm`. Read stdout via the host.sh `run`
+  --release --features convrot,sage,fusednorm,sage2,cudnn`. Read stdout via the host.sh `run`
   wrapper; filter noise with `grep -viE "WRN|system │|Source path|seaweedfs|Committed|Syncing|Wrote|Preparing|Running|warning|cutlass|cute|include"`.
 - **Mac cargo: ALWAYS `CARGO_TARGET_DIR=$HOME/.cache/qwen-image-rs-target`** — else a
   stray in-tree `target/` appears and `scripts/check.sh` fails exit 3 ("a target/
@@ -1160,3 +1165,36 @@ casts to the conv dtype; `RmsNorm` (F.normalize over C) f32-accumulates.
 - **Quality-neutral: bf16 vs f32 53.6 dB; bf16 vs oracle 55.2 dB** (f32 was
   53.3 — bf16 is marginally closer to the bf16 diffusers oracle).
 - **Decode 1.84 s -> 1.17 s (~1.57x)** tiled, resident 40 steps. Per-image ~16.3 s.
+
+### VAE convs on cuDNN (DONE — `qwen-image-rs-vae-cudnn`, feature `cudnn`)
+nsys of `vae-decode --bf16` 1024² (HEAD 279c10e): 888 ms GPU, im2col_bf16 324 ms (every
+3x3 conv unfolds 9x) + ucopy 142 ms vs ~124 ms of conv GEMM; the im2col buffer is also why
+the resident path had to tile.
+- **cuDNN in user space:** `uv pip install --no-deps --target ~/dev_tmp/cudnn/py
+  nvidia-cudnn-cu13==9.24.0.43` + `libcudnn.so -> libcudnn.so.9` symlink
+  (scripts/setup-host.sh). No root. build.rs (feature `cudnn`) adds link-search + an
+  rpath to `$QIR_CUDNN_LIB` (default `~/dev_tmp/cudnn/py/nvidia/cudnn/lib`); cudarc's
+  `cudnn` feature = cudnn-09021 bindings, fine against the 9.24 runtime.
+- **src/cudnn_conv.rs:** CustomOp2 (bf16 NCHW, stride/dilation 1, symmetric padding,
+  `dense_offset`), `CUDNN_TENSOR_OP_MATH`, f32 accumulation (PSEUDO_BFLOAT16), heuristic
+  algo cached per (device, shape) → IMPLICIT_PRECOMP_GEMM →
+  `sm80_xmma_fprop_implicit_gemm_bf16..._nhwckrsc_nhwc` tensor-core kernels. The VAE
+  `Conv` wrapper (vae.rs) routes CUDA bf16 convs there; bias is a candle broadcast_add as
+  before; on a cuDNN error it warns once and falls back to im2col. `QIR_CUDNN=0` = candle
+  im2col (byte-identical to the non-cudnn build). `QIR_CUDNN_DEBUG=1` prints the algo per
+  shape, `QIR_CUDNN_ALGO=<0..7>` forces one. `cudnn-test` verb: vs im2col on 5 shapes
+  (cos ≥ 0.999996) + offset-view bit-identity.
+- **Results (same session):** `vae-decode` whole image **950 → 510 ms** (GPU ~445 ms),
+  peak VRAM 15.7 → 8.9 GB; tiled 32: 1170 → 690 ms; resident `batch --vae-tile 32`
+  decode **1150 → 679 ms**; `generate` 40 steps 19.3 → 18.5 s. Resident NON-tiled now
+  fits: 502 ms/decode, peak 23.3 GB (see `-vae-untiled`).
+- **Quality:** PSNR vs oracle (scripts/compare_png.py, RGB) 00: 56.39 (base 56.35),
+  01: 51.79 (51.77), 02: 56.09 (56.06); vs prior build 60.5 dB (tiled 60.3); deterministic
+  (md5 equal across runs); dit-forward byte-identical. (The older "55.2 dB" used another
+  PSNR script; same image.)
+- **Kernel mix after:** fast_sum_f32 68 ms + bdiv/usqr/affine/bmul/casts ~150 ms (the
+  unfused channel RmsNorm, now the top bucket → `-vae-fused-norm`), conv 113 ms, badd 46
+  (bias + residual), cuDNN-internal nchw↔nhwc 30 ms, ucopy 24 ms. im2col gone, so the
+  CUTLASS implicit-GEMM issue (`-vae-implicit-gemm-conv`) is unnecessary; NHWC end to end
+  would only save the ~30 ms transforms. cudnnConvolutionBiasActivationForward could fuse
+  bias (+ residual via z) into the conv.

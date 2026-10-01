@@ -16,6 +16,7 @@ use std::sync::Arc;
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::cudnn::safe::{ConvForward, Cudnn};
 use candle_core::cuda_backend::cudarc::cudnn::sys;
+use candle_core::cuda_backend::DeviceId;
 use candle_core::{CpuStorage, CudaStorage, DType, Layout, Shape, Tensor};
 
 use crate::layout::dense_offset;
@@ -23,17 +24,19 @@ use crate::layout::dense_offset;
 type Algo = sys::cudnnConvolutionFwdAlgo_t;
 
 thread_local! {
-    static HANDLE: RefCell<Option<Arc<Cudnn>>> = const { RefCell::new(None) };
-    static ALGOS: RefCell<HashMap<[usize; 6], Algo>> = RefCell::new(HashMap::new());
+    // Handles are neither Send nor Sync, so per thread (as candle does), and
+    // per device. The algo cache is keyed by device + every descriptor dim.
+    static HANDLES: RefCell<HashMap<DeviceId, Arc<Cudnn>>> = RefCell::new(HashMap::new());
+    static ALGOS: RefCell<HashMap<(DeviceId, [usize; 8]), Algo>> = RefCell::new(HashMap::new());
 }
 
 fn handle(dev: &candle_core::CudaDevice) -> candle_core::Result<Arc<Cudnn>> {
-    HANDLE.with(|h| {
-        if let Some(c) = h.borrow().as_ref() {
+    HANDLES.with(|h| {
+        if let Some(c) = h.borrow().get(&dev.id()) {
             return Ok(c.clone());
         }
         let c = Cudnn::new(dev.cuda_stream()).map_err(candle_core::Error::wrap)?;
-        *h.borrow_mut() = Some(c.clone());
+        h.borrow_mut().insert(dev.id(), c.clone());
         Ok(c)
     })
 }
@@ -124,7 +127,7 @@ impl candle_core::CustomOp2 for Conv2dCudnn {
             w: &wdsc,
             y: &yd,
         };
-        let key = [b, c, h, wd, o, kh * 16 + p];
+        let key = (dev.id(), [b, c, h, wd, o, kh, kw, p]);
         let algo = match algo_override() {
             Some(a) => a,
             None => match ALGOS.with(|m| m.borrow().get(&key).copied()) {

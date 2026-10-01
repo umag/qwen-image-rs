@@ -72,9 +72,18 @@ re-checked against the oracle before the next one.
 | per-head q/k RMSNorm: 16-lane kernel + fused into the SA2 Q/K quant (normalized q/k never written) | `fusednorm`,`sage2` | 0.1647 (same-session A/B 0.1769 → 0.1647, −6.9%; `--batch 2` −6.9%; bit-identical) |
 | gated residual fused into the following LayerNorm+AdaLN; modulation read as its 2 rows (no per-token tensors) | `fusednorm` | **0.1522** (same-session A/B 0.1587 → 0.1522, −4.1%; `--batch 2` −4.5%; bit-identical) |
 
-Plus: bf16 VAE decode (1.57×) and tiled decode (constant memory); batched
+### VAE decode (1024², bf16)
+| Step | Feature | `vae-decode` (whole image) | resident `--vae-tile 32` |
+|---|---|---|---|
+| f32 decoder | — | — | 1.84 s |
+| bf16 decoder | — | 0.95 s | 1.15 s |
+| cuDNN tensor-core implicit-GEMM conv (no im2col buffer; peak 15.7 → 8.9 GB) | `cudnn` | **0.51 s** | **0.68 s** |
+
+Plus: tiled decode (constant memory); batched
 multi-seed generation (`generate --batch N`, B=4 sweet spot). Recommended (default)
-build: `--features convrot,sage,fusednorm,sage2`. Most accurate: drop `sage2`
+build: `--features convrot,sage,fusednorm,sage2,cudnn` (`cudnn` needs the user-space
+cuDNN wheel from `scripts/setup-host.sh`; without it drop `cudnn` — same images
+within 60 dB, VAE ~1.8× slower). Most accurate: drop `sage2`
 (dit-forward vs oracle 0.999944). The `sage2` (`convrot,sage,fusednorm,sage2`, dit-forward 0.999911 — FP8
 P·V; every DiT linear except img_in runs ConvRot INT8); in a `sage2` build `QIR_SAGE=1` selects SageAttention v1 (bit-identical to
 the build without `sage2`), `QIR_SAGE=2f32` SA2 with fp32 P·V accumulation.
@@ -97,7 +106,9 @@ qwen-image-rs generate --model <snapshot> \
   --steps 40 --seed 42 --out out.png
 ```
 Features: `cuda`, `cudnn`, `flash-attn`, `convrot`, `sage`, `sage2`, `fusednorm`. Default
-build is CPU-only (macOS-safe).
+build is CPU-only (macOS-safe). `cudnn` links the cuDNN 9 libs at `$QIR_CUDNN_LIB`
+(default `~/dev_tmp/cudnn/py/nvidia/cudnn/lib`, the `nvidia-cudnn-cu13` pip wheel —
+no root) and bakes an rpath; `QIR_CUDNN=0` falls back to candle's im2col conv.
 
 ## Weights
 Not included (Qwen Research License). Download `Qwen/Qwen-Image-2.1` and, if you
