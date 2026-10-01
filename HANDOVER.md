@@ -23,8 +23,8 @@ reference. ~36 commits. This doc = pick-up point for a fresh session.
 ## Status: DONE + heavily optimized (all accuracy-neutral vs oracle)
 End-to-end works: `generate --model <snapshot> --prompt "..." --out x.png`.
 **Fastest build: `--features convrot,sage,fusednorm,sage2`** (SageAttention2,
-dit-forward 0.999898 since `-tail-linears-unify` (was 0.999894) — FP8 P·V;
-denoise 0.2127 s/step after `-sage2-quant-fusion`; `QIR_SAGE=1` in that binary = SageAttention v1,
+dit-forward 0.999879 since `-fused-rotate-quant` (0.999898 before, chaos) — FP8 P·V;
+denoise 0.1911 s/step after `-fused-rotate-quant`; `QIR_SAGE=1` in that binary = SageAttention v1,
 bit-identical to the build without `sage2`). **Most accurate fast build: `--features
 convrot,sage,fusednorm`** (0.999944). **DEFAULT (human decision 2026-10-01): the
 SA2 build** — accepted at 0.999894 for -4.8% denoise. (bf16 VAE is the
@@ -54,7 +54,8 @@ at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 d
 | V born f16 in the ConvRot epilogue (no V cast) + sage partial-tile zero-fill | convrot,sage | 0.2266 (A/B same session: 0.2292 → 0.2266, −1.1%) |
 | SageAttention2 sm89: INT8-QK per-thread + K smoothing, FP8-PV (fp32+fp16 accum) | sage2 | 0.2149 (A/B same binary/session, `QIR_SAGE=1` vs `2`: 0.2259 → 0.2149, −4.8%; dit-forward --convrot 0.999944 → 0.999894) |
 | every DiT linear a `QLinear`, tail linears via ConvRot (uniformity) | convrot | 0.2150 (flat, as predicted; dit-forward --convrot 0.999894 → 0.999898) |
-| SA2 quant fused: 10 per-layer launches → 3 (one 512-thread kernel, L2-ordered), bit-identical | sage2 | **0.2127** (A/B same session: 0.2159 → 0.2127, −1.5%) |
+| SA2 quant fused: 10 per-layer launches → 3 (one 512-thread kernel, L2-ordered), bit-identical | sage2 | 0.2127 (A/B same session: 0.2159 → 0.2127, −1.5%) |
+| Hadamard rotation fused into the activation quantizer (f32 in registers; no bf16 rotation GEMM) | convrot | **0.1911** (A/B same session: 0.2125 → 0.1911, −10.1%; dit-forward --convrot 0.999898 → 0.999879, chaos — see section) |
 
 Plus (not per-step): bf16 VAE decode 1.57×; text encoder Q8_0 GGUF (resident
 VRAM); VAE tiling (constant decode memory); true CFG (`--guidance`/`--negative`,
@@ -152,6 +153,43 @@ shared by handle clone. `--convrot` added to generate/batch/denoise/dit-forward.
   because flash's stable attention keeps the INT8-perturbed 40-step trajectory
   near the bf16 one. dit-forward cosine 0.999942 (unchanged). This is the
   recommended fast path.
+
+### Rotation fused into the ConvRot activation quantizer (DONE — `qwen-image-rs-fused-rotate-quant`)
+Every ConvRot linear used to rotate its activation with a bf16 GEMM
+(`ampere_bf16_s1688gemm_bf16_128x128..nn`, one per INT8 linear, 195.5 ms per
+10-step generate) and write a bf16 `x R` that `quantize_rows_fused_k` re-read
+(128.2 ms). `rotate_quantize_rows_k<CPW>` (kernels/convrot/quant_ops.cu,
+`RotateQuantizeFused` in src/convrot.rs) does both: CTA per row, 8 warps, a
+warp per 256-wide chunk (lane = 8 contiguous elements, one 16-B load, CPW
+chunks per warp kept in f32 registers, K <= 16384), the Regular Hadamard as 4
+radix-4 stages — R256 = (H4/2)^⊗4 acts per base-4 digit as `y_a = Σx/2 − x_a`
+(digit 0 in-register, digit 1 = e bit 2 + lane xor 1, digits 2/3 = lane xor
+2,4 / 8,16) — then row amax, scale = amax/127, `__float2int_rn`, 8-B int8
+stores. Weights unchanged (fold_weight at load), so `PREQUANT_FORMAT` and the
+convrot cache stay valid. The old rotate + quantize path is
+`ConvRotLinear::forward_as_unfused`, kept only as the self-test oracle.
+- **Self-test (`convrot-test`):** fused vs an f64-accumulated host reference
+  (row 0 zero, row 1 with 60× outliers): **0 int8 differences** at (M,K) =
+  (37,256), (300,4096), (64,12288), (5,16384), scale rel ≤ 1.1e-7. vs the old
+  bf16-GEMM path: int8 within ±1 on 4–6% of elements (the old path's bf16
+  rounding of `x R`), scale rel ≤ 3.8e-3 (bf16). Linear fused vs unfused
+  cosine 0.99998 / 0.99997. Rejects K=128/384/16640; M=0 → empty. Offset view
+  bit-identical. Activation path alone (M=4117): K=4096 0.133 → 0.027 ms,
+  K=12288 0.495 → 0.199 ms.
+- **Oracle (dit-forward --convrot vs dit_io):** default SA2 0.999898 →
+  **0.999879**; but `QIR_SAGE=1` 0.999867 → 0.999900 and `QIR_SAGE=2f32`
+  0.999832 → 0.999868 (mean of the three +1.7e-5). The per-op math is MORE
+  exact (matches f64), so the −1.9e-5 on the default config is the known
+  chaotic response of 32 blocks of INT8/FP8 rounding to any ~1e-5 input
+  change (see "Tail linears"), not an error. vs own no-convrot output
+  0.999912 → 0.999907. No-convrot byte-identical; run-to-run byte-identical.
+- **Images:** B=1 mug and `--batch 2` clean, on-prompt; B=1 == lane 0
+  (latent cos 1.0000000, PNG identical); vs prior B=1 latent cos 0.99993.
+- **Speed:** denoise A/B (batch --resident, 2nd image, two interleaved
+  rounds): 8500 / 8497 → 7644 / 7651 ms = **0.2125 → 0.1911 s/step (−10.1%)**.
+  nsys 10-step generate: rotation GEMM gone; `rotate_quantize_rows_k` 119.5 ms
+  total (<2> 1980× 35 us, <6> 320× 154 us ≈ 1 TB/s) vs 323.7 ms for
+  GEMM + quant before.
 
 ### Prequantized ConvRot DiT = the DEFAULT `--convrot` load (DONE — `qwen-image-rs-prequant-default`)
 `src/convrot_cache.rs`: every `--convrot` DiT load (generate, batch both paths,
@@ -862,7 +900,8 @@ Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-bf16-v-pv` (V born f16 in the ConvRot epilogue + sage partial-tile zero-fill),
 `-sageattention2` (SA2 sm89 behind `sage2` + `QIR_SAGE`),
 `-sage2-quant-fusion` (SA2 quant: 10 launches/layer → 3, bit-identical, −1.5%),
-`-prequant-default` (cached prequantized DiT = default `--convrot` load; load 7.0 → 2.7 s cold).
+`-prequant-default` (cached prequantized DiT = default `--convrot` load; load 7.0 → 2.7 s cold),
+`-fused-rotate-quant` (Hadamard rotation fused into the activation quantizer, −10.1%).
 Bugs (complete): `-b1-off-prompt` (B=1 generate ignored the prompt: fused bridges
 ignored the view offset — see Gotchas).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path
