@@ -1248,6 +1248,11 @@ fn sage_test() -> Result<()> {
                 r.poison_maxabs,
                 if r.poison_nan == 0 && r.poison_maxabs == 0.0 { "OK" } else { "FAIL" }
             );
+            println!(
+                "sage2 fused per-layer quant (3 launches) vs per-op kernels (B=1,2, offset views, txt=37/21, fp16+fp32 accum): payload/scale/output mismatches = {} ({})",
+                r.fused_mismatches,
+                if r.fused_mismatches == 0 { "BIT-IDENTICAL" } else { "MISMATCH" }
+            );
             r.ok()
         };
         #[cfg(not(feature = "sage2"))]

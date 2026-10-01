@@ -53,6 +53,7 @@ extern "C" {
         sh: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn sage2_quant_layer_launch(tables: *const S2Tasks, ntables: i32, stream: *mut c_void) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn sage2_attn_launch(
         q_i8: *const c_void,
@@ -547,6 +548,26 @@ pub fn attend_block_causal(
     scale: f32,
     accum: PvAccum,
 ) -> Result<Tensor> {
+    let l = quant_layer(qh, kh, vf, cos, sin, txt_len, accum)?;
+    let ot = attention(&l.qt, &l.kt, &l.vt, scale, true)?; // (B,txt,H,D)
+    let oi = attention(&l.qi, &l.kf, &l.vf, scale, false)?; // (B,img,H,D)
+    Ok(Tensor::cat(&[ot, oi], 1)?)
+}
+
+/// [`attend_block_causal`] with each operand quantized by its own per-op
+/// launch ([`rope_quant`] / [`quant_v`], ten launches) — the byte-exact
+/// oracle for [`quant_layer`] in `sage-test`.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_block_causal_unfused(
+    qh: &Tensor,
+    kh: &Tensor,
+    vf: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    txt_len: usize,
+    scale: f32,
+    accum: PvAccum,
+) -> Result<Tensor> {
     let (_b, s, _h, _d) = qh.dims4()?;
     let img = s - txt_len;
     let (ct, st) = (cos.narrow(0, 0, txt_len)?, sin.narrow(0, 0, txt_len)?);
@@ -565,6 +586,347 @@ pub fn attend_block_causal(
     let vfq = quant_v(vf, accum)?;
     let oi = attention(&qi, &kf, &vfq, scale, false)?; // (B,img,H,D)
     Ok(Tensor::cat(&[ot, oi], 1)?)
+}
+
+// ---------------------------------------------------------------------------
+// Fused per-layer quant (three launches for all six operands)
+// ---------------------------------------------------------------------------
+
+/// Task kinds (`S2Kind` in sage2_ffi.cu).
+const S2_Q: u32 = 0;
+const S2_K: u32 = 1;
+const S2_V: u32 = 2;
+const S2_KSUM: u32 = 3;
+const S2_VAMAX: u32 = 4;
+const S2_MAX_TASKS: usize = 6;
+/// Partial-reduction chunks per CTA (`S2_PART_PER_CTA` in sage2_ffi.cu).
+const S2_PART_PER_CTA: usize = 2;
+
+/// One quant task (mirror of `S2Task` in sage2_ffi.cu: 6 pointers, 11 u32, 1 f32).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct S2Task {
+    inp: *const c_void,
+    cos: *const c_void,
+    sin: *const c_void,
+    partial: *mut f32,
+    out: *mut c_void,
+    scale: *mut f32,
+    kind: u32,
+    n: u32,
+    nchunk: u32,
+    nblk: u32,
+    ncta: u32,
+    nblocks: u32,
+    sbz: u32,
+    sseq: u32,
+    sh: u32,
+    sseq_cs: u32,
+    lpad: u32,
+    scale_max: f32,
+}
+
+impl S2Task {
+    const EMPTY: S2Task = S2Task {
+        inp: std::ptr::null(),
+        cos: std::ptr::null(),
+        sin: std::ptr::null(),
+        partial: std::ptr::null_mut(),
+        out: std::ptr::null_mut(),
+        scale: std::ptr::null_mut(),
+        kind: 0,
+        n: 0,
+        nchunk: 0,
+        nblk: 0,
+        ncta: 0,
+        nblocks: 0,
+        sbz: 0,
+        sseq: 0,
+        sh: 0,
+        sseq_cs: 0,
+        lpad: 0,
+        scale_max: 0.0,
+    };
+}
+
+/// A launch's task table (mirror of `S2Tasks`).
+#[repr(C)]
+struct S2Tasks {
+    t: [S2Task; S2_MAX_TASKS],
+    ntask: u32,
+    h: u32,
+    b: u32,
+}
+
+// ABI with `S2Task` / `S2Tasks` in sage2_ffi.cu (static_assert'ed there too).
+const _: () = assert!(std::mem::size_of::<S2Task>() == 96);
+const _: () = assert!(std::mem::size_of::<S2Tasks>() == 592);
+
+impl S2Tasks {
+    fn new(h: usize, b: usize) -> Self {
+        Self {
+            t: [S2Task::EMPTY; S2_MAX_TASKS],
+            ntask: 0,
+            h: h as u32,
+            b: b as u32,
+        }
+    }
+    fn push(&mut self, t: S2Task) {
+        self.t[self.ntask as usize] = t;
+        self.ntask += 1;
+    }
+}
+
+/// Value object: the six quantized operands of one block-causal SA2
+/// attention — the text-prefix call `(qt, kt, vt)` over `[0, txt)` and the
+/// image call `(qi, kf, vf)` (image queries, full K/V). Each operand has the
+/// exact payload/scale layout of the per-op [`rope_quant`] / [`quant_v`].
+pub struct Sage2Layer {
+    pub qt: Sage2Qk,
+    pub kt: Sage2Qk,
+    pub vt: Sage2V,
+    pub qi: Sage2Qk,
+    pub kf: Sage2Qk,
+    pub vf: Sage2V,
+}
+
+fn as_cuda<'a>(st: &'a candle_core::Storage, what: &str) -> Result<&'a CudaStorage> {
+    match st {
+        candle_core::Storage::Cuda(c) => Ok(c),
+        _ => anyhow::bail!("sage2::quant_layer: {what} must be on CUDA"),
+    }
+}
+
+/// Quantize all six operands of [`attend_block_causal`] in three launches of
+/// one generic kernel (V-amax partials; V quant + K-sum partials; K quant +
+/// Q quant), ordered for L2 reuse. `qh,kh` PRE-rope
+/// `(B,S,H,D)` bf16 views, `vf (B,S,H,D)` f16, `cos,sin (S, D/2)` bf16.
+/// Byte-identical to quantizing each S-axis narrow with the per-op kernels.
+#[allow(clippy::too_many_arguments)]
+pub fn quant_layer(
+    qh: &Tensor,
+    kh: &Tensor,
+    vf: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    txt_len: usize,
+    accum: PvAccum,
+) -> Result<Sage2Layer> {
+    use candle_core::cuda_backend::cudarc::driver::CudaSlice;
+    use candle_core::op::BackpropOp;
+    use candle_core::Storage;
+
+    let (b, s, h, _) = qh.dims4()?;
+    if kh.dims() != qh.dims() || vf.dims() != qh.dims() {
+        anyhow::bail!(
+            "sage2::quant_layer: q {:?} / k {:?} / v {:?} shapes differ",
+            qh.dims(),
+            kh.dims(),
+            vf.dims()
+        );
+    }
+    if qh.dtype() != DType::BF16 || kh.dtype() != DType::BF16 || vf.dtype() != DType::F16 {
+        anyhow::bail!("sage2::quant_layer: need q,k bf16 and v f16");
+    }
+    if txt_len == 0 || txt_len >= s {
+        anyhow::bail!("sage2::quant_layer: need 0 < txt_len ({txt_len}) < S ({s})");
+    }
+    let img = s - txt_len;
+    let (qs, ql) = qh.storage_and_layout();
+    let (ks, kl) = kh.storage_and_layout();
+    let (vs, vl) = vf.storage_and_layout();
+    let (cs, cl) = cos.storage_and_layout();
+    let (ss, sl) = sin.storage_and_layout();
+    // The read guards stay alive until every kernel has been enqueued.
+    let (qc, kc, vc, cc, sc) = (
+        as_cuda(&qs, "q")?,
+        as_cuda(&ks, "k")?,
+        as_cuda(&vs, "v")?,
+        as_cuda(&cs, "cos")?,
+        as_cuda(&ss, "sin")?,
+    );
+    check_qk_view(ql, "sage2-quant-layer q")?;
+    check_qk_view(kl, "sage2-quant-layer k")?;
+    check_qk_view(vl, "sage2-quant-layer v")?;
+    let dhalf = check_rope_tables(cl, sl, s, "sage2-quant-layer")?;
+    let dev = qc.device().clone();
+    let stream = dev.cuda_stream();
+
+    let q_t = Sage2Qk::packed_bytes(b, h, txt_len, Role::Query);
+    let q_i = Sage2Qk::packed_bytes(b, h, img, Role::Query);
+    let k_t = Sage2Qk::packed_bytes(b, h, txt_len, Role::Key);
+    let k_f = Sage2Qk::packed_bytes(b, h, s, Role::Key);
+    let v_t = Sage2V::packed_bytes(b, h, txt_len);
+    let v_f = Sage2V::packed_bytes(b, h, s);
+    let alloc = |n: usize| -> Result<CudaSlice<u8>> { Ok(unsafe { dev.alloc::<u8>(n)? }) };
+    let outs = [
+        alloc(q_t)?,
+        alloc(q_i)?,
+        alloc(k_t)?,
+        alloc(k_f)?,
+        alloc(v_t)?,
+        alloc(v_f)?,
+    ];
+    let rc;
+    {
+        let bf = std::mem::size_of::<half::bf16>();
+        let (qp, _g0) = qc.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
+        let (kp, _g1) = kc.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
+        let (vp, _g2) = vc.as_cuda_slice::<half::f16>()?.device_ptr(&stream);
+        let (cp, _g3) = cc.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
+        let (sp, _g4) = sc.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
+        let mut op = [0usize; 6];
+        let mut _og = Vec::with_capacity(6);
+        for (o, slot) in outs.iter().zip(op.iter_mut()) {
+            let (p, g) = o.device_ptr(&stream);
+            *slot = p as usize;
+            _og.push(g);
+        }
+        // Element pointers of token `tok` of a (B,S,H,D) view / row `tok` of cos,sin.
+        let at = |base: u64, l: &Layout, tok: usize| -> usize {
+            base as usize + (l.start_offset() + tok * l.stride()[1]) * bf
+        };
+        let row = |base: u64, l: &Layout, tok: usize| -> usize {
+            base as usize + (l.start_offset() + tok * dhalf) * bf
+        };
+        let (qst, kst, vst) = (ql.stride(), kl.stride(), vl.stride());
+        let strides = |st: &[usize]| (st[0] as u32, st[1] as u32, st[2] as u32);
+        let qk_task = |kind: u32,
+                       inp: usize,
+                       c: usize,
+                       sn: usize,
+                       out: usize,
+                       n: usize,
+                       st: (u32, u32, u32)| {
+            let role = if kind == S2_K { Role::Key } else { Role::Query };
+            let (nblk, ncta) = match role {
+                Role::Query => (n.div_ceil(128) * 4, n.div_ceil(128) * 4),
+                Role::Key => (n.div_ceil(64), n.div_ceil(64)),
+            };
+            let i8_len = Sage2Qk::int8_bytes(b, h, n);
+            let scr = i8_len + 4 * b * h * role.scales_per_head(n);
+            S2Task {
+                inp: inp as *const c_void,
+                cos: c as *const c_void,
+                sin: sn as *const c_void,
+                partial: if role == Role::Key {
+                    (out + scr) as *mut f32
+                } else {
+                    std::ptr::null_mut()
+                },
+                out: out as *mut c_void,
+                scale: (out + i8_len) as *mut f32,
+                kind,
+                n: n as u32,
+                nchunk: n.div_ceil(CHUNK) as u32,
+                nblk: nblk as u32,
+                ncta: ncta as u32,
+                nblocks: (ncta * h * b) as u32,
+                sbz: st.0,
+                sseq: st.1,
+                sh: st.2,
+                sseq_cs: dhalf as u32,
+                lpad: 0,
+                scale_max: 0.0,
+            }
+        };
+        let v_task = |inp: usize, out: usize, n: usize, st: (u32, u32, u32)| {
+            let f8 = Sage2V::fp8_bytes(b, h, n);
+            let lpad = Sage2V::lpad(n);
+            S2Task {
+                inp: inp as *const c_void,
+                partial: (out + f8 + 4 * b * h * D) as *mut f32,
+                out: out as *mut c_void,
+                scale: (out + f8) as *mut f32,
+                kind: S2_V,
+                n: n as u32,
+                nchunk: n.div_ceil(CHUNK) as u32,
+                ncta: (lpad / V_TILE) as u32,
+                nblocks: (lpad / V_TILE * h * b) as u32,
+                sbz: st.0,
+                sseq: st.1,
+                sh: st.2,
+                lpad: lpad as u32,
+                scale_max: accum.scale_max(),
+                ..S2Task::EMPTY
+            }
+        };
+        let (c0, s0) = (row(cp, cl, 0), row(sp, sl, 0));
+        let (ct, stx) = (row(cp, cl, txt_len), row(sp, sl, txt_len));
+        let tq = qk_task(S2_Q, at(qp, ql, 0), c0, s0, op[0], txt_len, strides(qst));
+        let iq = qk_task(S2_Q, at(qp, ql, txt_len), ct, stx, op[1], img, strides(qst));
+        let tk = qk_task(S2_K, at(kp, kl, 0), c0, s0, op[2], txt_len, strides(kst));
+        let fk = qk_task(S2_K, at(kp, kl, 0), c0, s0, op[3], s, strides(kst));
+        let tv = v_task(at(vp, vl, 0), op[4], txt_len, strides(vst));
+        let fv = v_task(at(vp, vl, 0), op[5], s, strides(vst));
+        // A partial pass writes into its K/V buffer's own scratch.
+        let partial = |t: &S2Task, kind: u32| S2Task {
+            kind,
+            ncta: 0,
+            nblocks: (t.nchunk as usize * h * b).div_ceil(S2_PART_PER_CTA) as u32,
+            ..*t
+        };
+        let table = |ts: &[S2Task]| {
+            let mut t = S2Tasks::new(h, b);
+            for x in ts {
+                t.push(*x);
+            }
+            t
+        };
+        // Launch order = L2 reuse: V was written last (to_v), then K, then Q;
+        // each tensor's quant pass directly follows its partial pass, so its
+        // second read hits L2 (one 4117-token K or V is 34 MB of the 72 MB L2).
+        // Launch order = L2 reuse (measured best of seven orders): V was
+        // written last (to_v), then K, then Q. V's amax partial reads V while
+        // it is still in L2, V's quant follows it and runs alongside K's sum
+        // partial, then K's quant (K just read) runs alongside Q.
+        let tables = [
+            table(&[partial(&fv, S2_VAMAX), partial(&tv, S2_VAMAX)]),
+            table(&[fv, tv, partial(&fk, S2_KSUM), partial(&tk, S2_KSUM)]),
+            table(&[fk, tk, iq, tq]),
+        ];
+        rc = unsafe {
+            sage2_quant_layer_launch(
+                tables.as_ptr(),
+                tables.len() as i32,
+                stream.cu_stream() as *mut c_void,
+            )
+        };
+    }
+    check_rc(rc, "sage2_quant_layer_launch")?;
+    drop((qs, ks, vs, cs, ss));
+    let [o_qt, o_qi, o_kt, o_kf, o_vt, o_vf] = outs;
+    let wrap = |o: CudaSlice<u8>| -> Tensor {
+        let n = o.len();
+        Tensor::from_storage(
+            Storage::Cuda(CudaStorage::wrap_cuda_slice(o, dev.clone())),
+            n,
+            BackpropOp::none(),
+            false,
+        )
+    };
+    let qk = |packed: Tensor, n: usize, role: Role| Sage2Qk {
+        packed,
+        b,
+        h,
+        n,
+        role,
+    };
+    let vv = |packed: Tensor, n: usize| Sage2V {
+        packed,
+        b,
+        h,
+        n,
+        accum,
+    };
+    Ok(Sage2Layer {
+        qt: qk(wrap(o_qt), txt_len, Role::Query),
+        kt: qk(wrap(o_kt), txt_len, Role::Key),
+        vt: vv(wrap(o_vt), txt_len),
+        qi: qk(wrap(o_qi), img, Role::Query),
+        kf: qk(wrap(o_kf), s, Role::Key),
+        vf: vv(wrap(o_vf), s),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +977,10 @@ pub struct Sage2Report {
     pub poison_maxabs: f32,
     /// run twice: differing output elements.
     pub nondeterministic: usize,
+    /// fused [`quant_layer`] vs the per-op kernels: differing payload/scale
+    /// bytes of the six operands + differing attention outputs (B=1, B=2,
+    /// S-offset views, txt=37 and 21, fp16 and fp32 accum).
+    pub fused_mismatches: usize,
 }
 
 impl Sage2Report {
@@ -627,6 +993,7 @@ impl Sage2Report {
             && self.poison_nan == 0
             && self.poison_maxabs == 0.0
             && self.nondeterministic == 0
+            && self.fused_mismatches == 0
     }
 }
 
@@ -649,6 +1016,47 @@ fn count_diff(a: &Tensor, b: &Tensor) -> Result<usize> {
         anyhow::bail!("count_diff: length {} vs {}", a.len(), b.len());
     }
     Ok(a.iter().zip(&b).filter(|(x, y)| x != y).count())
+}
+
+fn byte_diff(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len())
+}
+
+/// Fused [`quant_layer`] vs the per-op [`rope_quant`] / [`quant_v`] on the
+/// same views: differing bytes over the six operands + differing outputs of
+/// [`attend_block_causal`] vs [`attend_block_causal_unfused`].
+#[allow(clippy::too_many_arguments)]
+fn fused_vs_unfused(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    txt: usize,
+    scale: f32,
+    accum: PvAccum,
+) -> Result<usize> {
+    let s = q.dim(1)?;
+    let img = s - txt;
+    let l = quant_layer(q, k, v, cos, sin, txt, accum)?;
+    let (ct, st) = (cos.narrow(0, 0, txt)?, sin.narrow(0, 0, txt)?);
+    let (ci, si) = (cos.narrow(0, txt, img)?, sin.narrow(0, txt, img)?);
+    let qt = rope_quant(&q.narrow(1, 0, txt)?, &ct, &st, Role::Query)?;
+    let kt = rope_quant(&k.narrow(1, 0, txt)?, &ct, &st, Role::Key)?;
+    let vt = quant_v(&v.narrow(1, 0, txt)?, accum)?;
+    let qi = rope_quant(&q.narrow(1, txt, img)?, &ci, &si, Role::Query)?;
+    let kf = rope_quant(k, cos, sin, Role::Key)?;
+    let vf = quant_v(v, accum)?;
+    let mut bad = 0;
+    for (a, r) in [(&l.qt, &qt), (&l.kt, &kt), (&l.qi, &qi), (&l.kf, &kf)] {
+        bad += byte_diff(&a.to_bytes()?, &r.to_bytes()?);
+    }
+    for (a, r) in [(&l.vt, &vt), (&l.vf, &vf)] {
+        bad += byte_diff(&a.to_bytes()?, &r.to_bytes()?);
+    }
+    let o = attend_block_causal(q, k, v, cos, sin, txt, scale, accum)?;
+    let r = attend_block_causal_unfused(q, k, v, cos, sin, txt, scale, accum)?;
+    Ok(bad + count_diff(&o, &r)?)
 }
 
 fn count_nonfinite(t: &Tensor) -> Result<usize> {
@@ -732,6 +1140,7 @@ pub fn self_test() -> Result<Sage2Report> {
         poison_nan: 0,
         poison_maxabs: 0.0,
         nondeterministic: 0,
+        fused_mismatches: 0,
     };
 
     // 1. accuracy vs f32, B=1 and B=2; 2. lanes; 5. determinism.
@@ -774,6 +1183,25 @@ pub fn self_test() -> Result<Sage2Report> {
         rep.lane_mismatches += count_diff(&o1, &o2.narrow(0, lane, 1)?)?;
     }
 
+    // 6. fused per-layer quant vs the per-op kernels (B=2 here; B=1, offset
+    //    views and txt=21 below).
+    for accum in [PvAccum::F16, PvAccum::F32] {
+        rep.fused_mismatches += fused_vs_unfused(&q2, &k2, &v2, &cos, &sin, txt, sc, accum)?;
+    }
+    for lane in 0..2 {
+        rep.fused_mismatches += fused_vs_unfused(
+            &q2.narrow(0, lane, 1)?,
+            &k2.narrow(0, lane, 1)?,
+            &v2.narrow(0, lane, 1)?,
+            &cos,
+            &sin,
+            txt,
+            sc,
+            PvAccum::F16,
+        )?;
+    }
+    rep.fused_mismatches += fused_vs_unfused(&q2, &k2, &v2, &cos, &sin, 21, sc, PvAccum::F16)?;
+
     // 3. S-axis offset views vs fresh copies, every op.
     {
         let pad = 5usize;
@@ -799,6 +1227,7 @@ pub fn self_test() -> Result<Sage2Report> {
         rep.offset_mismatches += bytes(qa.to_bytes()?, qr.to_bytes()?);
         rep.offset_mismatches += bytes(ka.to_bytes()?, kr.to_bytes()?);
         rep.offset_mismatches += bytes(va.to_bytes()?, vr.to_bytes()?);
+        rep.fused_mismatches += fused_vs_unfused(&qv, &kv, &vv, &cos, &sin, txt, sc, PvAccum::F16)?;
         let oa = attend_block_causal(&qv, &kv, &vv, &cos, &sin, txt, sc, PvAccum::F16)?;
         let or = attend_block_causal(&qc, &kc, &vc, &cos, &sin, txt, sc, PvAccum::F16)?;
         rep.offset_mismatches += count_diff(&oa, &or)?;

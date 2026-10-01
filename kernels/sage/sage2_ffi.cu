@@ -257,6 +257,268 @@ __global__ void Sage2VQuantKernel(const half *__restrict__ v,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fused per-layer quant (qwen-image-rs-sage2-quant-fusion). One block-causal
+// SA2 attention needs six quantized operands: Q(txt), Q(img), K(txt), K(full),
+// V(txt), V(full) — ten per-op launches (two passes per K and V operand: the
+// per-channel partial reduction, then the quant). The DiT issues three
+// launches of ONE generic 512-thread kernel instead, each over a table of
+// tasks (one task per CTA, decoded from a flat blockIdx.x):
+//   1. V-amax partials (V full, V txt)
+//   2. V quant (full, txt) + K-sum partials (full, txt)
+//   3. K quant (full, txt) + Q quant (img, txt)
+// The order keeps each tensor's second read right after its first (V was
+// written last by to_v, then K, then Q), so the quant pass re-reads from L2;
+// the small text-prefix tasks ride along instead of costing five launches of
+// their own (each a few us of GPU time plus a launch gap). The math of every
+// task is the per-op kernel's, op for op and in the same summation order, so
+// payloads + scales are byte-identical (sage-test checks it against the
+// untouched per-op kernels above).
+
+enum S2Kind : uint32_t { kS2Q = 0, kS2K = 1, kS2V = 2, kS2KSum = 3, kS2VAmax = 4 };
+
+// One quant task. Pointers are already offset to the view's first element (and
+// cos/sin to its first row). `nblk` = the scale layout's quant blocks per head
+// (Q: ceil(n/128)*4 32-token blocks; K: ceil(n/64)); `ncta` = CTAs per head
+// (Q/K/V) or 0 (partials); `nblocks` = the task's share of the flat grid.
+struct S2Task {
+  const void *in;
+  const void *cos;
+  const void *sin;
+  float *partial;
+  void *out;
+  float *scale;
+  uint32_t kind, n, nchunk, nblk, ncta, nblocks;
+  uint32_t sbz, sseq, sh, sseq_cs, lpad;
+  float scale_max;
+};
+
+constexpr uint32_t S2_MAX_TASKS = 6;
+struct S2Tasks {
+  S2Task t[S2_MAX_TASKS];
+  uint32_t ntask, H, B;
+};
+// ABI with the #[repr(C)] mirrors in src/sage2.rs (which assert the same sizes).
+static_assert(sizeof(S2Task) == 96, "S2Task layout");
+static_assert(sizeof(S2Tasks) == 592, "S2Tasks layout");
+
+// 512-thread CTAs: up to three resident per SM, so one CTA's barrier stalls
+// overlap the others' loads (a 1024-thread CTA is alone on its SM).
+constexpr uint32_t S2_THREADS = 512;
+constexpr uint32_t S2_ROWS = S2_THREADS / TPT;                   // 32 token rows
+constexpr uint32_t S2_PART_PER_CTA = S2_THREADS / (ROWS * TPT); // 2 chunks
+
+// Map a flat block index to (task, block within the task); false if past the end.
+__device__ __forceinline__ bool s2_pick(const S2Tasks &P, uint32_t blk, S2Task &T,
+                                        uint32_t &local) {
+  for (uint32_t i = 0; i < P.ntask; i++) {
+    if (blk < P.t[i].nblocks) {
+      T = P.t[i];
+      local = blk;
+      return true;
+    }
+    blk -= P.t[i].nblocks;
+  }
+  return false;
+}
+
+// Partials: each 256-thread quarter of the CTA runs Sage2KSumPartialKernel /
+// Sage2VAmaxPartialKernel's body for one (chunk, h, b) — same loop, same
+// order (per row t = c*CHUNK + row + 16i ascending, then rows 0..15).
+__device__ __forceinline__ void s2_partial(const S2Task &T, uint32_t local, uint32_t nh,
+                                           uint32_t nb) {
+  const uint32_t q = threadIdx.x / (ROWS * TPT), qt = threadIdx.x % (ROWS * TPT);
+  const uint32_t li = local * S2_PART_PER_CTA + q;
+  const bool live = li < T.nchunk * nh * nb;
+  const uint32_t c = li % T.nchunk, h = (li / T.nchunk) % nh, b = li / (T.nchunk * nh);
+  const uint32_t row = qt / TPT, d0 = qt % TPT * 8;
+  const bool is_k = T.kind == kS2KSum;
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  if (live) {
+    const uint32_t end = min((c + 1) * CHUNK, T.n);
+    for (uint32_t t = c * CHUNK + row; t < end; t += ROWS) {
+      if (is_k) {
+        float y[8];
+        rope_pack((const __nv_bfloat16 *)T.in + (size_t)b * T.sbz + (size_t)h * T.sh +
+                      (size_t)t * T.sseq + d0,
+                  (const __nv_bfloat16 *)T.cos, (const __nv_bfloat16 *)T.sin, t, T.sseq_cs,
+                  d0, y);
+#pragma unroll
+        for (uint32_t j = 0; j < 8; j++) acc[j] += y[j];
+      } else {
+        half x[8];
+        *(float4 *)(&x[0]) = *(const float4 *)((const half *)T.in + (size_t)b * T.sbz +
+                                               (size_t)h * T.sh + (size_t)t * T.sseq + d0);
+#pragma unroll
+        for (uint32_t j = 0; j < 8; j++) acc[j] = fmaxf(acc[j], fabsf(__half2float(x[j])));
+      }
+    }
+  }
+  __shared__ float sm[S2_PART_PER_CTA][ROWS][D];
+#pragma unroll
+  for (uint32_t j = 0; j < 8; j++) sm[q][row][d0 + j] = acc[j];
+  __syncthreads();
+  if (live && qt < D) {
+    float s = 0.f;
+    if (is_k) {
+      for (uint32_t r = 0; r < ROWS; r++) s += sm[q][r][qt];
+    } else {
+      for (uint32_t r = 0; r < ROWS; r++) s = fmaxf(s, sm[q][r][qt]);
+    }
+    T.partial[((size_t)(b * nh + h) * T.nchunk + c) * D + qt] = s;
+  }
+}
+
+// Q or K: RoPE (+ K: minus the key mean) + per-thread INT8 quant of one quant
+// block: Q = a 32-token warp block (8 groups, one token per thread), K = a
+// 64-token block (4 groups, two tokens per thread: rows r and r+32, which
+// share a group since 32 % 8 == 0). Same per-element math and scale values as
+// Sage2RopeQuantKernel (the mean is summed in the same chunk order; max is
+// order-independent).
+template <bool is_k>
+__device__ __forceinline__ void s2_quant_qk(const S2Task &T, uint32_t local, uint32_t nh) {
+  const uint32_t cx = local % T.ncta, h = (local / T.ncta) % nh, b = local / (T.ncta * nh);
+  const uint32_t tid = threadIdx.x;
+  constexpr uint32_t NT = is_k ? 2 : 1;                 // tokens per thread
+  constexpr uint32_t blk_tok = S2_ROWS * NT, ng = is_k ? 4 : 8;
+  const uint32_t row0 = tid / TPT, d0 = tid % TPT * 8;
+  const uint32_t g = is_k ? (row0 % 8) / 2 : row0 % 8; // same for row0 + 32
+  const size_t hb = (size_t)(b * nh + h);
+
+  __shared__ float s_mean[D];
+  __shared__ float s_tok_amax[64];
+  __shared__ float s_gamax[8];
+  if constexpr (is_k) {
+    if (tid < D) {
+      float s = 0.f;
+      const float *p = T.partial + hb * T.nchunk * D + tid;
+#pragma unroll 8
+      for (uint32_t c = 0; c < T.nchunk; c++) s += p[(size_t)c * D];
+      s_mean[tid] = s / (float)T.n;
+    }
+    __syncthreads();
+  }
+  float x[NT][8];
+#pragma unroll
+  for (uint32_t i = 0; i < NT; i++) {
+    const uint32_t row = row0 + i * S2_ROWS, tok = cx * blk_tok + row;
+    if (tok < T.n) {
+      rope_pack((const __nv_bfloat16 *)T.in + (size_t)b * T.sbz + (size_t)h * T.sh +
+                    (size_t)tok * T.sseq + d0,
+                (const __nv_bfloat16 *)T.cos, (const __nv_bfloat16 *)T.sin, tok,
+                T.sseq_cs, d0, x[i]);
+      if constexpr (is_k) {
+#pragma unroll
+        for (uint32_t j = 0; j < 8; j++) x[i][j] -= s_mean[d0 + j];
+      }
+    } else {
+#pragma unroll
+      for (uint32_t j = 0; j < 8; j++) x[i][j] = 0.f;
+    }
+    float amax = 0.0000001f;
+#pragma unroll
+    for (uint32_t j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(x[i][j]));
+#pragma unroll
+    for (uint32_t off = TPT / 2; off > 0; off /= 2)
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    if (tid % TPT == 0) s_tok_amax[row] = amax;
+  }
+  __syncthreads();
+  if (tid < ng) {
+    float m = 0.0000001f;
+#pragma unroll
+    for (uint32_t r = 0; r < blk_tok; r++) {
+      const uint32_t rg = is_k ? (r % 8) / 2 : r % 8;
+      if (rg == tid) m = fmaxf(m, s_tok_amax[r]);
+    }
+    s_gamax[tid] = m;
+    T.scale[hb * T.nblk * ng + cx * ng + tid] = m / 127.0f;
+  }
+  __syncthreads();
+  const float inv = 127.0f / s_gamax[g];
+#pragma unroll
+  for (uint32_t i = 0; i < NT; i++) {
+    const uint32_t tok = cx * blk_tok + row0 + i * S2_ROWS;
+    if (tok < T.n) {
+      char4 o[2];
+      o[0] = make_char4(float_to_int8_rn(x[i][0] * inv), float_to_int8_rn(x[i][1] * inv),
+                        float_to_int8_rn(x[i][2] * inv), float_to_int8_rn(x[i][3] * inv));
+      o[1] = make_char4(float_to_int8_rn(x[i][4] * inv), float_to_int8_rn(x[i][5] * inv),
+                        float_to_int8_rn(x[i][6] * inv), float_to_int8_rn(x[i][7] * inv));
+      *reinterpret_cast<float2 *>((int8_t *)T.out + (hb * T.n + tok) * D + d0) =
+          *reinterpret_cast<float2 *>(&o[0]);
+    }
+  }
+}
+
+// V: Sage2VQuantKernel's body for one 64-token tile, two tokens per thread
+// (rows r and r+32).
+__device__ __forceinline__ void s2_quant_v(const S2Task &T, uint32_t local, uint32_t nh) {
+  const uint32_t bx = local % T.ncta, h = (local / T.ncta) % nh, b = local / (T.ncta * nh);
+  const uint32_t tid = threadIdx.x;
+  const size_t hb = (size_t)(b * nh + h);
+  __shared__ float s_inv[D];
+  __shared__ __align__(16) uint8_t s_out[D][V_TILE];
+  if (tid < D) {
+    float a = 0.0000001f;
+    const float *p = T.partial + hb * T.nchunk * D + tid;
+#pragma unroll 8
+    for (uint32_t c = 0; c < T.nchunk; c++) a = fmaxf(a, p[(size_t)c * D]);
+    s_inv[tid] = T.scale_max / a;
+    if (bx == 0) T.scale[hb * D + tid] = a / T.scale_max;
+  }
+  __syncthreads();
+  const uint32_t row0 = tid / TPT, d0 = tid % TPT * 8;
+#pragma unroll
+  for (uint32_t i = 0; i < V_TILE / S2_ROWS; i++) {
+    const uint32_t row = row0 + i * S2_ROWS, tok = bx * V_TILE + row;
+    float x[8];
+    if (tok < T.n) {
+      half hv[8];
+      *(float4 *)(&hv[0]) = *(const float4 *)((const half *)T.in + (size_t)b * T.sbz +
+                                              (size_t)h * T.sh + (size_t)tok * T.sseq + d0);
+#pragma unroll
+      for (uint32_t j = 0; j < 8; j++) x[j] = __half2float(hv[j]);
+    } else {
+#pragma unroll
+      for (uint32_t j = 0; j < 8; j++) x[j] = 0.f;
+    }
+    const uint32_t col = (row / 16) * 16 + perm16(row % 16);
+#pragma unroll
+    for (uint32_t j = 0; j < 8; j++) {
+      __nv_fp8_storage_t q =
+          __nv_cvt_float_to_fp8(x[j] * s_inv[d0 + j], __NV_SATFINITE, __NV_E4M3);
+      s_out[d0 + j][col] = (uint8_t)q;
+    }
+  }
+  __syncthreads();
+  static_assert(D * (V_TILE / 16) == S2_THREADS, "one 16-B store per thread");
+  const uint32_t d = tid / (V_TILE / 16), part = tid % (V_TILE / 16);
+  *(uint4 *)((uint8_t *)T.out + (hb * D + d) * T.lpad + bx * V_TILE + part * 16) =
+      *(const uint4 *)(&s_out[d][part * 16]);
+}
+
+// One CTA = one (task, block). Every path keeps its __syncthreads uniform
+// across the CTA (the whole CTA runs one task).
+__global__ void __launch_bounds__(S2_THREADS) Sage2QuantKernel(const S2Tasks P) {
+  S2Task T;
+  uint32_t local;
+  if (!s2_pick(P, blockIdx.x, T, local)) return;
+  switch (T.kind) {
+  case kS2KSum:
+  case kS2VAmax: s2_partial(T, local, P.H, P.B); break;
+  case kS2Q: s2_quant_qk<false>(T, local, P.H); break;
+  case kS2K: s2_quant_qk<true>(T, local, P.H); break;
+  default: s2_quant_v(T, local, P.H); break;
+  }
+}
+
+static uint32_t s2_total_blocks(const S2Tasks &P) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < P.ntask; i++) n += P.t[i].nblocks;
+  return n;
+}
+
 template <MaskMode MM, bool F16_ACCUM>
 static cudaError_t launch_attn(const int8_t *q, const int8_t *k, const int8_t *v,
                                __nv_bfloat16 *o, const float *qs, const float *ks,
@@ -373,4 +635,41 @@ extern "C" int sage2_attn_launch(const void *q_i8, const void *k_i8,
                                                         sbz_o, sseq_o, sh_o, sm_scale, st);
   }
   return (int)e;
+}
+
+// Fused per-layer quant: `ntables` launches of Sage2QuantKernel, in order, one
+// per task table (sage2.rs quant_layer builds them). Validates the tables'
+// grid bookkeeping against the kernel's fixed CTA shapes before launching.
+extern "C" int sage2_quant_layer_launch(const S2Tasks *tables, int ntables,
+                                        void *stream) {
+  cudaStream_t st = (cudaStream_t)stream;
+  for (int i = 0; i < ntables; i++) {
+    const S2Tasks &P = tables[i];
+    if (P.ntask == 0 || P.ntask > S2_MAX_TASKS) return (int)cudaErrorInvalidValue;
+    for (uint32_t j = 0; j < P.ntask; j++) {
+      const S2Task &T = P.t[j];
+      const uint32_t heads = P.H * P.B;
+      uint32_t want;
+      switch (T.kind) {
+      case kS2KSum:
+      case kS2VAmax:
+        want = (T.nchunk * heads + S2_PART_PER_CTA - 1) / S2_PART_PER_CTA;
+        break;
+      case kS2Q:
+        if (T.ncta != T.nblk) return (int)cudaErrorInvalidValue; // one warp block per CTA
+        want = T.ncta * heads;
+        break;
+      case kS2K:
+      case kS2V: want = T.ncta * heads; break;
+      default: return (int)cudaErrorInvalidValue;
+      }
+      if (T.nblocks != want) return (int)cudaErrorInvalidValue;
+    }
+    const uint32_t n = s2_total_blocks(P);
+    if (n == 0) continue;
+    Sage2QuantKernel<<<n, S2_THREADS, 0, st>>>(P);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+  }
+  return (int)cudaSuccess;
 }
