@@ -503,7 +503,7 @@ pub fn attention(q: &Sage2Qk, k: &Sage2Qk, v: &Sage2V, scale: f32, causal: bool)
     if q.role != Role::Query || k.role != Role::Key {
         anyhow::bail!("sage2::attention: need (Query, Key) operands");
     }
-    if q.b != k.b || k.b != v.b || k.h != v.h || k.n != v.n || q.h % k.h != 0 {
+    if q.b != k.b || k.b != v.b || k.h != v.h || k.n != v.n || !q.h.is_multiple_of(k.h) {
         anyhow::bail!(
             "sage2::attention: operand dims disagree or q heads not a multiple of kv heads (q b{} h{} n{}, k b{} h{} n{}, v b{} h{} n{})",
             q.b,
