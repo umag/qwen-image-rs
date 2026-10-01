@@ -330,7 +330,9 @@ fn sweep_stale_tmps(out: &Path) {
 /// which `QwenImageDit::load` rotates + quantizes on load — identical output.
 pub fn resolve_dit_files(dir: &Path, convrot: bool, spec: &CacheSpec) -> Result<Vec<PathBuf>> {
     let files = crate::loader::WeightSet::resolve(dir)?.files;
-    if !convrot || spec.mode == CacheMode::Off {
+    // Without the `convrot` feature the loader ignores --convrot (no rotation),
+    // so there is nothing to cache.
+    if !convrot || !cfg!(feature = "convrot") || spec.mode == CacheMode::Off {
         return Ok(files);
     }
     if files_hold_prequant(&files)? {
@@ -650,6 +652,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "convrot")]
     fn a_hit_is_served_without_building() {
         let d = tmpdir("hit");
         let src = d.join("snap").join("transformer");
@@ -670,25 +673,23 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_entry_without_convrot_falls_back_to_the_sources() {
-        // On the CPU (or a build without `convrot`) the rebuild fails; the run
-        // must still get the source files, never an error or the stale file.
+    fn without_the_convrot_feature_the_cache_is_never_touched() {
+        // A build without `convrot` ignores --convrot; resolution must hand
+        // back the sources and create nothing, even with a stale entry around.
         if cfg!(feature = "convrot") {
-            return; // would try a real GPU build
+            return;
         }
-        let d = tmpdir("stale");
+        let d = tmpdir("nofeat");
         let src = d.join("snap").join("transformer");
         std::fs::create_dir_all(&src).unwrap();
         let f = src.join("m.safetensors");
         write_st(&f, &["a.weight"], None);
         let root = d.join("cache");
-        let entry = entry_path(&root, &src).unwrap();
-        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
-        write_st(&entry, &["a.weight_i8"], meta("old-policy", "x"));
         let spec = CacheSpec {
-            root: Some(root),
-            mode: CacheMode::Use,
+            root: Some(root.clone()),
+            mode: CacheMode::Rebuild,
         };
         assert_eq!(resolve_dit_files(&src, true, &spec).unwrap(), vec![f]);
+        assert!(!root.exists());
     }
 }
