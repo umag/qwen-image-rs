@@ -259,11 +259,15 @@ using Cfg1 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, Raster<4>>;
 using Cfg2 = convrot_evt::TileCfg<64, 128, 64, 32, 64, 64, 4, Raster<1>>;
 using Cfg3 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, Raster<4>>;
 // SPIKE (gemm-tiling-push): stream-K and alternates
-using Cfg4 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, StreamK>;
-using Cfg5 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, StreamK>;
+using Cfg4 = convrot_evt::TileCfg<256, 128, 64, 64, 64, 64, 4, Raster<1>>;
+using Cfg5 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 4, Raster<1>>;
 using Cfg6 = convrot_evt::TileCfg<256, 128, 64, 64, 64, 64, 3, Raster<1>>;
 using Cfg7 = convrot_evt::TileCfg<64, 64, 64, 32, 32, 64, 6, Raster<1>>;
-static constexpr int kNumCfgs = 8;
+using Cfg8 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, Raster<1>>;
+using Cfg9 = convrot_evt::TileCfg<256, 128, 64, 64, 64, 64, 3, Raster<2>>;
+using Cfg10 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 4, Raster<1>>;
+using Cfg11 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, Raster<2>>;
+static constexpr int kNumCfgs = 12;
 
 template <typename ElementOutput>
 static int int8_gemm_dequant_dispatch(
@@ -272,7 +276,7 @@ static int int8_gemm_dequant_dispatch(
 #define QIR_CFG(i) \
   case i: return int8_gemm_dequant_impl<ElementOutput, Cfg##i>(d, a, b, s_row, s_col, m, n, k, stream);
   switch (cfg) {
-    QIR_CFG(0) QIR_CFG(1) QIR_CFG(2) QIR_CFG(3) QIR_CFG(4) QIR_CFG(5) QIR_CFG(6) QIR_CFG(7)
+    QIR_CFG(0) QIR_CFG(1) QIR_CFG(2) QIR_CFG(3) QIR_CFG(4) QIR_CFG(5) QIR_CFG(6) QIR_CFG(7) QIR_CFG(8) QIR_CFG(9) QIR_CFG(10) QIR_CFG(11)
   }
 #undef QIR_CFG
   return -2;  // unknown config

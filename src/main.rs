@@ -1266,8 +1266,8 @@ fn gemm_bench(iters: usize, batch: usize, txt: usize) -> Result<()> {
         let mut plans: Vec<GemmPlan> = (0..GEMM_CONFIGS.len() as u8)
             .map(GemmPlan::single)
             .collect();
-        for main in [0u8, 1, 3, 6] {
-            for tail in [2u8, 7] {
+        for main in [0u8, 1, 3, 4, 5, 6, 8, 9, 10, 11] {
+            for tail in [7u8] {
                 plans.push(GemmPlan {
                     main,
                     tail: Some(tail),
