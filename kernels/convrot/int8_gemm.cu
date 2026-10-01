@@ -88,11 +88,15 @@ constexpr int AlignmentC = 8;   // 128-bit / 16-bit (bf16 | f16) store (all conv
 // warp tile, pipeline stages. INT8 accumulation is exact and the epilogue is
 // per element, so every config computes bit-identical outputs; the choice is
 // speed only (picked per shape on the Rust side, `convrot::gemm_config`).
-template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages>
+// Swizzle = GemmIdentityThreadblockSwizzle<Swizzle>: CTAs are rastered in
+// groups of up to Swizzle N-tiles so a wave reuses A (and B) tiles from L2
+// instead of streaming all of A once per N-column wave.
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages, int Swizzle>
 struct TileCfg {
   using ThreadblockShape = cutlass::gemm::GemmShape<TBM, TBN, TBK>;
   using WarpShape = cutlass::gemm::GemmShape<WM, WN, WK>;
   static constexpr int NumStages = Stages;
+  using Swz = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<Swizzle>;
 };
 
 // Everything downstream of the output element is templated on it (bf16 | f16)
@@ -147,7 +151,7 @@ struct Evt {
       WarpShape,
       InstructionShape,
       EVTD,
-      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+      typename Cfg::Swz,
       Cfg::NumStages,
       cutlass::arch::OpMultiplyAddSaturate,  // int8 tensor-op mma (no plain OpMultiplyAdd for s8)
       EVTEpilogueStages>::GemmKernel;
@@ -224,15 +228,16 @@ static int int8_gemm_dequant_impl(
 
 // The tile configs, by index (TB MxNxK / warp MxNxK / stages). 0 is the
 // original single config. Keep in sync with `convrot::GEMM_CONFIGS`.
-using Cfg0 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3>;
-using Cfg1 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3>;
-using Cfg2 = convrot_evt::TileCfg<256, 128, 64, 64, 64, 64, 3>;
-using Cfg3 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 4>;
-using Cfg4 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 5>;
-using Cfg5 = convrot_evt::TileCfg<256, 64, 64, 64, 64, 64, 4>;
-using Cfg6 = convrot_evt::TileCfg<64, 128, 64, 32, 64, 64, 4>;
-using Cfg7 = convrot_evt::TileCfg<128, 128, 128, 64, 64, 128, 3>;
-static constexpr int kNumCfgs = 8;
+using Cfg0 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, 1>;
+using Cfg1 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, 2>;
+using Cfg2 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, 4>;
+using Cfg3 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, 8>;
+using Cfg4 = convrot_evt::TileCfg<256, 128, 64, 64, 64, 64, 3, 1>;
+using Cfg5 = convrot_evt::TileCfg<256, 128, 64, 64, 64, 64, 3, 4>;
+using Cfg6 = convrot_evt::TileCfg<64, 128, 64, 32, 64, 64, 4, 1>;
+using Cfg7 = convrot_evt::TileCfg<128, 128, 128, 64, 64, 128, 3, 4>;
+using Cfg8 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, 4>;
+static constexpr int kNumCfgs = 9;
 
 template <typename ElementOutput>
 static int int8_gemm_dequant_dispatch(
@@ -241,7 +246,7 @@ static int int8_gemm_dequant_dispatch(
 #define QIR_CFG(i) \
   case i: return int8_gemm_dequant_impl<ElementOutput, Cfg##i>(d, a, b, s_row, s_col, m, n, k, stream);
   switch (cfg) {
-    QIR_CFG(0) QIR_CFG(1) QIR_CFG(2) QIR_CFG(3) QIR_CFG(4) QIR_CFG(5) QIR_CFG(6) QIR_CFG(7)
+    QIR_CFG(0) QIR_CFG(1) QIR_CFG(2) QIR_CFG(3) QIR_CFG(4) QIR_CFG(5) QIR_CFG(6) QIR_CFG(7) QIR_CFG(8)
   }
 #undef QIR_CFG
   return -2;  // unknown config

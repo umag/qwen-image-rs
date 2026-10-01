@@ -40,17 +40,18 @@ extern "C" {
 }
 
 /// The CUTLASS EVT tile configs (`kernels/convrot/int8_gemm.cu` `Cfg<i>`), by
-/// index: (threadblock M, N, K, warp M, N, K, stages). Every config computes
+/// index: (threadblock M, N, K, warp M, N, K, stages, swizzle). Every config computes
 /// bit-identical outputs (exact INT8 accumulation, per-element epilogue).
-pub const GEMM_CONFIGS: [(u16, u16, u16, u16, u16, u16, u8); 8] = [
-    (128, 128, 64, 64, 64, 64, 3),
-    (128, 256, 64, 64, 64, 64, 3),
-    (256, 128, 64, 64, 64, 64, 3),
-    (128, 128, 64, 64, 64, 64, 4),
-    (128, 128, 64, 64, 64, 64, 5),
-    (256, 64, 64, 64, 64, 64, 4),
-    (64, 128, 64, 32, 64, 64, 4),
-    (128, 128, 128, 64, 64, 128, 3),
+pub const GEMM_CONFIGS: [(u16, u16, u16, u16, u16, u16, u8, u8); 9] = [
+    (128, 128, 64, 64, 64, 64, 3, 1),
+    (128, 128, 64, 64, 64, 64, 3, 2),
+    (128, 128, 64, 64, 64, 64, 3, 4),
+    (128, 128, 64, 64, 64, 64, 3, 8),
+    (256, 128, 64, 64, 64, 64, 3, 1),
+    (256, 128, 64, 64, 64, 64, 3, 4),
+    (64, 128, 64, 32, 64, 64, 4, 1),
+    (128, 128, 128, 64, 64, 128, 3, 4),
+    (128, 256, 64, 64, 64, 64, 3, 4),
 ];
 
 /// The tile config the DiT uses for an `(M, N, K)` INT8 GEMM.

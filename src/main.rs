@@ -1228,8 +1228,8 @@ fn gemm_bench(iters: usize, batch: usize) -> Result<()> {
         ];
         for (i, c) in GEMM_CONFIGS.iter().enumerate() {
             println!(
-                "cfg {i}: TB {}x{}x{} warp {}x{}x{} stages {}",
-                c.0, c.1, c.2, c.3, c.4, c.5, c.6
+                "cfg {i}: TB {}x{}x{} warp {}x{}x{} stages {} swizzle {}",
+                c.0, c.1, c.2, c.3, c.4, c.5, c.6, c.7
             );
         }
         let mut all_same = true;
