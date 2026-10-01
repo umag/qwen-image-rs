@@ -1198,3 +1198,30 @@ the resident path had to tile.
   CUTLASS implicit-GEMM issue (`-vae-implicit-gemm-conv`) is unnecessary; NHWC end to end
   would only save the ~30 ms transforms. cudnnConvolutionBiasActivationForward could fuse
   bias (+ residual via z) into the conv.
+
+### VAE channel RmsNorm + residual fused (DONE — `qwen-image-rs-vae-fused-norm`, extends `fusednorm`, BYTE-IDENTICAL)
+`kernels/fusednorm/vae_norm.cu` + bridges `src/vae_fused.rs`; wired via
+`RmsNorm::forward_silu(x, with_silu)` and `Conv::forward_residual(x, r)` in vae.rs
+(`QIR_VAE_FUSED=0` = candle chain). `vae-fused-test` verb: 26 cases bit-identical.
+- **vae_rmsnorm_k<LOG2N, SILU>** replaces cast/sqr/fast_sum/sqrt/max/div/affine/cast/
+  bmul(γ)/silu (~200 ms of ~445). Byte identity with candle's `fast_sum_f32`: it runs a
+  block per pixel with N = next_pow2(min(1024,C)) threads, thread t holds 0+v[t]
+  (+v[t+1024]), then `shr[t] += shr[t+s]`, s = N/2..1. That association == a balanced
+  adjacent-pair tree over the leaves in BIT-REVERSED order (Python f32 sim: 0
+  mismatches), so a CTA = 32 pixels × 8 channel lanes; lane g sums the aligned chunk g of
+  the bit-reversed order (compile-time pairwise recursion, `__brev`), the 8 partials
+  combine pairwise in lane order. Explicit `__fmul_rn/__fadd_rn/__fdiv_rn/__fsqrt_rn`
+  (candle-kernels build without fast-math; no FMA contraction); affine as
+  `fadd(fmul(v, sqrt(C)), 0)` (−0 → +0 like candle); γ and SiLU with the same bf16
+  operators/`hexp` as candle's kernels. Adjacent threads = adjacent pixels → coalesced.
+- **vae_bias_residual_k:** `bf16(bf16(y + bias[c]) + r)` (both bf16 roundings) for the
+  resnet conv2 + skip and the attention proj + identity.
+- **Results:** `vae-decode` whole image **505 → 266 ms**, tiled 32 690 → 380 ms; resident
+  `batch --vae-tile 32` decode **683 → 382 ms**; all PNGs md5-identical to the
+  `-vae-cudnn` build (00 whole + tiled, 01, 02), dit-forward byte-identical. Norm kernels
+  now ~13 ms total.
+- **Kernel mix after (GPU ~231 ms):** conv 113 ms, badd 28 (bias of the non-residual
+  convs), ucopy 23 (dup_up / attention transposes), cuDNN nchw↔nhwc 31, upsample 9.5,
+  norm 13, bias_residual 6. Left: NHWC end to end (drops the 31 ms transforms + lets
+  cudnnConvolutionBiasActivationForward fuse the bias), then a distilled/lightweight
+  decoder is the only big lever (conv math itself is ~half of what remains).
