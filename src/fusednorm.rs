@@ -136,7 +136,8 @@ impl candle_core::CustomOp2 for FusedNormMod {
 }
 
 /// `norm_no_affine(x) * (scale + 1)` fused. `x` and `scale` share the shape
-/// `(..., N)`; normalization is over the last dim. bf16 in/out.
+/// `(..., N)`; normalization is over the last dim. bf16 in/out. The DiT now
+/// uses [`fused_residual_norm_mod`]; this op stays as its bit-identity oracle.
 pub fn fused_norm_mod(x: &Tensor, scale: &Tensor, eps: f32) -> Result<Tensor> {
     let x = x.contiguous()?;
     let scale = scale.contiguous()?;
@@ -271,8 +272,8 @@ fn rmsnorm_scale_impl(x: &Tensor, w: &Tensor, eps: f32, force_block: bool) -> Re
 }
 
 /// Fused gated residual: `out = h + tanh(gate) * y`, elementwise. `h`, `gate`,
-/// `y` share the same shape (bf16). Replaces `h + gate.tanh() * y` (used twice
-/// per block) in src/model/dit.rs.
+/// `y` share the same shape (bf16). The DiT now applies the residual inside
+/// [`fused_residual_norm_mod`]; this op stays as its bit-identity oracle.
 struct FusedGatedResidual;
 
 impl candle_core::CustomOp3 for FusedGatedResidual {

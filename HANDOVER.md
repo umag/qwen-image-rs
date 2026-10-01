@@ -24,7 +24,7 @@ reference. ~36 commits. This doc = pick-up point for a fresh session.
 End-to-end works: `generate --model <snapshot> --prompt "..." --out x.png`.
 **Fastest build: `--features convrot,sage,fusednorm,sage2`** (SageAttention2,
 dit-forward 0.999911 since `-fused-swiglu` (0.999879 after `-fused-rotate-quant`, chaos) — FP8 P·V;
-denoise 0.1647 s/step after `-qk-norm-fusion` (same-session A/B; 0.1703 after `-gemm-merge-tune` in its session); `QIR_SAGE=1` in that binary = SageAttention v1,
+denoise 0.1522 s/step after `-residual-norm-fusion` (same-session A/B; 0.1647 after `-qk-norm-fusion` in its session); `QIR_SAGE=1` in that binary = SageAttention v1,
 bit-identical to the build without `sage2`). **Most accurate fast build: `--features
 convrot,sage,fusednorm`** (0.999944). **DEFAULT (human decision 2026-10-01): the
 SA2 build** — accepted at 0.999894 for -4.8% denoise. (bf16 VAE is the
@@ -58,7 +58,8 @@ at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 d
 | Hadamard rotation fused into the activation quantizer (f32 in registers; no bf16 rotation GEMM) | convrot | 0.1911 (A/B same session: 0.2125 → 0.1911, −10.1%; dit-forward --convrot 0.999898 → 0.999879, chaos — see section) |
 | SwiGLU `silu(g)·p` fused into the MLP-out rotate+quantize (f32; no bf16 h, no usilu/bmul passes) | convrot | 0.1746 (A/B same session: 0.1905 → 0.1746, −8.4%; dit-forward --convrot SA2 0.999879 → 0.999911, v1 0.999900 → 0.999881, chaos) |
 | q\|k (head-interleaved) and gate\|proj merged GEMMs, v on the shared activation quant, per-shape CUTLASS tile/swizzle | convrot | 0.1703 (A/B same session: 0.1750 → 0.1703, −2.7%; `--batch 2` 0.3555 → 0.3374, −5.1%; byte-identical output) |
-| per-head q/k RMSNorm: 16-lane N=128 kernel (3.1× faster) + fused into the SA2 Q/K/K-sum quant (normalized q/k never written), byte-identical | fusednorm,sage2 | **0.1647** (A/B same session: 0.1769 → 0.1647, −6.9%; `--batch 2` 0.3492 → 0.3252, −6.9%; byte-identical output) |
+| per-head q/k RMSNorm: 16-lane N=128 kernel (3.1× faster) + fused into the SA2 Q/K/K-sum quant (normalized q/k never written), byte-identical | fusednorm,sage2 | 0.1647 (A/B same session: 0.1769 → 0.1647, −6.9%; `--batch 2` 0.3492 → 0.3252, −6.9%; byte-identical output) |
+| gated residual fused into the following LayerNorm+AdaLN (one CTA-per-row kernel writes h' and x), gate/scale read as the 2 modulation rows, byte-identical | fusednorm | **0.1522** (A/B same session: 0.1587 → 0.1522, −4.1%; `--batch 2` 0.3161 → 0.3021, −4.5%; byte-identical output) |
 
 Plus (not per-step): bf16 VAE decode 1.57×; text encoder Q8_0 GGUF (resident
 VRAM); VAE tiling (constant decode memory); true CFG (`--guidance`/`--negative`,
@@ -95,6 +96,26 @@ CLI verbs (all in `src/main.rs`): `generate`, `batch` (has `--resident`,
 `prequantize-text`.
 
 ### NEXT SESSION — remaining optimization backlog (ranked; latest nsys below)
+**Latest (after `-residual-norm-fusion`, 10-step generate, per denoise step = total/10
+for the per-step kernels):** INT8 GEMMs ~99.9 ms (91.8 + 8.1) · SA2 attention 18.6 ms ·
+SwiGLU rotate+quant 9.3 ms · `residual_norm_mod_kernel` 7.7 ms · Sage2QuantKernel 6.8 ms ·
+PlainRow rotate+quant 2.8 ms. **NOT per step** (constant with the step count, checked
+with a 3-step trace): `copy2d_u8` (212 launches, 21.6 ms = the int8 weight
+`Tensor::cat` in `ConvRotLinear::concat_out` for the merged q|k and gate|proj at DiT
+load) and `ucopy_bf16` (765 launches, load/text-encoder) — the earlier "copy2d_u8
+~2.1 ms/step" was a total/10 artefact. VAE decode (`im2col_bf16` 452 ms + bf16 GEMMs,
+once per image) is now ~16 % of a 40-step image. Ranked levers:
+1. **SwiGLU write/read** (9.3 ms, bandwidth-bound: 202 MB g|p read per call): have the
+   gate|proj GEMM epilogue emit `silu(g)·p` (interleaved g/p column tiles) so the
+   (S, 12288) product is written once and g|p never are — ~4-5 ms/step, large (EVT work).
+2. **VAE decode** (~1.2 s/image): implicit-GEMM convs instead of im2col.
+3. **norm_mod into the activation quant loader** (`-residual-norm-fusion` part 2, skipped):
+   kernel writes h' + per-row (mean, rstd), a NormModRow loader rebuilds x in registers
+   → ~1.9 ms x write + ~0.7 ms PlainRow L2 loss ≈ 2.6 ms/step (~1.7 %); needs a lazy
+   "normed activation" through Attention::project and SwiGlu (see section).
+4. INT8 GEMMs / SA2 attention are at the 4090 roofline (440–510 TOPS); Sage2Quant 6.8 ms.
+
+**Previous (after `-qk-norm-fusion`):**
 **Latest (after `-qk-norm-fusion`, 10-step generate, per denoise step):** INT8 GEMMs
 ~100 ms (91.6 main + 8.0 second EVT config; 440–510 TOPS, near the 4090's peak) ·
 SA2 attention 18.4 ms · SwiGLU rotate+quant 9.2 ms · fused gated residual 9.0 ms
@@ -266,6 +287,54 @@ policy tag are unchanged, no rebuild; warm DiT load unchanged ~0.97 s):
   silu(g) and the product, so it is now ±2 / 2^-7 (the f64 bound is unchanged).
 - Not done: q|k|v as one GEMM (V's f16 epilogue; see above); split-K (no shape
   needs it at these M; determinism kept by construction).
+
+### Gated residual fused into the following LayerNorm+AdaLN (DONE — `qwen-image-rs-residual-norm-fusion`, byte-identical)
+Every gated residual `h' = h + tanh(gate)·y` in the DiT (2 per block) is consumed by a
+LayerNorm(no-affine)×(scale+1): the mid-block one by `scale2`, the block-final one by
+the next block's `scale1`, the last block's by `norm_out`. At 10d9c1a they were two
+kernels (`fused_gated_residual_kernel` 8.9 ms/step + `fused_norm_mod_kernel` 6.6 ms/step)
+over materialized `(B, S, INNER)` gate/scale tensors.
+- **Kernel** (`residual_norm_mod_kernel<HAS_RES, VEC>`, kernels/fusednorm/fused_norm.cu):
+  CTA per row; computes h' in f32, rounds to bf16 exactly like the old kernel (same TU
+  and flags → same fma contraction), writes h', stages the ROUNDED row as f32 in shared
+  memory, then mean / var / normalize exactly as `fused_norm_mod_kernel`. The staging is
+  vectorized (16-B loads, 8 elements per thread) but after a barrier each thread sums the
+  same strided set `sh[tid + 256k]` in k order with the same tree → mean/var bit-identical.
+  `HAS_RES=false` serves the first block (no pending residual). Scalar staging fallback
+  when not 16-B aligned / n % 8 != 0.
+- **Modulation as 2 rows:** gate/scale are read straight from the `(2, INNER)` modulation
+  rows (row 1 for text tokens pos < txt_len, row 0 for image; pos = row % S, B lanes
+  share the split), so the per-token tensors (5 `select_rows` cats per forward, and the
+  B>1 broadcast copies) are gone. Rows may be column narrows of the `(2, 4·INNER)`
+  modulation output (row stride via `row_strided_2d`).
+- **DiT structure:** `residual_norm_mod(h, pending, scale) -> (h', x)` is the one AdaLN
+  entry point (src/model/dit.rs); `Block::forward(h, pending_mlp, &BlockMods) -> (h,
+  mlp_out)` — the block-final residual is applied by the next block's first norm or
+  norm_out. `Modulation` holds the rows (fusednorm) or the materialized per-token tensor
+  (candle fallback, unchanged math; CPU unit test pins it to the old pair).
+- **Bridge** (`fused_residual_norm_mod`, src/fusednorm.rs): storage_and_layout, two
+  outputs, view offsets for h / y / both row views; bails on dtype/shape/txt_len/smem.
+  The old `fused_norm_mod` / `fused_gated_residual` ops stay only as test oracles.
+- **Verified:** fusednorm-test 18 new bit-identity cases vs gated_residual → norm_mod
+  (B=1 real shape, B=2, txt 0 / S, forced scalar, N=1004 natural scalar, no-residual) all
+  0 mismatches + offset-view case; dit-forward SA2 / QIR_SAGE=1 / 2f32 / no-convrot
+  `cmp`-identical to 10d9c1a (0.999911 / 0.999881 / 0.999890 / 0.999945); B=1 and
+  `--batch 2` PNG md5 identical, B=1 == lane 0; sage/convrot tests pass; host clippy
+  `-D warnings` for convrot,sage,fusednorm,sage2 / convrot,sage,fusednorm / convrot,sage,sage2.
+- **Measured (nsys 10-step, same session):** gated 88.6 + norm_mod 65.7 ms → fused 77.4 +
+  0.1 ms (−7.7 ms/step; ~121 us/call for 4 passes of 33.7 MB ≈ 1.1 TB/s, at DRAM peak);
+  ucopy_bf16 −10 launches/step (the select_rows cats); PlainRow rotate+quant 21.2 → 28.5 ms
+  (+0.7 ms/step: x is no longer L2-hot because the kernel also writes h'). Speed:
+  batch --resident 2nd image 6339 / 6358 → 6085 / 6094 ms = **0.1587 → 0.1522 s/step
+  (−4.1%)**; `generate --batch 2` steps 10..20: **0.3161 → 0.3021 (−4.5%)**.
+- **Part 2 skipped** (norm_mod into the activation rotate+quant loader): x is written once
+  and read once per sub-layer (q|k and v share one quant), so folding the norm into a
+  NormModRow loader saves the x write (~1.9 ms/step) and the PlainRow L2 loss (~0.7) —
+  ~1.7 %. It needs the kernel to emit per-row (mean, rstd) and a lazy "normed
+  activation" type threaded through Attention::project / project_raw, SwiGlu and the
+  ConvRot quant bridge, with a materializing fallback for non-ConvRot linears. Marginal
+  for the plumbing; ranked #3 in the backlog. Byte identity is reachable (round x to
+  bf16 in the loader before rotating).
 
 ### Per-head q/k RMSNorm made cheap (DONE — `qwen-image-rs-qk-norm-fusion`, byte-identical)
 At 236db1b the per-head q/k `HeadRmsNorm` (N = 128, f32 weight) was 640 of the 650
@@ -1066,7 +1135,8 @@ Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-fused-rotate-quant` (Hadamard rotation fused into the activation quantizer, −10.1%),
 `-fused-swiglu` (SwiGLU silu·p fused into the MLP-out rotate+quantize, −8.4%),
 `-gemm-merge-tune` (q|k and gate|proj merged GEMMs + per-shape tile, byte-identical, −2.7% / −5.1% at B=2),
-`-qk-norm-fusion` (16-lane q/k RMSNorm kernel + norm fused into the SA2 quant, byte-identical, −6.9% / −6.9% at B=2).
+`-qk-norm-fusion` (16-lane q/k RMSNorm kernel + norm fused into the SA2 quant, byte-identical, −6.9% / −6.9% at B=2),
+`-residual-norm-fusion` (gated residual fused into the following LayerNorm+AdaLN, modulation as 2 rows, byte-identical, −4.1% / −4.5% at B=2).
 Bugs (complete): `-b1-off-prompt` (B=1 generate ignored the prompt: fused bridges
 ignored the view offset — see Gotchas).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path
