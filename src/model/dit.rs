@@ -1186,6 +1186,58 @@ fn block_causal_mask(
 mod tests {
     use super::*;
 
+    /// The candle fallback of the AdaLN step equals the pre-fusion pair
+    /// (`h + tanh(gate) * y`, then `norm_no_affine(h') * (scale + 1)`) on the
+    /// per-token tensors, and the per-token selection puts row 1 on the text
+    /// tokens of every lane.
+    #[cfg(not(feature = "fusednorm"))]
+    #[test]
+    fn residual_norm_mod_fallback_matches_the_unfused_pair() {
+        let dev = Device::Cpu;
+        let (b, txt, img, n) = (2usize, 3usize, 5usize, 16usize);
+        let rows = |seed: f32| {
+            Tensor::arange(0f32, (2 * n) as f32, &dev)
+                .unwrap()
+                .affine(0.05, seed as f64)
+                .unwrap()
+                .sin()
+                .unwrap()
+                .reshape((2, n))
+                .unwrap()
+        };
+        let (g, sc) = (rows(0.3), rows(1.7));
+        let gm = Modulation::new(g.clone(), b, txt, img).unwrap();
+        let sm = Modulation::new(sc.clone(), b, txt, img).unwrap();
+        let tok = gm.tokens.to_vec3::<f32>().unwrap();
+        let (g0, g1) = (
+            g.get(0).unwrap().to_vec1::<f32>().unwrap(),
+            g.get(1).unwrap().to_vec1::<f32>().unwrap(),
+        );
+        for lane in &tok {
+            for (pos, row) in lane.iter().enumerate() {
+                assert_eq!(row, if pos < txt { &g1 } else { &g0 }, "pos {pos}");
+            }
+        }
+        let h = Tensor::randn(0f32, 2f32, (b, txt + img, n), &dev).unwrap();
+        let y = Tensor::randn(0f32, 1f32, (b, txt + img, n), &dev).unwrap();
+        let (h2, x2) = residual_norm_mod(&h, Some((&gm, &y)), &sm, 1e-6).unwrap();
+        let h_ref = (&h + gm.tokens.tanh().unwrap().broadcast_mul(&y).unwrap()).unwrap();
+        let x_ref = norm_no_affine(&h_ref, 1e-6)
+            .unwrap()
+            .broadcast_mul(&(&sm.tokens + 1.0).unwrap())
+            .unwrap();
+        let v = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(v(&h2), v(&h_ref));
+        assert_eq!(v(&x2), v(&x_ref));
+        let (h3, x3) = residual_norm_mod(&h, None, &sm, 1e-6).unwrap();
+        assert_eq!(v(&h3), v(&h));
+        let x_ref = norm_no_affine(&h, 1e-6)
+            .unwrap()
+            .broadcast_mul(&(&sm.tokens + 1.0).unwrap())
+            .unwrap();
+        assert_eq!(v(&x3), v(&x_ref));
+    }
+
     #[test]
     fn rotated_tail_linears_meet_the_convrot_shape_rules() {
         for (prefix, k, n, rot) in TAIL_LINEARS {
