@@ -167,6 +167,71 @@ fn conv2d_k1(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv> {
     })
 }
 
+/// VAE decode tiling policy (`--vae-tile auto|0|N`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VaeTiling {
+    /// Whole image when its estimated working set fits in free VRAM, else
+    /// [`AUTO_TILE`]-latent tiles.
+    Auto,
+    /// Always the whole image.
+    Off,
+    /// Always `n`×`n` latent tiles (overlap n/4).
+    Tile(usize),
+}
+
+impl std::str::FromStr for VaeTiling {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim() {
+            "auto" => Ok(Self::Auto),
+            "0" => Ok(Self::Off),
+            n => n
+                .parse::<usize>()
+                .map(Self::Tile)
+                .map_err(|_| format!("--vae-tile: expected auto, 0 or a tile size, got {n:?}")),
+        }
+    }
+}
+
+/// Tile size [`VaeTiling::Auto`] falls back to.
+pub const AUTO_TILE: usize = 32;
+/// Headroom kept free on top of the decode estimate (allocator slack,
+/// fragmentation, the display / other processes).
+pub const FIT_MARGIN: usize = 1 << 30;
+
+/// Estimated whole-image decode working set per OUTPUT pixel, in bytes.
+/// Measured at 1024² (vae-decode, nvidia-smi peak minus idle): cuDNN conv bf16
+/// ~4.5 KiB/px; candle's im2col conv materializes 9x the conv input (~13.5
+/// KiB/px); f32 doubles every activation. Rounded up.
+pub fn decode_bytes_per_pixel(cudnn_conv: bool, f32_decoder: bool) -> usize {
+    let base = if cudnn_conv { 5 << 10 } else { 15 << 10 };
+    if f32_decoder {
+        2 * base
+    } else {
+        base
+    }
+}
+
+/// Does a whole-image decode of `pixels` output pixels fit in `free` bytes?
+pub fn untiled_fits(pixels: usize, bytes_per_pixel: usize, free: usize) -> bool {
+    pixels
+        .saturating_mul(bytes_per_pixel)
+        .saturating_add(FIT_MARGIN)
+        <= free
+}
+
+/// Whether this build's VAE convs run on cuDNN (feature `cudnn`, not disabled).
+fn conv_uses_cudnn() -> bool {
+    #[cfg(feature = "cudnn")]
+    {
+        cudnn_enabled()
+    }
+    #[cfg(not(feature = "cudnn"))]
+    {
+        false
+    }
+}
+
 /// `QwenImage21ResidualBlock`: norm1->silu->conv1(k3)->norm2->silu->conv2(k3) + shortcut.
 struct ResidualBlock {
     norm1: RmsNorm,
@@ -475,6 +540,46 @@ impl QwenImageVae {
         Ok(out.clamp(-1.0, 1.0)?)
     }
 
+    /// Decode with a [`VaeTiling`] policy. `Auto` estimates the whole-image
+    /// working set ([`decode_bytes_per_pixel`]) against free VRAM and tiles
+    /// only when it would not fit: on WSL an over-subscribed decode does not
+    /// fail, it silently spills to shared memory (35 s decodes, blank images).
+    /// A whole-image attempt that errors anyway is retried tiled.
+    pub fn decode_auto(&self, z_normalized: &Tensor, tiling: VaeTiling) -> Result<Tensor> {
+        let tile = match tiling {
+            VaeTiling::Off => return self.decode(z_normalized),
+            VaeTiling::Tile(n) => return self.decode_tiled(z_normalized, n, (n / 4).max(1)),
+            VaeTiling::Auto => AUTO_TILE,
+        };
+        let (b, _, h, w) = z_normalized.dims4()?;
+        let pixels = b * h * w * 256; // 16x per side
+        let bpp = decode_bytes_per_pixel(conv_uses_cudnn(), self.dtype == DType::F32);
+        let need = pixels.saturating_mul(bpp);
+        let fits = match crate::device::free_vram(z_normalized.device()) {
+            Some((free, _total)) => {
+                let fits = untiled_fits(pixels, bpp, free);
+                tracing::info!(
+                    need_mib = need >> 20,
+                    free_mib = free >> 20,
+                    mode = if fits { "whole" } else { "tiled" },
+                    "vae decode (auto)"
+                );
+                fits
+            }
+            None => true, // CPU: host RAM, no co-resident GPU models
+        };
+        if !fits {
+            return self.decode_tiled(z_normalized, tile, (tile / 4).max(1));
+        }
+        match self.decode(z_normalized) {
+            Ok(img) => Ok(img),
+            Err(e) => {
+                tracing::warn!(error = %e, "whole-image VAE decode failed; retrying tiled");
+                self.decode_tiled(z_normalized, tile, (tile / 4).max(1))
+            }
+        }
+    }
+
     /// Tiled decode: split the latent into overlapping `tile`×`tile` (latent)
     /// windows, decode each, and feather-blend them into the full image. Peak
     /// memory scales with the tile size², not the image size², so the decode
@@ -579,6 +684,47 @@ use candle_core::IndexOp;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn vae_tiling_parses() {
+        assert_eq!("auto".parse::<VaeTiling>(), Ok(VaeTiling::Auto));
+        assert_eq!("0".parse::<VaeTiling>(), Ok(VaeTiling::Off));
+        assert_eq!("32".parse::<VaeTiling>(), Ok(VaeTiling::Tile(32)));
+        assert!("big".parse::<VaeTiling>().is_err());
+    }
+
+    #[test]
+    fn untiled_fit_decision() {
+        const MIB: usize = 1 << 20;
+        let px = 1024 * 1024;
+        let cudnn = decode_bytes_per_pixel(true, false);
+        // Resident 1024² after the TE + DiT: ~7.4 GiB free -> whole image.
+        assert!(untiled_fits(px, cudnn, 7400 * MIB));
+        // Exactly at the boundary fits; one byte less does not.
+        assert!(untiled_fits(px, cudnn, px * cudnn + FIT_MARGIN));
+        assert!(!untiled_fits(px, cudnn, px * cudnn + FIT_MARGIN - 1));
+        // 2048² resident needs ~20 GiB -> tiled.
+        assert!(!untiled_fits(4 * px, cudnn, 7400 * MIB));
+        // Without cuDNN (im2col) or with the f32 decoder 1024² resident tiles.
+        assert!(!untiled_fits(
+            px,
+            decode_bytes_per_pixel(false, false),
+            7400 * MIB
+        ));
+        assert!(!untiled_fits(
+            px,
+            decode_bytes_per_pixel(true, true),
+            7400 * MIB
+        ));
+        assert!(untiled_fits(
+            px,
+            decode_bytes_per_pixel(true, true),
+            22000 * MIB
+        ));
+        // Overflow saturates instead of wrapping into "fits".
+        assert!(!untiled_fits(usize::MAX, cudnn, usize::MAX - 1));
+    }
+
     use super::*;
     use candle_core::Device;
 

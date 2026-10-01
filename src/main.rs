@@ -114,10 +114,11 @@ enum Command {
         /// instead of quantizing on load — smaller VRAM pool, no ~58 s load.
         #[arg(long)]
         text_gguf: Option<std::path::PathBuf>,
-        /// VAE tiled decode: latent tile size (0 = off). Caps decode peak memory
-        /// (~tile²) so it fits alongside co-resident models. Try 32.
-        #[arg(long, default_value_t = 0)]
-        vae_tile: usize,
+        /// VAE decode tiling: `auto` (default) decodes the whole image when its
+        /// working set fits in free VRAM, else 32-latent tiles; `0` forces the
+        /// whole image; `N` forces N×N latent tiles (overlap N/4).
+        #[arg(long, default_value = "auto")]
+        vae_tile: qwen_image_rs::model::vae::VaeTiling,
         /// True-CFG guidance scale. 1.0 = single forward (fast); >1 runs the DiT
         /// twice per step (cond + negative) for stronger prompt adherence.
         #[arg(long, default_value_t = 1.0)]
@@ -176,9 +177,10 @@ enum Command {
         /// Load the text encoder from a pre-quantized GGUF (from prequantize-text).
         #[arg(long)]
         text_gguf: Option<std::path::PathBuf>,
-        /// VAE tiled decode: latent tile size (0 = off). Try 32 for resident.
-        #[arg(long, default_value_t = 0)]
-        vae_tile: usize,
+        /// VAE decode tiling: `auto` (default; whole image when it fits in free
+        /// VRAM, else 32-latent tiles), `0` = whole image, `N` = N×N tiles.
+        #[arg(long, default_value = "auto")]
+        vae_tile: qwen_image_rs::model::vae::VaeTiling,
         /// True-CFG guidance scale (1.0 = single forward; >1 = two forwards/step).
         #[arg(long, default_value_t = 1.0)]
         guidance: f32,
@@ -532,7 +534,7 @@ fn generate(
     cache: &qwen_image_rs::convrot_cache::CacheSpec,
     quant_text: bool,
     text_gguf: Option<&std::path::Path>,
-    vae_tile: usize,
+    vae_tile: qwen_image_rs::model::vae::VaeTiling,
     guidance: f32,
     negative: &str,
     vae_f32: bool,
@@ -700,11 +702,10 @@ fn generate(
     for i in 0..batch {
         let li = latent.narrow(0, i, 1)?; // (1, img, 64)
         let z = vae::unpack_latents(&li, 64)?;
-        let img = if vae_tile > 0 {
-            vmodel.decode_tiled(&z, vae_tile, (vae_tile / 4).max(1))?
-        } else {
-            vmodel.decode(&z)?
-        };
+        let t_dec = std::time::Instant::now();
+        let img = vmodel.decode_auto(&z, vae_tile)?;
+        dev.synchronize()?;
+        tracing::info!(lane = i, decode_ms = t_dec.elapsed().as_millis(), "decoded");
         let (w, h, bytes) = vae::to_rgba_u8(&img)?;
         let buf: image::RgbaImage =
             image::ImageBuffer::from_raw(w as u32, h as u32, bytes).context("image buffer")?;
@@ -748,7 +749,7 @@ fn batch(
     quant_text: bool,
     resident: bool,
     text_gguf: Option<&std::path::Path>,
-    vae_tile: usize,
+    vae_tile: qwen_image_rs::model::vae::VaeTiling,
     guidance: f32,
     negative: &str,
     vae_f32: bool,
@@ -882,11 +883,7 @@ fn batch(
             let dn_ms = t_dn.elapsed().as_millis();
             let t_dec = std::time::Instant::now();
             let z = vae::unpack_latents(&latents, 64)?;
-            let img = if vae_tile > 0 {
-                vmodel.decode_tiled(&z, vae_tile, (vae_tile / 4).max(1))?
-            } else {
-                vmodel.decode(&z)?
-            };
+            let img = vmodel.decode_auto(&z, vae_tile)?;
             dev.synchronize()?;
             let dec_ms = t_dec.elapsed().as_millis();
             save_png(&img, out_dir.join(format!("{i:03}.png")))?;
@@ -974,11 +971,7 @@ fn batch(
     )?;
     for (i, lat) in latents_list.iter().enumerate() {
         let z = vae::unpack_latents(lat, 64)?;
-        let img = if vae_tile > 0 {
-            vmodel.decode_tiled(&z, vae_tile, (vae_tile / 4).max(1))?
-        } else {
-            vmodel.decode(&z)?
-        };
+        let img = vmodel.decode_auto(&z, vae_tile)?;
         save_png(&img, out_dir.join(format!("{i:03}.png")))?;
     }
     println!("wrote {} images to {}", prompts.len(), out_dir.display());
