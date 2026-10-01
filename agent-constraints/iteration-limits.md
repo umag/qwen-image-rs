@@ -37,3 +37,9 @@ does not alter the math must stay bit-identical to the prior build; one that doe
 must stay within ~1e-5 of the prior build's oracle cosine and keep images clean.
 Standing auth also covers `qwen-image-rs-tail-linears-unify` and
 `qwen-image-rs-sage2-quant-fusion` (same clean-exit rules).
+
+Standing auth (2026-10-01, human: "make 5 default, and continue with 1 2 3"):
+`qwen-image-rs-prequant-default`, `qwen-image-rs-fused-rotate-quant`,
+`qwen-image-rs-fused-swiglu`, `qwen-image-rs-gemm-merge-tune` — same clean-exit
+rules as the "Gate update (2026-10-01)" paragraph above (current oracle baseline
+dit-forward --convrot 0.999898 with sage2 default). Run strictly sequentially.
