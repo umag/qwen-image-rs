@@ -70,3 +70,8 @@ via the system package manager, build candle `cudnn`), `qwen-image-rs-vae-fused-
 oracle stays >= ~50 dB (bf16 baseline 55.2 dB) and vs the prior build >= ~50 dB when
 conv/accumulation order changes (byte-identical where the math is unchanged);
 images clean; DiT path untouched (dit-forward cmp-identical).
+
+Standing auth (2026-10-02, human: "push for better tiling, try optimisators"):
+`qwen-image-rs-gemm-tiling-push` — INT8 accumulation is exact, so every GEMM
+config change must be byte-identical (cmp dit-forward in all QIR_SAGE modes, PNG
+md5). Determinism required (no atomic / non-deterministic split-K reductions).
