@@ -12,8 +12,105 @@ use candle_nn::{linear_no_bias, Linear, Module, VarBuilder};
 
 use crate::Result;
 
+/// The seven linears of every transformer block, by weight prefix relative to
+/// `transformer_blocks.<i>.` (the safetensors key minus `.weight`).
+const BLOCK_LINEARS: [&str; 7] = [
+    "attn.to_q",
+    "attn.to_k",
+    "attn.to_v",
+    "attn.to_out.0",
+    "img_mlp.proj",
+    "img_mlp.gate_layer",
+    "img_mlp.out",
+];
+
+/// The DiT's non-block ("tail") linears: `(weight prefix, in K, out N, ConvRot
+/// under --convrot)`. A rotated layer needs K % 256 == 0 (the 256-wide
+/// Hadamard) and N % 8 == 0 (the epilogue's 128-bit 16-bit store); `img_in`
+/// (K = 64) cannot rotate. N for `proj_out` is the checkpoint's out_channels.
+const TAIL_LINEARS: [(&str, usize, usize, bool); 8] = [
+    ("img_in", 64, INNER, false),
+    ("txt_in.in_layer", 4096, INNER, true),
+    ("txt_in.out_layer", INNER, INNER, true),
+    (
+        "time_text_embed.timestep_embedder.linear_1",
+        256,
+        INNER,
+        true,
+    ),
+    (
+        "time_text_embed.timestep_embedder.linear_2",
+        INNER,
+        INNER,
+        true,
+    ),
+    ("modulation.1", INNER, 4 * INNER, true),
+    ("norm_out.linear", INNER, INNER, true),
+    ("proj_out", INNER, 64, true),
+];
+
+/// How one DiT linear computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearPrecision {
+    /// bf16 `x Wᵀ` (candle `Linear`).
+    Full,
+    /// Q8_0 GGUF weights (`--quant`; block linears only).
+    Q8,
+    /// ConvRot W8A8 INT8 (`--convrot`).
+    ConvRot,
+}
+
+/// Block-linear suffix of a `transformer_blocks.<i>.<suffix>` prefix.
+fn block_suffix(prefix: &str) -> Option<&str> {
+    let rest = prefix.strip_prefix("transformer_blocks.")?;
+    let (idx, suffix) = rest.split_once('.')?;
+    (!idx.is_empty() && idx.bytes().all(|c| c.is_ascii_digit())).then_some(suffix)
+}
+
+/// The one precision policy for every DiT linear, keyed by its weight prefix.
+/// Shared by `QwenImageDit::load` and `prequantize-convrot`, so a
+/// pre-quantized file holds exactly the layers the loader rotates. Block
+/// linears: ConvRot when `convrot`, else Q8_0 when `quant`, else Full. Tail
+/// linears: ConvRot when `convrot` and the table enables it, else Full (Q8_0
+/// never applied to them). `None` = not a DiT linear.
+pub fn linear_precision(prefix: &str, quant: bool, convrot: bool) -> Option<LinearPrecision> {
+    let p = if block_suffix(prefix).is_some_and(|s| BLOCK_LINEARS.contains(&s)) {
+        if convrot {
+            LinearPrecision::ConvRot
+        } else if quant {
+            LinearPrecision::Q8
+        } else {
+            LinearPrecision::Full
+        }
+    } else {
+        let &(_, _, _, rot) = TAIL_LINEARS.iter().find(|t| t.0 == prefix)?;
+        if convrot && rot {
+            LinearPrecision::ConvRot
+        } else {
+            LinearPrecision::Full
+        }
+    };
+    Some(p)
+}
+
+/// True when `prefix` is a linear that `--convrot` runs rotated INT8 (and
+/// `prequantize-convrot` therefore stores as `weight_i8` + `col_scale`).
+pub fn is_convrot_target(prefix: &str) -> bool {
+    linear_precision(prefix, false, true) == Some(LinearPrecision::ConvRot)
+}
+
+/// Load-time precision switches shared by every DiT linear.
+#[derive(Clone, Copy)]
+struct LinearOpts<'a> {
+    quant: bool,
+    convrot: bool,
+    /// The 256×256 Hadamard; `Some` iff `convrot` (and the feature) is on.
+    rot: Option<&'a Tensor>,
+}
+
 /// A no-bias linear that is full-precision, Q8_0-quantized (GGUF), or ConvRot
-/// W8A8 INT8 (rotated int8 GEMM, `convrot` feature).
+/// W8A8 INT8 (rotated int8 GEMM, `convrot` feature). Every DiT linear is one;
+/// `linear_precision` picks the variant from the weight prefix.
 enum QLinear {
     Full(Linear),
     Quant(QMatMul),
@@ -22,48 +119,79 @@ enum QLinear {
 }
 
 impl QLinear {
-    /// Load `(out, in)` weights. `convrot` (with a rotation `rot` and in-features
-    /// a multiple of 256) takes priority over `quant`; otherwise Q8_0 when
-    /// `quant`, else full-precision.
-    fn load(
-        in_c: usize,
-        out_c: usize,
-        quant: bool,
-        convrot: bool,
-        rot: Option<&Tensor>,
-        vb: VarBuilder,
-    ) -> Result<Self> {
-        #[cfg(feature = "convrot")]
-        if convrot {
-            if let Some(r) = rot {
-                if in_c.is_multiple_of(crate::model::rotation::GROUP) {
-                    // Pre-quantized weights on disk (from `prequantize-convrot`):
-                    // load the rotated INT8 weight + col scale directly, skipping
-                    // the load-time rotate+quant. Detected by `weight_i8` next to
-                    // the usual `weight`.
-                    if vb.contains_tensor("weight_i8") {
-                        let w_i8 = vb.get_unchecked_dtype("weight_i8", DType::U8)?;
-                        let col_scale = vb.get_unchecked_dtype("col_scale", DType::F32)?;
-                        return Ok(QLinear::Convrot(
-                            crate::convrot::ConvRotLinear::from_prequantized(w_i8, col_scale, r)?,
-                        ));
-                    }
-                    let w = vb.get((out_c, in_c), "weight")?;
-                    return Ok(QLinear::Convrot(
-                        crate::convrot::ConvRotLinear::from_weight(&w, r)?,
-                    ));
+    /// Load the `(out, in)` weight at `vb`'s prefix with the precision
+    /// `linear_precision` assigns it.
+    fn load(in_c: usize, out_c: usize, opts: LinearOpts, vb: VarBuilder) -> Result<Self> {
+        let prefix = vb.prefix();
+        let convrot = opts.convrot && opts.rot.is_some();
+        let precision = linear_precision(&prefix, opts.quant, convrot)
+            .ok_or_else(|| anyhow::anyhow!("{prefix}: not a DiT linear in the precision policy"))?;
+        match precision {
+            LinearPrecision::ConvRot => Self::load_convrot(in_c, out_c, opts.rot, &prefix, vb),
+            LinearPrecision::Q8 => {
+                let w = vb.get((out_c, in_c), "weight")?;
+                let qt = QTensor::quantize(&w, GgmlDType::Q8_0)?;
+                Ok(QLinear::Quant(QMatMul::from_qtensor(qt)?))
+            }
+            LinearPrecision::Full => {
+                if !vb.contains_tensor("weight") && vb.contains_tensor("weight_i8") {
+                    anyhow::bail!(
+                        "{prefix}: the weight file holds only a ConvRot INT8 weight for this \
+                         bf16 layer (run with --convrot, or regenerate it with prequantize-convrot)"
+                    );
                 }
+                Ok(QLinear::Full(linear_no_bias(in_c, out_c, vb)?))
             }
         }
-        #[cfg(not(feature = "convrot"))]
-        let _ = (convrot, rot);
-        if quant {
-            let w = vb.get((out_c, in_c), "weight")?;
-            let qt = QTensor::quantize(&w, GgmlDType::Q8_0)?;
-            Ok(QLinear::Quant(QMatMul::from_qtensor(qt)?))
-        } else {
-            Ok(QLinear::Full(linear_no_bias(in_c, out_c, vb)?))
+    }
+
+    /// ConvRot load: the pre-quantized weight when the file has one (from
+    /// `prequantize-convrot`, detected by `weight_i8` next to `weight`), else
+    /// rotate + quantize the bf16 weight now.
+    #[cfg(feature = "convrot")]
+    fn load_convrot(
+        in_c: usize,
+        out_c: usize,
+        rot: Option<&Tensor>,
+        prefix: &str,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let r = rot.ok_or_else(|| anyhow::anyhow!("{prefix}: ConvRot needs the rotation"))?;
+        anyhow::ensure!(
+            in_c.is_multiple_of(crate::model::rotation::GROUP) && out_c.is_multiple_of(8),
+            "{prefix}: ConvRot needs K % 256 == 0 and N % 8 == 0 (K={in_c}, N={out_c})"
+        );
+        if vb.contains_tensor("weight_i8") {
+            let w_i8 = vb.get_unchecked_dtype("weight_i8", DType::U8)?;
+            let col_scale = vb.get_unchecked_dtype("col_scale", DType::F32)?;
+            return Ok(QLinear::Convrot(
+                crate::convrot::ConvRotLinear::from_prequantized(w_i8, col_scale, r)?,
+            ));
         }
+        let w = vb.get((out_c, in_c), "weight")?;
+        Ok(QLinear::Convrot(
+            crate::convrot::ConvRotLinear::from_weight(&w, r)?,
+        ))
+    }
+
+    #[cfg(not(feature = "convrot"))]
+    fn load_convrot(
+        _: usize,
+        _: usize,
+        _: Option<&Tensor>,
+        prefix: &str,
+        _: VarBuilder,
+    ) -> Result<Self> {
+        anyhow::bail!("{prefix}: ConvRot requires the `convrot` feature")
+    }
+
+    /// True for the ConvRot INT8 variant (load-time accounting).
+    fn is_convrot(&self) -> bool {
+        #[cfg(feature = "convrot")]
+        if let QLinear::Convrot(_) = self {
+            return true;
+        }
+        false
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -181,42 +309,47 @@ impl ZeroCenterRmsNorm {
 /// `QwenImage21TextProjection`: ZeroCenterRMSNorm -> Linear -> GELU(tanh) -> Linear.
 struct TextProjection {
     norm: ZeroCenterRmsNorm,
-    in_layer: Linear,
-    out_layer: Linear,
+    in_layer: QLinear,
+    out_layer: QLinear,
 }
 
 impl TextProjection {
-    fn load(ctx_dim: usize, vb: VarBuilder) -> Result<Self> {
+    fn load(ctx_dim: usize, opts: LinearOpts, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             norm: ZeroCenterRmsNorm::load(ctx_dim, 1e-6, vb.pp("text_norm"))?,
-            in_layer: linear_no_bias(ctx_dim, INNER, vb.pp("in_layer"))?,
-            out_layer: linear_no_bias(INNER, INNER, vb.pp("out_layer"))?,
+            in_layer: QLinear::load(ctx_dim, INNER, opts, vb.pp("in_layer"))?,
+            out_layer: QLinear::load(INNER, INNER, opts, vb.pp("out_layer"))?,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.norm.forward(x)?;
         let x = self.in_layer.forward(&x)?;
         let x = x.gelu()?; // tanh approximation (matches GELU(approximate="tanh"))
-        Ok(self.out_layer.forward(&x)?)
+        self.out_layer.forward(&x)
     }
 }
 
 /// Sinusoidal timestep embedding (256) -> MLP(256->INNER, silu, INNER->INNER).
 struct TimestepEmbed {
-    linear1: Linear,
-    linear2: Linear,
+    linear1: QLinear,
+    linear2: QLinear,
     freqs: Tensor, // (128,)
 }
 
 impl TimestepEmbed {
-    fn load(vb: VarBuilder, dev: &Device) -> Result<Self> {
+    fn load(opts: LinearOpts, vb: VarBuilder, dev: &Device) -> Result<Self> {
         let half = 128usize;
         let freqs: Vec<f32> = (0..half)
             .map(|i| (-(10000f32.ln()) * i as f32 / half as f32).exp())
             .collect();
         Ok(Self {
-            linear1: linear_no_bias(256, INNER, vb.pp("timestep_embedder").pp("linear_1"))?,
-            linear2: linear_no_bias(INNER, INNER, vb.pp("timestep_embedder").pp("linear_2"))?,
+            linear1: QLinear::load(256, INNER, opts, vb.pp("timestep_embedder").pp("linear_1"))?,
+            linear2: QLinear::load(
+                INNER,
+                INNER,
+                opts,
+                vb.pp("timestep_embedder").pp("linear_2"),
+            )?,
             freqs: Tensor::from_vec(freqs, (1, half), dev)?,
         })
     }
@@ -229,7 +362,7 @@ impl TimestepEmbed {
         let emb = emb.to_dtype(dtype)?;
         let x = self.linear1.forward(&emb)?;
         let x = silu(&x)?;
-        Ok(self.linear2.forward(&x)?)
+        self.linear2.forward(&x)
     }
 }
 
@@ -262,12 +395,12 @@ struct Attention {
 }
 
 impl Attention {
-    fn load(quant: bool, convrot: bool, rot: Option<&Tensor>, vb: VarBuilder) -> Result<Self> {
+    fn load(opts: LinearOpts, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            to_q: QLinear::load(INNER, INNER, quant, convrot, rot, vb.pp("to_q"))?,
-            to_k: QLinear::load(INNER, INNER, quant, convrot, rot, vb.pp("to_k"))?,
-            to_v: QLinear::load(INNER, INNER, quant, convrot, rot, vb.pp("to_v"))?,
-            to_out: QLinear::load(INNER, INNER, quant, convrot, rot, vb.pp("to_out").pp("0"))?,
+            to_q: QLinear::load(INNER, INNER, opts, vb.pp("to_q"))?,
+            to_k: QLinear::load(INNER, INNER, opts, vb.pp("to_k"))?,
+            to_v: QLinear::load(INNER, INNER, opts, vb.pp("to_v"))?,
+            to_out: QLinear::load(INNER, INNER, opts, vb.pp("to_out").pp("0"))?,
             norm_q: HeadRmsNorm::load(vb.pp("norm_q"))?,
             norm_k: HeadRmsNorm::load(vb.pp("norm_k"))?,
         })
@@ -445,11 +578,11 @@ struct SwiGlu {
     out: QLinear,
 }
 impl SwiGlu {
-    fn load(quant: bool, convrot: bool, rot: Option<&Tensor>, vb: VarBuilder) -> Result<Self> {
+    fn load(opts: LinearOpts, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            proj: QLinear::load(INNER, INNER * 3, quant, convrot, rot, vb.pp("proj"))?,
-            gate: QLinear::load(INNER, INNER * 3, quant, convrot, rot, vb.pp("gate_layer"))?,
-            out: QLinear::load(INNER * 3, INNER, quant, convrot, rot, vb.pp("out"))?,
+            proj: QLinear::load(INNER, INNER * 3, opts, vb.pp("proj"))?,
+            gate: QLinear::load(INNER, INNER * 3, opts, vb.pp("gate_layer"))?,
+            out: QLinear::load(INNER * 3, INNER, opts, vb.pp("out"))?,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -465,10 +598,10 @@ struct Block {
 }
 
 impl Block {
-    fn load(quant: bool, convrot: bool, rot: Option<&Tensor>, vb: VarBuilder) -> Result<Self> {
+    fn load(opts: LinearOpts, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            attn: Attention::load(quant, convrot, rot, vb.pp("attn"))?,
-            mlp: SwiGlu::load(quant, convrot, rot, vb.pp("img_mlp"))?,
+            attn: Attention::load(opts, vb.pp("attn"))?,
+            mlp: SwiGlu::load(opts, vb.pp("img_mlp"))?,
             eps: 1e-6,
         })
     }
@@ -498,13 +631,13 @@ impl Block {
 
 /// Full DiT.
 pub struct QwenImageDit {
-    img_in: Linear,
+    img_in: QLinear,
     txt_in: TextProjection,
     time_embed: TimestepEmbed,
-    modulation: Linear, // INNER -> 4*INNER (after silu)
+    modulation: QLinear, // INNER -> 4*INNER (after silu)
     blocks: Vec<Block>,
-    norm_out_linear: Linear, // INNER -> INNER
-    proj_out: Linear,        // INNER -> out_channels
+    norm_out_linear: QLinear, // INNER -> INNER
+    proj_out: QLinear,        // INNER -> out_channels
     device: Device,
     inv_freqs: [Vec<f32>; 3], // per-axis rope inv-freqs
 }
@@ -531,10 +664,15 @@ impl QwenImageDit {
             let _ = convrot;
             None
         };
+        let opts = LinearOpts {
+            quant,
+            convrot,
+            rot: rot.as_ref(),
+        };
         let mut blocks = Vec::with_capacity(num_layers);
         let vb_b = vb.pp("transformer_blocks");
         for i in 0..num_layers {
-            blocks.push(Block::load(quant, convrot, rot.as_ref(), vb_b.pp(i))?);
+            blocks.push(Block::load(opts, vb_b.pp(i))?);
         }
         let inv_freqs = std::array::from_fn(|a| {
             let d = AXES[a];
@@ -542,17 +680,52 @@ impl QwenImageDit {
                 .map(|j| 1f32 / ROPE_THETA.powf(2.0 * j as f64 / d as f64) as f32)
                 .collect()
         });
-        Ok(Self {
-            img_in: linear_no_bias(64, INNER, vb.pp("img_in"))?,
-            txt_in: TextProjection::load(4096, vb.pp("txt_in"))?,
-            time_embed: TimestepEmbed::load(vb.pp("time_text_embed"), &dev)?,
-            modulation: linear_no_bias(INNER, 4 * INNER, vb.pp("modulation").pp("1"))?,
+        let dit = Self {
+            img_in: QLinear::load(64, INNER, opts, vb.pp("img_in"))?,
+            txt_in: TextProjection::load(4096, opts, vb.pp("txt_in"))?,
+            time_embed: TimestepEmbed::load(opts, vb.pp("time_text_embed"), &dev)?,
+            modulation: QLinear::load(INNER, 4 * INNER, opts, vb.pp("modulation").pp("1"))?,
             blocks,
-            norm_out_linear: linear_no_bias(INNER, INNER, vb.pp("norm_out").pp("linear"))?,
-            proj_out: linear_no_bias(INNER, out_channels, vb.pp("proj_out"))?,
+            norm_out_linear: QLinear::load(INNER, INNER, opts, vb.pp("norm_out").pp("linear"))?,
+            proj_out: QLinear::load(INNER, out_channels, opts, vb.pp("proj_out"))?,
             device: dev,
             inv_freqs,
-        })
+        };
+        tracing::info!(
+            convrot_linears = dit.convrot_linears(),
+            total_linears = BLOCK_LINEARS.len() * dit.blocks.len() + TAIL_LINEARS.len(),
+            "DiT linears loaded"
+        );
+        Ok(dit)
+    }
+
+    /// How many linears run ConvRot INT8.
+    fn convrot_linears(&self) -> usize {
+        let tail = [
+            &self.img_in,
+            &self.txt_in.in_layer,
+            &self.txt_in.out_layer,
+            &self.time_embed.linear1,
+            &self.time_embed.linear2,
+            &self.modulation,
+            &self.norm_out_linear,
+            &self.proj_out,
+        ];
+        let blocks = self.blocks.iter().flat_map(|b| {
+            [
+                &b.attn.to_q,
+                &b.attn.to_k,
+                &b.attn.to_v,
+                &b.attn.to_out,
+                &b.mlp.proj,
+                &b.mlp.gate,
+                &b.mlp.out,
+            ]
+        });
+        tail.into_iter()
+            .chain(blocks)
+            .filter(|l| l.is_convrot())
+            .count()
     }
 
     /// Build cos/sin `(S, 32)` for interleaved RoPE, from per-token 3-axis
@@ -722,4 +895,67 @@ fn block_causal_mask(
         }
     }
     Ok(Tensor::from_vec(data, (1, 1, s, s), dev)?.to_dtype(dtype)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotated_tail_linears_meet_the_convrot_shape_rules() {
+        for (prefix, k, n, rot) in TAIL_LINEARS {
+            if rot {
+                assert!(k % crate::model::rotation::GROUP == 0, "{prefix}: K={k}");
+                assert!(n % 8 == 0, "{prefix}: N={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn img_in_cannot_rotate() {
+        assert_eq!(
+            linear_precision("img_in", true, true),
+            Some(LinearPrecision::Full)
+        );
+        assert!(!is_convrot_target("img_in"));
+    }
+
+    #[test]
+    fn block_linears_follow_convrot_then_quant() {
+        let p = "transformer_blocks.31.img_mlp.gate_layer";
+        assert_eq!(
+            linear_precision(p, true, true),
+            Some(LinearPrecision::ConvRot)
+        );
+        assert_eq!(linear_precision(p, true, false), Some(LinearPrecision::Q8));
+        assert_eq!(
+            linear_precision(p, false, false),
+            Some(LinearPrecision::Full)
+        );
+        assert!(is_convrot_target("transformer_blocks.0.attn.to_out.0"));
+    }
+
+    #[test]
+    fn tail_linears_never_take_q8() {
+        for (prefix, ..) in TAIL_LINEARS {
+            assert_ne!(
+                linear_precision(prefix, true, false),
+                Some(LinearPrecision::Q8)
+            );
+        }
+    }
+
+    #[test]
+    fn non_linears_are_outside_the_policy() {
+        for p in [
+            "transformer_blocks.0.attn.norm_q",
+            "transformer_blocks.x.attn.to_q",
+            "transformer_blocks..attn.to_q",
+            "txt_in.text_norm",
+            "modulation",
+        ] {
+            assert_eq!(linear_precision(p, true, true), None, "{p}");
+            assert!(!is_convrot_target(p));
+        }
+    }
 }

@@ -540,12 +540,14 @@ pub fn self_test() -> Result<i64> {
 /// operands + positive f32 scales go through `Int8GemmDequant` (bf16 and f16),
 /// and a host reference applies the epilogue's exact op order —
 /// `(acc as f32 * s_row[m]) * s_col[n]`, then one round-to-nearest-even to the
-/// 16-bit type. M is odd (37) to exercise the packed-scale alignment that once
-/// faulted at M=4117. Returns the mismatch counts `(bf16, f16)` out of M·N.
-pub fn self_test_epilogue() -> Result<(usize, usize)> {
+/// 16-bit type at shape `(m, n, k)`. An odd M (37) exercises the packed-scale
+/// alignment that once faulted at M=4117; the DiT tail shapes cover M=2
+/// (modulation / norm_out / time_embed), K=256 (time_embed.linear_1) and
+/// N=64 (proj_out, a partial 128-wide N tile). Returns the mismatch counts
+/// `(bf16, f16)` out of M·N.
+pub fn self_test_epilogue(m: usize, n: usize, k: usize) -> Result<(usize, usize)> {
     use candle_core::Device;
     let dev = Device::new_cuda(0)?;
-    let (m, n, k) = (37usize, 256usize, 512usize);
     let ai: Vec<i8> = (0..m * k).map(|i| ((i * 7) % 255) as i8).collect();
     let bi: Vec<i8> = (0..n * k).map(|i| ((i * 13 + 5) % 255) as i8).collect();
     // Scales spanning several binades so both 16-bit roundings are exercised.

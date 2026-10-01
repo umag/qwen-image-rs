@@ -1138,15 +1138,25 @@ fn convrot_test() -> Result<()> {
                 "MISMATCH"
             }
         );
-        let (bad_bf, bad_hf) = qwen_image_rs::convrot::self_test_epilogue()?;
-        println!(
-            "convrot dequant epilogue vs host ref (M=37): bf16 mismatches = {bad_bf}, f16 mismatches = {bad_hf} ({})",
-            if bad_bf == 0 && bad_hf == 0 {
-                "EXACT"
-            } else {
-                "MISMATCH"
-            }
-        );
+        // (M, N, K): the odd-M alignment case + the DiT tail-linear shapes.
+        let mut epi_bad = 0usize;
+        for (m, n, k) in [
+            (37, 256, 512),
+            (2, 4096, 256),
+            (2, 16384, 4096),
+            (37, 64, 4096),
+        ] {
+            let (bad_bf, bad_hf) = qwen_image_rs::convrot::self_test_epilogue(m, n, k)?;
+            println!(
+                "convrot dequant epilogue vs host ref (M={m} N={n} K={k}): bf16 mismatches = {bad_bf}, f16 mismatches = {bad_hf} ({})",
+                if bad_bf == 0 && bad_hf == 0 {
+                    "EXACT"
+                } else {
+                    "MISMATCH"
+                }
+            );
+            epi_bad += bad_bf + bad_hf;
+        }
         let (d16, a16) = qwen_image_rs::convrot::self_test_f16_vs_cast()?;
         let f16_ok = d16 <= a16 / 128.0;
         println!(
@@ -1163,7 +1173,7 @@ fn convrot_test() -> Result<()> {
             "MLP-shape timing: convrot {cr_ms:.3} ms vs bf16 {bf_ms:.3} ms ({:.2}x)",
             bf_ms / cr_ms
         );
-        if maxdiff != 0 || bad_bf != 0 || bad_hf != 0 || !f16_ok {
+        if maxdiff != 0 || epi_bad != 0 || !f16_ok {
             anyhow::bail!("convrot self-test FAILED (bit-exactness)");
         }
         report_offset_views("convrot", qwen_image_rs::convrot::self_test_offset_views()?)
@@ -1383,23 +1393,9 @@ fn smoke(n: usize) -> Result<()> {
     Ok(())
 }
 
-/// The DiT linears that ConvRot quantizes (per transformer block): attention
-/// q/k/v/o and the SwiGlu proj/gate/out. Matched by name suffix.
-#[cfg(feature = "convrot")]
-fn is_convrot_target(name: &str) -> bool {
-    const SUFFIXES: [&str; 7] = [
-        ".attn.to_q.weight",
-        ".attn.to_k.weight",
-        ".attn.to_v.weight",
-        ".attn.to_out.0.weight",
-        ".img_mlp.proj.weight",
-        ".img_mlp.gate_layer.weight",
-        ".img_mlp.out.weight",
-    ];
-    name.starts_with("transformer_blocks.") && SUFFIXES.iter().any(|s| name.ends_with(s))
-}
-
-/// Pre-quantize the DiT's ConvRot linears to a single safetensors file: each
+/// Pre-quantize the DiT's ConvRot linears (every weight
+/// `dit::is_convrot_target` names: the 224 block linears + the rotated tail
+/// linears) to a single safetensors file: each
 /// target `<prefix>.weight` (bf16) becomes `<prefix>.weight_i8` (rotated INT8,
 /// U8 bytes) + `<prefix>.col_scale` (f32); all other tensors are copied bf16.
 /// `QwenImageDit::load` auto-detects `weight_i8` and skips the load-time
@@ -1427,7 +1423,12 @@ fn prequantize_convrot(weights: &std::path::Path, out: &std::path::Path) -> Resu
     let mut outmap: HashMap<String, Tensor> = HashMap::new();
     let mut n_quant = 0usize;
     for (name, t) in &full {
-        if is_convrot_target(name) {
+        // The loader's own precision policy decides which weights are stored
+        // rotated INT8, so the file and `QwenImageDit::load` always agree.
+        let target = name
+            .strip_suffix(".weight")
+            .is_some_and(qwen_image_rs::model::dit::is_convrot_target);
+        if target {
             let w = t.to_device(&dev)?.to_dtype(DType::BF16)?; // (N,K) bf16 on GPU
             let cr = ConvRotLinear::from_weight(&w, &r)?;
             let (wi8, cs) = cr.export();
