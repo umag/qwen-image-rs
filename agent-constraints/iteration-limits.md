@@ -53,3 +53,7 @@ no-convrot parity, self-tests vs f64/old path, clean images), not one number.
 Reference update (2026-10-01): fused-swiglu accepted under the same stance. New
 dit-forward --convrot vs oracle references: default SA2 0.999911, QIR_SAGE=1
 0.999881, QIR_SAGE=2f32 0.999890 (no-convrot 0.999945 unchanged).
+
+Standing auth (2026-10-01, human: "lets optimise per-head q/k RMSNorm"):
+`qwen-image-rs-qk-norm-fusion` — same clean-exit rules; oracle references after
+gemm-merge-tune: SA2 0.999911, QIR_SAGE=1 0.999881, 2f32 0.999890.
