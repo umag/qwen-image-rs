@@ -61,3 +61,12 @@ gemm-merge-tune: SA2 0.999911, QIR_SAGE=1 0.999881, 2f32 0.999890.
 Standing auth (2026-10-01, human: "fuse gated residual into norm_mod"):
 `qwen-image-rs-residual-norm-fusion` — same clean-exit rules; references
 unchanged (SA2 0.999911, QIR_SAGE=1 0.999881, 2f32 0.999890, no-convrot 0.999945).
+
+Standing auth (2026-10-01, human: "run 1 to 4 as lifecycles" — VAE decode series):
+`qwen-image-rs-vae-cudnn` (spike: install cuDNN on the GPU host in user space or
+via the system package manager, build candle `cudnn`), `qwen-image-rs-vae-fused-norm`,
+`qwen-image-rs-vae-implicit-gemm-conv` (only if cuDNN falls short),
+`qwen-image-rs-vae-untiled`. Run sequentially. VAE gate: decode PSNR vs the diffusers
+oracle stays >= ~50 dB (bf16 baseline 55.2 dB) and vs the prior build >= ~50 dB when
+conv/accumulation order changes (byte-identical where the math is unchanged);
+images clean; DiT path untouched (dit-forward cmp-identical).
