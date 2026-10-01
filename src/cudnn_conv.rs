@@ -141,7 +141,7 @@ impl candle_core::CustomOp2 for Conv2dCudnn {
         };
         let ws_bytes = fwd.get_workspace_size(algo).map_err(e)?;
         let stream = dev.cuda_stream();
-        let mut workspace = unsafe { stream.alloc::<u8>(ws_bytes.max(1)) }.map_err(e)?;
+        let mut workspace = unsafe { stream.alloc::<u8>(ws_bytes.max(1)) }.map_err(candle_core::Error::wrap)?;
         let mut out = unsafe { dev.alloc::<half::bf16>(b * o * oh * ow)? };
         unsafe {
             fwd.launch(
