@@ -33,6 +33,7 @@ fn main() {
     {
         // Fused LayerNorm+AdaLN kernel (no external deps).
         println!("cargo:rerun-if-changed=kernels/fusednorm/fused_norm.cu");
+        println!("cargo:rerun-if-changed=kernels/fusednorm/vae_norm.cu");
         println!("cargo:rerun-if-changed=kernels/fusednorm/head_rmsnorm.cuh");
         let cap = std::env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".into());
         cc::Build::new()
@@ -41,6 +42,7 @@ fn main() {
             .flag("--expt-relaxed-constexpr")
             .flag(format!("-arch=sm_{cap}"))
             .file("kernels/fusednorm/fused_norm.cu")
+            .file("kernels/fusednorm/vae_norm.cu")
             .compile("fused_norm");
         println!("cargo:rustc-link-lib=dylib=cudart");
     }

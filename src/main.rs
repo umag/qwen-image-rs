@@ -70,6 +70,9 @@ enum Command {
     FusednormTest,
     /// Self-test the cuDNN VAE conv (feature `cudnn`) vs candle's im2col conv.
     CudnnTest,
+    /// Self-test the fused VAE RmsNorm / bias+residual kernels (feature
+    /// `fusednorm`): bit-identical to the candle op chains.
+    VaeFusedTest,
     /// Micro-benchmark the DiT's dominant ops (MLP GEMM vs attention) in bf16.
     Bench {
         #[arg(long, default_value_t = 4117)]
@@ -319,6 +322,7 @@ fn main() -> Result<()> {
         Command::SageTest => sage_test(),
         Command::FusednormTest => fusednorm_test(),
         Command::CudnnTest => cudnn_test(),
+        Command::VaeFusedTest => vae_fused_test(),
         Command::Bench { seq, iters } => bench(seq, iters),
         Command::Batch {
             model,
@@ -1564,6 +1568,28 @@ fn report_offset_views(group: &str, results: Vec<(&'static str, bool)>) -> Resul
         anyhow::bail!("{group}: bridges ignore the view offset: {bad:?}");
     }
     Ok(())
+}
+
+fn vae_fused_test() -> Result<()> {
+    #[cfg(feature = "fusednorm")]
+    {
+        let dev = device::best_device()?;
+        let mut bad = 0;
+        for (case, n) in qwen_image_rs::vae_fused::self_test(&dev)? {
+            println!(
+                "{case}: {n} mismatching elements ({})",
+                if n == 0 { "BIT-IDENTICAL" } else { "FAIL" }
+            );
+            bad += (n > 0) as usize;
+        }
+        if bad > 0 {
+            anyhow::bail!("vae-fused-test: {bad} case(s) not bit-identical");
+        }
+        println!("vae-fused-test: all OK");
+        Ok(())
+    }
+    #[cfg(not(feature = "fusednorm"))]
+    anyhow::bail!("vae-fused-test needs --features fusednorm")
 }
 
 fn cudnn_test() -> Result<()> {

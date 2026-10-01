@@ -29,6 +29,8 @@ pub mod rope;
 pub mod sage;
 #[cfg(feature = "sage2")]
 pub mod sage2;
+#[cfg(feature = "fusednorm")]
+pub mod vae_fused;
 
 /// Crate result alias.
 pub type Result<T> = anyhow::Result<T>;

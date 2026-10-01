@@ -13,7 +13,7 @@
 //! `post_quant_conv` (1x1) -> `Decoder3d` -> clamp[-1,1].
 
 use candle_core::{DType, Tensor, D};
-use candle_nn::{conv2d, Conv2d, Conv2dConfig, Module, VarBuilder};
+use candle_nn::{conv2d, Conv2d, Conv2dConfig, VarBuilder};
 
 /// A VAE conv (stride 1): candle's `Conv2d` (im2col + GEMM), or — with the
 /// `cudnn` feature, on CUDA in bf16 — cuDNN with tensor-core math
@@ -25,23 +25,49 @@ struct Conv {
 }
 
 impl Conv {
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+    /// The convolution without its bias.
+    fn conv_nobias(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         #[cfg(feature = "cudnn")]
         if x.device().is_cuda() && x.dtype() == DType::BF16 && cudnn_enabled() {
             match crate::cudnn_conv::conv2d_bf16(x, self.inner.weight(), self.padding) {
-                Ok(y) => {
-                    return match self.inner.bias() {
-                        Some(b) => y.broadcast_add(&b.reshape((1, b.dim(0)?, 1, 1))?),
-                        None => Ok(y),
-                    }
-                }
+                Ok(y) => return Ok(y),
                 // cuDNN refused this call (unsupported shape, workspace OOM):
                 // the im2col path still decodes (not bit-identical; slower).
                 Err(e) => warn_cudnn_fallback(x, &e),
             }
         }
-        self.inner.forward(x)
+        // Exactly what candle_nn's Conv2d::forward does before its bias add.
+        x.conv2d(self.inner.weight(), self.padding, 1, 1, 1)
     }
+
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let y = self.conv_nobias(x)?;
+        match self.inner.bias() {
+            Some(b) => y.broadcast_add(&b.reshape((1, b.dim(0)?, 1, 1))?),
+            None => Ok(y),
+        }
+    }
+
+    /// `forward(x) + r` (a residual skip). Under `fusednorm` on CUDA bf16 the
+    /// bias add and the residual add run as one kernel with the same two bf16
+    /// roundings (byte-identical).
+    fn forward_residual(&self, x: &Tensor, r: &Tensor) -> candle_core::Result<Tensor> {
+        #[cfg(feature = "fusednorm")]
+        if let Some(b) = self.inner.bias() {
+            if x.device().is_cuda() && x.dtype() == DType::BF16 && vae_fused_enabled() {
+                let y = self.conv_nobias(x)?;
+                return crate::vae_fused::bias_residual(&y, b, r);
+            }
+        }
+        self.forward(x)? + r
+    }
+}
+
+/// `QIR_VAE_FUSED=0` turns the fused VAE norm/residual kernels off.
+#[cfg(feature = "fusednorm")]
+fn vae_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QIR_VAE_FUSED").map_or(true, |v| v != "0"))
 }
 
 #[cfg(feature = "cudnn")]
@@ -85,6 +111,26 @@ impl RmsNorm {
             gamma,
             scale: (c as f64).sqrt(),
         })
+    }
+
+    /// `forward(x)`, then SiLU if `silu` — one fused kernel under `fusednorm`
+    /// on CUDA bf16 (byte-identical to the candle chain below).
+    fn forward_silu(&self, x: &Tensor, with_silu: bool) -> Result<Tensor> {
+        #[cfg(feature = "fusednorm")]
+        if x.device().is_cuda()
+            && x.dtype() == DType::BF16
+            && self.gamma.dtype() == DType::BF16
+            && crate::vae_fused::rmsnorm_supports(x.dim(1)?)
+            && vae_fused_enabled()
+        {
+            return Ok(crate::vae_fused::rmsnorm(x, &self.gamma, with_silu)?);
+        }
+        let y = self.forward(x)?;
+        if with_silu {
+            Ok(silu(&y)?)
+        } else {
+            Ok(y)
+        }
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -151,13 +197,10 @@ impl ResidualBlock {
             Some(sc) => sc.forward(x)?,
             None => x.clone(),
         };
-        let x = self.norm1.forward(x)?;
-        let x = silu(&x)?;
+        let x = self.norm1.forward_silu(x, true)?;
         let x = self.conv1.forward(&x)?;
-        let x = self.norm2.forward(&x)?;
-        let x = silu(&x)?;
-        let x = self.conv2.forward(&x)?;
-        Ok((x + h)?)
+        let x = self.norm2.forward_silu(&x, true)?;
+        Ok(self.conv2.forward_residual(&x, &h)?)
     }
 }
 
@@ -182,7 +225,7 @@ impl AttentionBlock {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let identity = x;
         let (b, c, h, w) = x.dims4()?;
-        let xn = self.norm.forward(x)?;
+        let xn = self.norm.forward_silu(x, false)?;
         let qkv = self.to_qkv.forward(&xn)?; // (B, 3C, H, W)
                                              // (B, 3C, HW) -> (B, HW, 3C) -> chunk on last
         let qkv = qkv.reshape((b, 3 * c, h * w))?.transpose(1, 2)?; // (B, HW, 3C)
@@ -195,8 +238,7 @@ impl AttentionBlock {
         let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
         let out = attn.matmul(&v)?; // (B, HW, C)
         let out = out.transpose(1, 2)?.reshape((b, c, h, w))?; // (B, C, H, W)
-        let out = self.proj.forward(&out)?;
-        Ok((out + identity)?)
+        Ok(self.proj.forward_residual(&out, identity)?)
     }
 }
 
@@ -382,8 +424,7 @@ impl Decoder3d {
         for up in &self.up_blocks {
             x = up.forward(&x)?;
         }
-        x = self.norm_out.forward(&x)?;
-        x = silu(&x)?;
+        x = self.norm_out.forward_silu(&x, true)?;
         Ok(self.conv_out.forward(&x)?)
     }
 }
