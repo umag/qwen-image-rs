@@ -136,7 +136,20 @@ extern "C" {
         k: i32,
         stream: *mut std::ffi::c_void,
     );
+    // Fused 256-point Regular Hadamard rotation + per-row INT8 quantize.
+    // 0 = ok, 1 = unsupported K, 2 = misaligned pointer, else a CUDA error.
+    fn rotate_quantize_rows_launch(
+        out: *mut u8,
+        x: *const std::ffi::c_void,
+        row_scale: *mut f32,
+        m: i32,
+        k: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
 }
+
+/// Largest K the fused rotate+quantize kernel takes (8 warps x 8 chunks x 256).
+pub const ROTATE_QUANT_MAX_K: usize = 16384;
 
 /// Per-row INT8 quantize: `x (M,K) bf16`, `inv_scale (M,) f32` -> `u8 (M,K)` int8.
 struct QuantizeRows;
@@ -241,6 +254,91 @@ impl candle_core::CustomOp2 for QuantizeFused {
         }
         Ok((CudaStorage::wrap_cuda_slice(out, dev), (m, k).into()))
     }
+}
+
+/// Fused rotate + activation quantize (`qwen-image-rs-fused-rotate-quant`):
+/// `x (M,K) bf16` -> rotated int8 `u8 (M,K)`, with the per-row scale written
+/// IN PLACE into the pre-allocated `row_scale (M,) f32` (same contract as
+/// `QuantizeFused`). The 256-point Regular Hadamard runs in f32 registers per
+/// 256-wide chunk, so the rotated activation never exists in memory.
+struct RotateQuantizeFused;
+impl candle_core::CustomOp2 for RotateQuantizeFused {
+    fn name(&self) -> &'static str {
+        "rotate-quantize-rows-fused"
+    }
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda-only")
+    }
+    fn cuda_fwd(
+        &self,
+        x: &CudaStorage,
+        x_l: &Layout,
+        rs: &CudaStorage,
+        rs_l: &Layout,
+    ) -> candle_core::Result<(CudaStorage, Shape)> {
+        let dev = x.device().clone();
+        let (m, k) = x_l.shape().dims2()?;
+        if k == 0 || !k.is_multiple_of(crate::model::rotation::GROUP) || k > ROTATE_QUANT_MAX_K {
+            candle_core::bail!(
+                "rotate-quantize: K={k} must be a positive multiple of 256 and <= {ROTATE_QUANT_MAX_K}"
+            );
+        }
+        if rs_l.shape().dims1()? != m {
+            candle_core::bail!("rotate-quantize: row_scale len != M={m}");
+        }
+        let xo = dense_byte_offset::<half::bf16>(x_l, "rotate-quantize x")?;
+        let ro = dense_byte_offset::<f32>(rs_l, "rotate-quantize row_scale")?;
+        let x = x.as_cuda_slice::<half::bf16>()?;
+        let rs = rs.as_cuda_slice::<f32>()?; // pre-allocated (m,), written in place
+        let stream = dev.cuda_stream();
+        let out = unsafe { dev.alloc::<u8>(m * k)? };
+        {
+            let (xp, _a) = x.device_ptr(&stream);
+            let (rp, _b) = rs.device_ptr(&stream);
+            let (op, _c) = out.device_ptr(&stream);
+            let (xp, rp) = (xp + xo, rp + ro);
+            if !xp.is_multiple_of(16) {
+                candle_core::bail!("rotate-quantize: x view not 16-B aligned ({xp:#x})");
+            }
+            let rc = unsafe {
+                rotate_quantize_rows_launch(
+                    op as *mut u8,
+                    xp as *const std::ffi::c_void,
+                    rp as *mut f32,
+                    m as i32,
+                    k as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                )
+            };
+            if rc != 0 {
+                candle_core::bail!("rotate_quantize_rows_launch failed rc={rc} (M={m}, K={k})");
+            }
+        }
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), (m, k).into()))
+    }
+}
+
+/// Fused rotate + quantize: `x (M,K) bf16` -> (`rotated int8 (M,K) u8`,
+/// `row_scale (M,) f32`), `row_scale[m] = max(|(x R)[m,:]|)/127`.
+fn rotate_quantize_rows_fused(x: &Tensor) -> Result<(Tensor, Tensor)> {
+    let (m, k) = x.dims2()?;
+    if m == 0 {
+        // Zero-size grid is a launch error; nothing to compute.
+        let dev = x.device();
+        return Ok((
+            Tensor::zeros((0, k), candle_core::DType::U8, dev)?,
+            Tensor::zeros(0, candle_core::DType::F32, dev)?,
+        ));
+    }
+    let row_scale = Tensor::zeros(m, candle_core::DType::F32, x.device())?;
+    let x_i8 = x.apply_op2(&row_scale, RotateQuantizeFused)?;
+    Ok((x_i8, row_scale))
 }
 
 /// Fused activation quantize: `x (M,K) bf16` -> (`int8 (M,K) u8`, `row_scale (M,) f32`)
@@ -431,12 +529,34 @@ impl ConvRotLinear {
     /// Forward on `x (..., K)` bf16 -> `(..., N)` in the epilogue's `out` type
     /// (f16 feeds SageAttention's FP16 P·V without a separate cast kernel).
     pub fn forward_as(&self, x: &Tensor, out_ty: EpilogueOut) -> Result<Tensor> {
+        // One kernel: f32 Hadamard rotation + row amax + int8 (no bf16 x R).
+        self.forward_with(x, out_ty, rotate_quantize_rows_fused)
+    }
+
+    /// The pre-fusion forward — bf16 rotation GEMM (`rotation::rotate`), then
+    /// `quantize_rows_fused` — kept as the self-test oracle for the fused
+    /// rotate+quantize kernel. Not on the DiT path.
+    pub fn forward_as_unfused(&self, x: &Tensor, out_ty: EpilogueOut) -> Result<Tensor> {
+        let r = self.hadamard.clone();
+        self.forward_with(x, out_ty, move |x2: &Tensor| {
+            let xr = crate::model::rotation::rotate(x2, &r)?; // (M,K) bf16
+            quantize_rows_fused(&xr)
+        })
+    }
+
+    /// Shared tail of both forwards: `quant` maps the `(M,K)` bf16 activation
+    /// to (rotated int8, row scale); then the fused INT8 GEMM + dequant.
+    fn forward_with(
+        &self,
+        x: &Tensor,
+        out_ty: EpilogueOut,
+        quant: impl Fn(&Tensor) -> Result<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
         let dims = x.dims().to_vec();
         let k = *dims.last().unwrap();
         let m: usize = dims[..dims.len() - 1].iter().product();
         let x2 = x.reshape((m, k))?;
-        let xr = crate::model::rotation::rotate(&x2, &self.hadamard)?; // (M,K) bf16
-        let (x_i8, row_scale) = quantize_rows_fused(&xr)?; // fused amax+quantize
+        let (x_i8, row_scale) = quant(&x2)?;
         let n = self.col_scale.dim(0)?;
         // Pack the two scale vectors into one tensor (candle has no CustomOp4):
         // scales[0..N] = s_col, scales[N..N+M] = s_row. col first so the
@@ -653,6 +773,9 @@ pub fn self_test_offset_views() -> Result<Vec<(&'static str, bool)>> {
     let (q, rs) = quantize_rows_fused(&x)?;
     let (qf, rsf) = quantize_rows_fused(&xf)?;
     let fused_ok = u8s(&q)? == u8s(&qf)? && rs.to_vec1::<f32>()? == rsf.to_vec1::<f32>()?;
+    let (rq, rrs) = rotate_quantize_rows_fused(&x)?;
+    let (rqf, rrsf) = rotate_quantize_rows_fused(&xf)?;
+    let rotq_ok = u8s(&rq)? == u8s(&rqf)? && rrs.to_vec1::<f32>()? == rrsf.to_vec1::<f32>()?;
     let inv = Tensor::from_vec(vec![100f32; drop + m], drop + m, &dev)?.narrow(0, drop, m)?;
     let invf = inv.force_contiguous()?;
     let rows_ok =
@@ -661,6 +784,192 @@ pub fn self_test_offset_views() -> Result<Vec<(&'static str, bool)>> {
         ("int8_gemm", gemm_ok),
         ("int8_gemm_dequant", deq_ok),
         ("quantize_rows_fused", fused_ok),
+        ("rotate_quantize_rows_fused", rotq_ok),
         ("quantize_rows", rows_ok),
     ])
+}
+
+/// One shape of the fused rotate+quantize self-test.
+#[derive(Debug)]
+pub struct RotQuantCase {
+    pub m: usize,
+    pub k: usize,
+    /// Fused vs the f64-accumulated host reference: max |int8 diff|, count of
+    /// differing int8s, max relative row-scale error.
+    pub ref_max_diff: i32,
+    pub ref_mismatches: usize,
+    pub ref_scale_rel: f32,
+    /// Fused vs the old path (bf16 rotation GEMM + quantize_rows_fused).
+    pub old_max_diff: i32,
+    pub old_mismatches: usize,
+    pub old_scale_rel: f32,
+}
+
+impl RotQuantCase {
+    /// Pass: int8 within 1 of both references; scales within 1e-5 of the
+    /// f64 reference and within bf16 rounding (2^-8) of the old path.
+    pub fn ok(&self) -> bool {
+        self.ref_max_diff <= 1
+            && self.old_max_diff <= 1
+            && self.ref_scale_rel <= 1e-5
+            && self.old_scale_rel <= 1.0 / 256.0
+    }
+}
+
+/// Fused rotate+quantize vs (a) a host reference (R256 · chunk accumulated
+/// in f64, then the kernel's quantize formula in f32) and (b) the old
+/// rotate (bf16 GEMM) + quantize_rows_fused path, at each `(M, K)`. Row 0 is
+/// all zero, row 1 carries large outliers, the rest are randn.
+pub fn self_test_rotate_quant(shapes: &[(usize, usize)]) -> Result<Vec<RotQuantCase>> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let g = crate::model::rotation::GROUP;
+    let r_cpu: Vec<f32> = crate::model::rotation::regular_hadamard_256(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+    let r = crate::model::rotation::regular_hadamard_256(&dev)?;
+    let mut cases = Vec::new();
+    for &(m, k) in shapes {
+        let mut x: Vec<f32> = Tensor::randn(0f32, 1f32, (m, k), &Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        x[..k].fill(0.0);
+        if m > 1 {
+            for j in (0..k).step_by(97) {
+                x[k + j] *= 60.0;
+            }
+        }
+        let xb = Tensor::from_vec(x, (m, k), &Device::Cpu)?.to_dtype(DType::BF16)?;
+        let xh: Vec<f32> = xb.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let xg = xb.to_device(&dev)?;
+        let (q, s) = rotate_quantize_rows_fused(&xg)?;
+        let q: Vec<i8> = q
+            .flatten_all()?
+            .to_vec1::<u8>()?
+            .iter()
+            .map(|&b| b as i8)
+            .collect();
+        let s: Vec<f32> = s.to_vec1()?;
+        let xr = crate::model::rotation::rotate(&xg, &r)?;
+        let (qo, so) = quantize_rows_fused(&xr)?;
+        let qo: Vec<i8> = qo
+            .flatten_all()?
+            .to_vec1::<u8>()?
+            .iter()
+            .map(|&b| b as i8)
+            .collect();
+        let so: Vec<f32> = so.to_vec1()?;
+
+        let mut c = RotQuantCase {
+            m,
+            k,
+            ref_max_diff: 0,
+            ref_mismatches: 0,
+            ref_scale_rel: 0.0,
+            old_max_diff: 0,
+            old_mismatches: 0,
+            old_scale_rel: 0.0,
+        };
+        let rel = |a: f32, b: f32| if b == 0.0 { a.abs() } else { (a - b).abs() / b };
+        for row in 0..m {
+            let mut y = vec![0f32; k];
+            for ch in 0..k / g {
+                for i in 0..g {
+                    let acc: f64 = (0..g)
+                        .map(|j| r_cpu[i * g + j] as f64 * xh[row * k + ch * g + j] as f64)
+                        .sum();
+                    y[ch * g + i] = acc as f32;
+                }
+            }
+            let amax = y.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let scale = amax * (1.0 / 127.0);
+            let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+            c.ref_scale_rel = c.ref_scale_rel.max(rel(s[row], scale));
+            c.old_scale_rel = c.old_scale_rel.max(rel(s[row], so[row]));
+            for (i, yv) in y.iter().enumerate() {
+                let want = (yv * inv).round_ties_even().clamp(-127.0, 127.0) as i32;
+                let got = q[row * k + i] as i32;
+                let d_ref = (got - want).abs();
+                let d_old = (got - qo[row * k + i] as i32).abs();
+                c.ref_max_diff = c.ref_max_diff.max(d_ref);
+                c.old_max_diff = c.old_max_diff.max(d_old);
+                c.ref_mismatches += usize::from(d_ref != 0);
+                c.old_mismatches += usize::from(d_old != 0);
+            }
+        }
+        cases.push(c);
+    }
+    Ok(cases)
+}
+
+/// The fused rotate+quantize rejects K it cannot rotate (not a multiple of
+/// 256, or above `ROTATE_QUANT_MAX_K`) with an error instead of a partial
+/// rotation. Returns true when every bad K errors.
+pub fn self_test_rotate_quant_rejects() -> Result<bool> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let mut all = true;
+    for k in [128usize, 384, ROTATE_QUANT_MAX_K + 256] {
+        let x = Tensor::zeros((2, k), DType::BF16, &dev)?;
+        all &= rotate_quantize_rows_fused(&x).is_err();
+    }
+    let empty = Tensor::zeros((0, 4096), DType::BF16, &dev)?;
+    let (q, s) = rotate_quantize_rows_fused(&empty)?;
+    Ok(all && q.dims() == [0, 4096] && s.dims() == [0])
+}
+
+/// ConvRotLinear fused forward vs the unfused (old) forward: output cosine at
+/// the DiT MLP-out shape class (K = 12288) and an attention shape (K = 4096).
+pub fn self_test_linear_fused_vs_unfused() -> Result<Vec<(usize, usize, usize, f32)>> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let r = crate::model::rotation::regular_hadamard_256(&dev)?;
+    let mut out = Vec::new();
+    for (m, n, k) in [(257usize, 4096usize, 4096usize), (64, 512, 12288)] {
+        let w = (Tensor::randn(0f32, 1f32, (n, k), &dev)? * 0.02)?.to_dtype(DType::BF16)?;
+        let x = Tensor::randn(0f32, 1f32, (m, k), &dev)?.to_dtype(DType::BF16)?;
+        let cr = ConvRotLinear::from_weight(&w, &r)?;
+        let a = cr.forward(&x)?.to_dtype(DType::F32)?;
+        let b = cr
+            .forward_as_unfused(&x, EpilogueOut::Bf16)?
+            .to_dtype(DType::F32)?;
+        let dot = (&a * &b)?.sum_all()?.to_scalar::<f32>()?;
+        let na = a.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+        let nb = b.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+        out.push((m, n, k, dot / (na * nb + 1e-12)));
+    }
+    Ok(out)
+}
+
+/// Time the activation path alone at the DiT shapes (M = 4117): fused
+/// rotate+quantize vs the old bf16 rotation GEMM + quantize. Returns
+/// `(K, fused_ms, unfused_ms)` per K.
+pub fn bench_rotate_quant(iters: usize) -> Result<Vec<(usize, f64, f64)>> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let r = crate::model::rotation::regular_hadamard_256(&dev)?;
+    let mut out = Vec::new();
+    for k in [4096usize, 12288] {
+        let x = Tensor::randn(0f32, 1f32, (4117, k), &dev)?.to_dtype(DType::BF16)?;
+        let time = |f: &dyn Fn() -> Result<()>| -> Result<f64> {
+            f()?;
+            dev.synchronize()?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                f()?;
+            }
+            dev.synchronize()?;
+            Ok(t0.elapsed().as_secs_f64() * 1e3 / iters as f64)
+        };
+        let fused = time(&|| {
+            rotate_quantize_rows_fused(&x)?;
+            Ok(())
+        })?;
+        let unfused = time(&|| {
+            quantize_rows_fused(&crate::model::rotation::rotate(&x, &r)?)?;
+            Ok(())
+        })?;
+        out.push((k, fused, unfused));
+    }
+    Ok(out)
 }

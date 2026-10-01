@@ -1246,8 +1246,50 @@ fn convrot_test() -> Result<()> {
             "MLP-shape timing: convrot {cr_ms:.3} ms vs bf16 {bf_ms:.3} ms ({:.2}x)",
             bf_ms / cr_ms
         );
-        if maxdiff != 0 || epi_bad != 0 || !f16_ok {
-            anyhow::bail!("convrot self-test FAILED (bit-exactness)");
+        // Fused rotate+quantize vs the f64 host reference and the old path.
+        let mut rq_ok = true;
+        for c in qwen_image_rs::convrot::self_test_rotate_quant(&[
+            (37, 256),
+            (300, 4096),
+            (64, 12288),
+            (5, 16384),
+        ])? {
+            println!(
+                "convrot fused rotate+quant (M={} K={}): vs f64 ref max|dq|={} ({} of {} differ), scale rel {:.1e}; vs old bf16-GEMM path max|dq|={} ({} differ, {:.3}%), scale rel {:.1e} ({})",
+                c.m,
+                c.k,
+                c.ref_max_diff,
+                c.ref_mismatches,
+                c.m * c.k,
+                c.ref_scale_rel,
+                c.old_max_diff,
+                c.old_mismatches,
+                100.0 * c.old_mismatches as f64 / (c.m * c.k) as f64,
+                c.old_scale_rel,
+                if c.ok() { "OK" } else { "MISMATCH" }
+            );
+            rq_ok &= c.ok();
+        }
+        let rq_rej = qwen_image_rs::convrot::self_test_rotate_quant_rejects()?;
+        println!(
+            "convrot fused rotate+quant rejects K=128/384/16640, M=0 empty: {}",
+            if rq_rej { "OK" } else { "MISMATCH" }
+        );
+        for (m, n, k, c) in qwen_image_rs::convrot::self_test_linear_fused_vs_unfused()? {
+            println!(
+                "convrot linear fused vs unfused forward (M={m} N={n} K={k}): cosine = {c:.7} ({})",
+                if c > 0.9999 { "OK" } else { "TOO LOW" }
+            );
+            rq_ok &= c > 0.9999;
+        }
+        for (k, f, u) in qwen_image_rs::convrot::bench_rotate_quant(50)? {
+            println!(
+                "activation rotate+quant (M=4117 K={k}): fused {f:.3} ms vs bf16 GEMM + quant {u:.3} ms ({:.2}x)",
+                u / f
+            );
+        }
+        if maxdiff != 0 || epi_bad != 0 || !f16_ok || !rq_ok || !rq_rej {
+            anyhow::bail!("convrot self-test FAILED (bit-exactness / rotate+quant bounds)");
         }
         report_offset_views("convrot", qwen_image_rs::convrot::self_test_offset_views()?)
     }
