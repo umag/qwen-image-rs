@@ -1875,6 +1875,7 @@ dependencies = [
  "candle-transformers",
  "cc",
  "clap",
+ "cudarc 0.19.9",
  "half",
  "image",
  "safetensors 0.8.0",

@@ -28,14 +28,28 @@ impl Conv {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         #[cfg(feature = "cudnn")]
         if x.device().is_cuda() && x.dtype() == DType::BF16 && cudnn_enabled() {
-            let y = crate::cudnn_conv::conv2d_bf16(x, self.inner.weight(), self.padding)?;
-            return match self.inner.bias() {
-                Some(b) => y.broadcast_add(&b.reshape((1, b.dim(0)?, 1, 1))?),
-                None => Ok(y),
-            };
+            match crate::cudnn_conv::conv2d_bf16(x, self.inner.weight(), self.padding) {
+                Ok(y) => {
+                    return match self.inner.bias() {
+                        Some(b) => y.broadcast_add(&b.reshape((1, b.dim(0)?, 1, 1))?),
+                        None => Ok(y),
+                    }
+                }
+                // cuDNN refused this call (unsupported shape, workspace OOM):
+                // the im2col path still decodes (not bit-identical; slower).
+                Err(e) => warn_cudnn_fallback(x, &e),
+            }
         }
         self.inner.forward(x)
     }
+}
+
+#[cfg(feature = "cudnn")]
+fn warn_cudnn_fallback(x: &Tensor, e: &candle_core::Error) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(shape = ?x.dims(), error = %e, "cuDNN conv failed; falling back to im2col");
+    });
 }
 
 #[cfg(feature = "cudnn")]

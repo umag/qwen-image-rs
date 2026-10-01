@@ -22,6 +22,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 candle-flash-attn = { version = "0.11", optional = true }
 half = { version = "2", optional = true }
+# Only for its `cudnn` module (feature `cudnn`); unifies with candle's cudarc 0.19.
+# Deliberately NOT candle-core/cudnn: candle's own cuDNN conv uses default math
+# (FP32 SIMT kernels for bf16) and is slower than its im2col path.
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["cudnn"] }
 
 [build-dependencies]
 cc = { version = "1", optional = true }
@@ -32,7 +36,7 @@ default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 # cuDNN conv2d for the VAE (tensor-core math; src/cudnn_conv.rs). Needs libcudnn
 # (pip wheel nvidia-cudnn-cu13, see scripts/setup-host.sh; QIR_CUDNN_LIB).
-cudnn = ["cuda", "candle-core/cudnn", "dep:half"]
+cudnn = ["cuda", "dep:cudarc", "dep:half"]
 # FlashAttention-2 kernels (Ada/Ampere/Hopper only). ~19 min first build.
 flash-attn = ["cuda", "dep:candle-flash-attn"]
 # ConvRot INT8 W8A8: compiles kernels/convrot/*.cu (needs CUTLASS_DIR).

@@ -68,6 +68,8 @@ enum Command {
     SageTest,
     /// Self-test the fused LayerNorm+AdaLN kernel vs the candle reference.
     FusednormTest,
+    /// Self-test the cuDNN VAE conv (feature `cudnn`) vs candle's im2col conv.
+    CudnnTest,
     /// Micro-benchmark the DiT's dominant ops (MLP GEMM vs attention) in bf16.
     Bench {
         #[arg(long, default_value_t = 4117)]
@@ -316,6 +318,7 @@ fn main() -> Result<()> {
         Command::GemmBench { iters, batch } => gemm_bench(iters, batch),
         Command::SageTest => sage_test(),
         Command::FusednormTest => fusednorm_test(),
+        Command::CudnnTest => cudnn_test(),
         Command::Bench { seq, iters } => bench(seq, iters),
         Command::Batch {
             model,
@@ -1561,6 +1564,21 @@ fn report_offset_views(group: &str, results: Vec<(&'static str, bool)>) -> Resul
         anyhow::bail!("{group}: bridges ignore the view offset: {bad:?}");
     }
     Ok(())
+}
+
+fn cudnn_test() -> Result<()> {
+    #[cfg(feature = "cudnn")]
+    {
+        let dev = device::best_device()?;
+        let fails = qwen_image_rs::cudnn_conv::self_test(&dev)?;
+        if fails > 0 {
+            anyhow::bail!("cudnn-test: {fails} case(s) failed");
+        }
+        println!("cudnn-test: all OK");
+        Ok(())
+    }
+    #[cfg(not(feature = "cudnn"))]
+    anyhow::bail!("cudnn-test needs --features cudnn")
 }
 
 fn fusednorm_test() -> Result<()> {

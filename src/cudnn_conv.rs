@@ -141,7 +141,8 @@ impl candle_core::CustomOp2 for Conv2dCudnn {
         };
         let ws_bytes = fwd.get_workspace_size(algo).map_err(e)?;
         let stream = dev.cuda_stream();
-        let mut workspace = unsafe { stream.alloc::<u8>(ws_bytes.max(1)) }.map_err(candle_core::Error::wrap)?;
+        let mut workspace =
+            unsafe { stream.alloc::<u8>(ws_bytes.max(1)) }.map_err(candle_core::Error::wrap)?;
         let mut out = unsafe { dev.alloc::<half::bf16>(b * o * oh * ow)? };
         unsafe {
             fwd.launch(
@@ -169,4 +170,61 @@ pub fn conv2d_bf16(x: &Tensor, w: &Tensor, padding: usize) -> candle_core::Resul
     }
     x.contiguous()?
         .apply_op2_no_bwd(&w.contiguous()?, &Conv2dCudnn { padding })
+}
+
+/// `cudnn-test`: the bridge vs candle's im2col conv on VAE-like shapes, plus
+/// an offset-view check. Returns the number of failures (the verb exits
+/// nonzero on any).
+pub fn self_test(dev: &candle_core::Device) -> candle_core::Result<usize> {
+    let mut fails = 0;
+    // (B, C, H, W, O, k, padding)
+    let cases = [
+        (1, 64, 16, 16, 64, 3, 1),
+        (1, 96, 8, 12, 32, 1, 0),
+        (1, 144, 8, 8, 4, 3, 1),
+        (2, 32, 5, 7, 48, 3, 1),
+        (1, 288, 33, 31, 288, 3, 1),
+    ];
+    for &(b, c, h, w, o, k, p) in &cases {
+        let x = Tensor::randn(0f32, 1f32, (b, c, h, w), dev)?.to_dtype(DType::BF16)?;
+        let wt = (Tensor::randn(0f32, 1f32, (o, c, k, k), dev)? / ((c * k * k) as f64).sqrt())?
+            .to_dtype(DType::BF16)?;
+        let ours = conv2d_bf16(&x, &wt, p)?.to_dtype(DType::F32)?;
+        let refr = x.conv2d(&wt, p, 1, 1, 1)?.to_dtype(DType::F32)?;
+        let dot = (&ours * &refr)?.sum_all()?.to_scalar::<f32>()?;
+        let na = ours.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+        let nb = refr.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+        let cos = dot / (na * nb).max(1e-30);
+        let maxabs = (&ours - &refr)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        let ok = ours.dims() == refr.dims() && cos > 0.99999 && maxabs < 0.05;
+        if !ok {
+            fails += 1;
+        }
+        println!(
+            "conv ({b},{c},{h},{w})->{o} k{k} p{p}: cos {cos:.7} maxabs {maxabs:.4} {}",
+            if ok { "OK" } else { "FAIL" }
+        );
+    }
+    // Offset view: a B=1 narrow of a (2,C,H,W) batch is a dense view at
+    // start_offset C*H*W (the size-1 batch dim is skipped by is_contiguous).
+    let big = Tensor::randn(0f32, 1f32, (2, 64, 12, 12), dev)?.to_dtype(DType::BF16)?;
+    let view = big.narrow(0, 1, 1)?;
+    let wt = (Tensor::randn(0f32, 1f32, (32, 64, 3, 3), dev)? / 24.0)?.to_dtype(DType::BF16)?;
+    let offset = view.layout().start_offset();
+    let a = conv2d_bf16(&view, &wt, 1)?;
+    let fresh = view.to_dtype(DType::F32)?.to_dtype(DType::BF16)?; // new storage, offset 0
+    let bb = conv2d_bf16(&fresh, &wt, 1)?;
+    let diff = (a.to_dtype(DType::F32)? - bb.to_dtype(DType::F32)?)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+    let ok = offset > 0 && diff == 0.0;
+    if !ok {
+        fails += 1;
+    }
+    println!(
+        "offset view (start_offset {offset}) vs fresh copy: {}",
+        if ok { "BIT-IDENTICAL" } else { "MISMATCH" }
+    );
+    Ok(fails)
 }

@@ -34,4 +34,11 @@ uv pip install --python .venv \
   "diffusers @ git+https://github.com/huggingface/diffusers" \
   "transformers>=5.17" accelerate safetensors pillow
 .venv/bin/python -c "import torch,diffusers,transformers; print('torch',torch.__version__,'cuda',torch.cuda.is_available()); print('diffusers',diffusers.__version__,'transformers',transformers.__version__)"
+echo "== cuDNN (user space, for --features cudnn) =="
+# NVIDIA's pip wheel, unpacked with --target: no root, no system package. The
+# cudnn feature's build.rs links + rpaths $QIR_CUDNN_LIB (default below).
+CUDNN_DIR="$HOME/dev_tmp/cudnn/py"
+uv pip install --no-deps --target "$CUDNN_DIR" "nvidia-cudnn-cu13==9.24.0.43"
+ln -sf libcudnn.so.9 "$CUDNN_DIR/nvidia/cudnn/lib/libcudnn.so" # link-time name
+ls "$CUDNN_DIR/nvidia/cudnn/lib/libcudnn.so"
 echo "== setup-host OK =="
