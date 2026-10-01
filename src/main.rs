@@ -53,6 +53,17 @@ enum Command {
     },
     /// Self-test the ConvRot INT8 GEMM bridge (candle -> CUTLASS kernel -> candle).
     ConvrotTest,
+    /// Time the ConvRot INT8 GEMM + dequant per CUTLASS tile config at the DiT
+    /// shapes (separate and merged q/k/v and gate/proj), checking every config
+    /// is bit-identical.
+    GemmBench {
+        /// Timed launches per (shape, config).
+        #[arg(long, default_value_t = 30)]
+        iters: usize,
+        /// Batch size B (M = B * 4117 for the image-sequence shapes).
+        #[arg(long, default_value_t = 1)]
+        batch: usize,
+    },
     /// Self-test the SageAttention INT8-QK/FP16-PV kernel vs an f32 reference.
     SageTest,
     /// Self-test the fused LayerNorm+AdaLN kernel vs the candle reference.
@@ -294,6 +305,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Smoke { n } => smoke(n),
         Command::ConvrotTest => convrot_test(),
+        Command::GemmBench { iters, batch } => gemm_bench(iters, batch),
         Command::SageTest => sage_test(),
         Command::FusednormTest => fusednorm_test(),
         Command::Bench { seq, iters } => bench(seq, iters),
@@ -1196,6 +1208,61 @@ fn vae_decode(
     buf.save(out)?;
     println!("wrote {} ({w}x{h} RGBA)", out.display());
     Ok(())
+}
+
+/// `gemm-bench`: ms per tile config for each DiT INT8 GEMM shape.
+fn gemm_bench(iters: usize, batch: usize) -> Result<()> {
+    #[cfg(feature = "convrot")]
+    {
+        use qwen_image_rs::convrot::{bench_gemm_configs, gemm_config, EpilogueOut, GEMM_CONFIGS};
+        let m = 4117 * batch;
+        let shapes = [
+            (m, 4096, 4096),  // to_q / to_k / to_out
+            (m, 8192, 4096),  // merged q|k
+            (m, 12288, 4096), // gate / proj (or merged q|k|v)
+            (m, 24576, 4096), // merged gate|proj
+            (m, 4096, 12288), // mlp out
+            (m, 64, 4096),    // proj_out
+            (2, 16384, 4096), // modulation
+            (2, 4096, 4096),  // norm_out / time_embed.linear_2
+        ];
+        for (i, c) in GEMM_CONFIGS.iter().enumerate() {
+            println!(
+                "cfg {i}: TB {}x{}x{} warp {}x{}x{} stages {}",
+                c.0, c.1, c.2, c.3, c.4, c.5, c.6
+            );
+        }
+        let mut all_same = true;
+        for (out, list) in [
+            (EpilogueOut::Bf16, &shapes[..]),
+            (EpilogueOut::F16, &shapes[..1]),
+        ] {
+            for (m, n, k, times, same) in bench_gemm_configs(list, out, iters)? {
+                let flop = 2.0 * (m * n * k) as f64;
+                let cells: Vec<String> = times
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| match t {
+                        Some(ms) => format!("{i}:{ms:.4}ms/{:.0}T", flop / ms / 1e9),
+                        None => format!("{i}:n/a"),
+                    })
+                    .collect();
+                println!(
+                    "{out:?} M={m} N={n} K={k} [selected cfg {}] {} bit-identical={same}",
+                    gemm_config(m, n, k),
+                    cells.join(" ")
+                );
+                all_same &= same;
+            }
+        }
+        anyhow::ensure!(all_same, "tile configs disagree (must be bit-identical)");
+        Ok(())
+    }
+    #[cfg(not(feature = "convrot"))]
+    {
+        let _ = (iters, batch);
+        anyhow::bail!("build with --features convrot (needs CUTLASS_DIR)")
+    }
 }
 
 /// Self-test the ConvRot INT8 GEMM bridge end to end.

@@ -20,9 +20,13 @@ extern "C" {
         k: i32,
         stream: *mut std::ffi::c_void,
     ) -> i32;
-    // Fused INT8 GEMM + per-row/per-col dequant epilogue -> bf16.
-    // d[m,n] = bf16(acc[m,n] * s_row[m] * s_col[n]).
-    fn int8_gemm_dequant_bf16(
+    // Fused INT8 GEMM + per-row/per-col dequant epilogue with tile config
+    // `cfg`: d[m,n] = out(acc[m,n] * s_row[m] * s_col[n]), out_kind 0 = bf16,
+    // 1 = f16. 0 = ok, -2 = unknown cfg/out_kind, else the cutlass::Status.
+    #[allow(clippy::too_many_arguments)]
+    fn int8_gemm_dequant_cfg_launch(
+        out_kind: i32,
+        cfg: i32,
         d: *mut std::ffi::c_void,
         a: *const i8,
         b: *const i8,
@@ -33,18 +37,25 @@ extern "C" {
         k: i32,
         stream: *mut std::ffi::c_void,
     ) -> i32;
-    // Same fused GEMM, f16 store: d[m,n] = f16(acc[m,n] * s_row[m] * s_col[n]).
-    fn int8_gemm_dequant_f16(
-        d: *mut std::ffi::c_void,
-        a: *const i8,
-        b: *const i8,
-        s_row: *const f32,
-        s_col: *const f32,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: *mut std::ffi::c_void,
-    ) -> i32;
+}
+
+/// The CUTLASS EVT tile configs (`kernels/convrot/int8_gemm.cu` `Cfg<i>`), by
+/// index: (threadblock M, N, K, warp M, N, K, stages). Every config computes
+/// bit-identical outputs (exact INT8 accumulation, per-element epilogue).
+pub const GEMM_CONFIGS: [(u16, u16, u16, u16, u16, u16, u8); 8] = [
+    (128, 128, 64, 64, 64, 64, 3),
+    (128, 256, 64, 64, 64, 64, 3),
+    (256, 128, 64, 64, 64, 64, 3),
+    (128, 128, 64, 64, 64, 64, 4),
+    (128, 128, 64, 64, 64, 64, 5),
+    (256, 64, 64, 64, 64, 64, 4),
+    (64, 128, 64, 32, 64, 64, 4),
+    (128, 128, 128, 64, 64, 128, 3),
+];
+
+/// The tile config the DiT uses for an `(M, N, K)` INT8 GEMM.
+pub fn gemm_config(_m: usize, _n: usize, _k: usize) -> u8 {
+    0
 }
 
 struct Int8Gemm;
@@ -507,10 +518,20 @@ pub enum EpilogueOut {
 /// `col_scale` first keeps it at the buffer base. `s_row` then sits at offset N,
 /// which is 32-B aligned because N (out_features) is always a multiple of 8
 /// (the bf16 store alignment requires it anyway).
-struct Int8GemmDequant(EpilogueOut);
+struct Int8GemmDequant {
+    out: EpilogueOut,
+    /// Tile config index (`GEMM_CONFIGS`); `None` = `gemm_config(M, N, K)`.
+    cfg: Option<u8>,
+}
+
+impl Int8GemmDequant {
+    fn auto(out: EpilogueOut) -> Self {
+        Self { out, cfg: None }
+    }
+}
 impl candle_core::CustomOp3 for Int8GemmDequant {
     fn name(&self) -> &'static str {
-        match self.0 {
+        match self.out {
             EpilogueOut::Bf16 => "int8-gemm-dequant-bf16",
             EpilogueOut::F16 => "int8-gemm-dequant-f16",
         }
@@ -573,19 +594,31 @@ impl candle_core::CustomOp3 for Int8GemmDequant {
         let (a_i8, b_i8) = (ap as *const i8, bp as *const i8);
         let cu = stream.cu_stream() as *mut std::ffi::c_void;
         let (mi, ni, ki) = (m as i32, n as i32, k as i32);
-        // Both variants share every argument but the store type (and launcher).
-        let storage = match self.0 {
+        let cfg = self.cfg.unwrap_or_else(|| gemm_config(m, n, k));
+        if cfg as usize >= GEMM_CONFIGS.len() {
+            candle_core::bail!("int8-gemm-dequant: unknown tile config {cfg}");
+        }
+        let launch = |d: *mut std::ffi::c_void, kind: i32| -> candle_core::Result<()> {
+            let rc = unsafe {
+                int8_gemm_dequant_cfg_launch(
+                    kind, cfg as i32, d, a_i8, b_i8, s_row, s_col, mi, ni, ki, cu,
+                )
+            };
+            if rc != 0 {
+                candle_core::bail!(
+                    "int8_gemm_dequant (out {:?}, cfg {cfg}, M={m} N={n} K={k}) failed, rc={rc}",
+                    self.out
+                );
+            }
+            Ok(())
+        };
+        // Both variants share every argument but the store type.
+        let storage = match self.out {
             EpilogueOut::Bf16 => {
                 let out = unsafe { dev.alloc::<half::bf16>(m * n)? };
                 {
                     let (op, _go) = out.device_ptr(&stream);
-                    let d = op as *mut std::ffi::c_void;
-                    let rc = unsafe {
-                        int8_gemm_dequant_bf16(d, a_i8, b_i8, s_row, s_col, mi, ni, ki, cu)
-                    };
-                    if rc != 0 {
-                        candle_core::bail!("int8_gemm_dequant_bf16 failed, rc={rc}");
-                    }
+                    launch(op as *mut std::ffi::c_void, 0)?;
                 }
                 CudaStorage::wrap_cuda_slice(out, dev.clone())
             }
@@ -593,13 +626,7 @@ impl candle_core::CustomOp3 for Int8GemmDequant {
                 let out = unsafe { dev.alloc::<half::f16>(m * n)? };
                 {
                     let (op, _go) = out.device_ptr(&stream);
-                    let d = op as *mut std::ffi::c_void;
-                    let rc = unsafe {
-                        int8_gemm_dequant_f16(d, a_i8, b_i8, s_row, s_col, mi, ni, ki, cu)
-                    };
-                    if rc != 0 {
-                        candle_core::bail!("int8_gemm_dequant_f16 failed, rc={rc}");
-                    }
+                    launch(op as *mut std::ffi::c_void, 1)?;
                 }
                 CudaStorage::wrap_cuda_slice(out, dev.clone())
             }
@@ -734,7 +761,7 @@ impl ConvRotLinear {
         let scales = Tensor::cat(&[&self.col_scale, row_scale], 0)?; // (N+M,) f32
 
         // Fused INT8 GEMM + per-row/per-col dequant epilogue -> (M,N) out_ty.
-        let out = x_i8.apply_op3(&self.w_i8, &scales, Int8GemmDequant(out_ty))?;
+        let out = x_i8.apply_op3(&self.w_i8, &scales, Int8GemmDequant::auto(out_ty))?;
         let mut out_dims = lead.to_vec();
         out_dims.push(n);
         Ok(out.reshape(out_dims)?)
@@ -849,8 +876,8 @@ pub fn self_test_epilogue(m: usize, n: usize, k: usize) -> Result<(usize, usize)
     let mut packed = s_col.clone();
     packed.extend_from_slice(&s_row);
     let scales = Tensor::from_vec(packed, n + m, &dev)?;
-    let bf = a.apply_op3(&b, &scales, Int8GemmDequant(EpilogueOut::Bf16))?;
-    let hf = a.apply_op3(&b, &scales, Int8GemmDequant(EpilogueOut::F16))?;
+    let bf = a.apply_op3(&b, &scales, Int8GemmDequant::auto(EpilogueOut::Bf16))?;
+    let hf = a.apply_op3(&b, &scales, Int8GemmDequant::auto(EpilogueOut::F16))?;
     let bf: Vec<half::bf16> = bf.flatten_all()?.to_vec1()?;
     let hf: Vec<half::f16> = hf.flatten_all()?.to_vec1()?;
     let (mut bad_bf, mut bad_hf) = (0usize, 0usize);
@@ -926,7 +953,7 @@ pub fn self_test_offset_views() -> Result<Vec<(&'static str, bool)>> {
     let sc = Tensor::from_vec(sv, sdrop + n + m, &dev)?.narrow(0, sdrop, n + m)?;
     let scf = sc.force_contiguous()?;
     let deq = |a: &Tensor, b: &Tensor, s: &Tensor| -> Result<Vec<u16>> {
-        Ok(a.apply_op3(b, s, Int8GemmDequant(EpilogueOut::Bf16))?
+        Ok(a.apply_op3(b, s, Int8GemmDequant::auto(EpilogueOut::Bf16))?
             .flatten_all()?
             .to_vec1::<half::bf16>()?
             .iter()
@@ -1355,4 +1382,79 @@ pub fn bench_swiglu_quant(iters: usize) -> Result<(f64, f64)> {
         Ok(())
     })?;
     Ok((fused, unfused))
+}
+
+/// Time one fused INT8 GEMM + dequant per tile config at each `(M, N, K)`,
+/// and check every config's output is bit-identical to config 0. Returns
+/// `(m, n, k, per-config ms or None when the config cannot run the shape,
+/// all_identical)`.
+#[allow(clippy::type_complexity)]
+pub fn bench_gemm_configs(
+    shapes: &[(usize, usize, usize)],
+    out: EpilogueOut,
+    iters: usize,
+) -> Result<Vec<(usize, usize, usize, Vec<Option<f64>>, bool)>> {
+    use candle_core::Device;
+    let dev = Device::new_cuda(0)?;
+    let mut res = Vec::new();
+    for &(m, n, k) in shapes {
+        let ai: Vec<u8> = (0..m * k).map(|i| ((i * 7 + 3) % 255) as u8).collect();
+        let bi: Vec<u8> = (0..n * k).map(|i| ((i * 13 + 5) % 255) as u8).collect();
+        let a = Tensor::from_vec(ai, (m, k), &dev)?;
+        let b = Tensor::from_vec(bi, (n, k), &dev)?;
+        let sv: Vec<f32> = (0..n + m).map(|i| 1e-5 * (1.0 + (i % 97) as f32)).collect();
+        let sc = Tensor::from_vec(sv, n + m, &dev)?;
+        let bits = |t: &Tensor| -> Result<Vec<u16>> {
+            Ok(match out {
+                EpilogueOut::Bf16 => t
+                    .flatten_all()?
+                    .to_vec1::<half::bf16>()?
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect(),
+                EpilogueOut::F16 => t
+                    .flatten_all()?
+                    .to_vec1::<half::f16>()?
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect(),
+            })
+        };
+        let mut times = Vec::new();
+        let mut reference: Option<Vec<u16>> = None;
+        let mut same = true;
+        for cfg in 0..GEMM_CONFIGS.len() as u8 {
+            let op = || {
+                a.apply_op3(
+                    &b,
+                    &sc,
+                    Int8GemmDequant {
+                        out,
+                        cfg: Some(cfg),
+                    },
+                )
+            };
+            let first = match op() {
+                Ok(t) => t,
+                Err(_) => {
+                    times.push(None);
+                    continue;
+                }
+            };
+            let got = bits(&first)?;
+            match &reference {
+                None => reference = Some(got),
+                Some(r) => same &= *r == got,
+            }
+            dev.synchronize()?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                op()?;
+            }
+            dev.synchronize()?;
+            times.push(Some(t0.elapsed().as_secs_f64() * 1e3 / iters as f64));
+        }
+        res.push((m, n, k, times, same));
+    }
+    Ok(res)
 }
