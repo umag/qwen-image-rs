@@ -93,12 +93,13 @@ constexpr int AlignmentC = 8;   // 128-bit / 16-bit (bf16 | f16) store (all conv
 // Swizzle = GemmIdentityThreadblockSwizzle<Swizzle>: CTAs are rastered in
 // groups of up to Swizzle N-tiles so a wave reuses A (and B) tiles from L2
 // instead of streaming all of A once per N-column wave.
-template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages, class Swizzle>
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages, class Swizzle, int EpiStages = 1>
 struct TileCfg {
   using ThreadblockShape = cutlass::gemm::GemmShape<TBM, TBN, TBK>;
   using WarpShape = cutlass::gemm::GemmShape<WM, WN, WK>;
   static constexpr int NumStages = Stages;
   using Swz = Swizzle;
+  static constexpr int EpilogueStages = EpiStages;
 };
 template <int N>
 using Raster = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<N>;
@@ -113,7 +114,7 @@ struct Evt {
   using WarpShape = typename Cfg::WarpShape;
   using ElementC = ElementOutput;
   using OutputTileThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<
-      ThreadblockShape, WarpShape, ElementC, AlignmentC, EVTEpilogueStages>;
+      ThreadblockShape, WarpShape, ElementC, AlignmentC, Cfg::EpilogueStages>;
 
   // Fetch the int32 accumulator.
   using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
@@ -159,7 +160,7 @@ struct Evt {
       typename Cfg::Swz,
       Cfg::NumStages,
       cutlass::arch::OpMultiplyAddSaturate,  // int8 tensor-op mma (no plain OpMultiplyAdd for s8)
-      EVTEpilogueStages>::GemmKernel;
+      Cfg::EpilogueStages>::GemmKernel;
   using DeviceGemm = cutlass::gemm::device::GemmUniversalAdapter<EVTKernel>;
 };
 }  // namespace convrot_evt
@@ -267,7 +268,9 @@ using Cfg8 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, Raster<1>>;
 using Cfg9 = convrot_evt::TileCfg<256, 128, 64, 64, 64, 64, 3, Raster<2>>;
 using Cfg10 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 4, Raster<1>>;
 using Cfg11 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, Raster<2>>;
-static constexpr int kNumCfgs = 12;
+using Cfg12 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, Raster<1>, 2>;
+using Cfg13 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, Raster<1>, 2>;
+static constexpr int kNumCfgs = 14;
 
 template <typename ElementOutput>
 static int int8_gemm_dequant_dispatch(
@@ -276,7 +279,7 @@ static int int8_gemm_dequant_dispatch(
 #define QIR_CFG(i) \
   case i: return int8_gemm_dequant_impl<ElementOutput, Cfg##i>(d, a, b, s_row, s_col, m, n, k, stream);
   switch (cfg) {
-    QIR_CFG(0) QIR_CFG(1) QIR_CFG(2) QIR_CFG(3) QIR_CFG(4) QIR_CFG(5) QIR_CFG(6) QIR_CFG(7) QIR_CFG(8) QIR_CFG(9) QIR_CFG(10) QIR_CFG(11)
+    QIR_CFG(0) QIR_CFG(1) QIR_CFG(2) QIR_CFG(3) QIR_CFG(4) QIR_CFG(5) QIR_CFG(6) QIR_CFG(7) QIR_CFG(8) QIR_CFG(9) QIR_CFG(10) QIR_CFG(11) QIR_CFG(12) QIR_CFG(13)
   }
 #undef QIR_CFG
   return -2;  // unknown config

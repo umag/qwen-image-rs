@@ -39,7 +39,7 @@ const fn cfg(tb: (u16, u16, u16), warp: (u16, u16, u16), stages: u8, raster: Ras
 }
 
 /// The compiled configs, by index (= the `cfg` passed to the launcher).
-pub const GEMM_CONFIGS: [TileConfig; 12] = [
+pub const GEMM_CONFIGS: [TileConfig; 14] = [
     // 0: the original config; best (within noise) for B=1 DiT shapes.
     cfg((128, 128, 64), (64, 64, 64), 3, Raster::Tiles(1)),
     // 1: swizzled 128x128 for M >= 8192 (B >= 2): L2 reuse of A.
@@ -57,6 +57,9 @@ pub const GEMM_CONFIGS: [TileConfig; 12] = [
     cfg((256, 128, 64), (64, 64, 64), 3, Raster::Tiles(2)),
     cfg((128, 128, 64), (64, 64, 64), 4, Raster::Tiles(1)),
     cfg((128, 256, 64), (64, 64, 64), 3, Raster::Tiles(2)),
+    // epilogue stages 2 (spike)
+    cfg((128, 256, 64), (64, 64, 64), 3, Raster::Tiles(1)),
+    cfg((128, 128, 64), (64, 64, 64), 3, Raster::Tiles(1)),
 ];
 
 /// How one GEMM is launched: `main` covers the rows up to the last full
