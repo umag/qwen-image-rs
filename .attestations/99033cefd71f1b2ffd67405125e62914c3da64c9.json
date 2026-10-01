@@ -1,0 +1,103 @@
+{
+  "id": "99b09933-1c6e-4543-ad36-f2a7a4876cb4",
+  "name": "99033cefd71f1b2ffd67405125e62914c3da64c9",
+  "modelId": "7dfda78a-0099-4bf9-abb6-88e41c28cc80",
+  "modelName": "qwen-image-rs-tail-linears-unify",
+  "modelType": "@magistr/issue-lifecycle",
+  "version": 1,
+  "contentType": "application/json",
+  "lifetime": "infinite",
+  "garbageCollection": 20,
+  "streaming": false,
+  "tags": {
+    "type": "resource",
+    "specName": "attestation",
+    "modelName": "qwen-image-rs-tail-linears-unify",
+    "initiatedBy": "user:magistr"
+  },
+  "ownerDefinition": {
+    "ownerType": "model-method",
+    "ownerRef": "7dfda78a-0099-4bf9-abb6-88e41c28cc80"
+  },
+  "createdAt": "2026-10-01T11:28:34.692Z",
+  "size": 2697,
+  "checksum": "eb2ef2717d8d5139c2817667c933f71693e40f30a113fd50950c1eae14a31b6b",
+  "contentPath": "../../.swamp/repos/c8eb7040-ad64-4e9e-9c47-e2d30504659e/dev-tmp-swamp/data/@magistr/issue-lifecycle/7dfda78a-0099-4bf9-abb6-88e41c28cc80/99033cefd71f1b2ffd67405125e62914c3da64c9/1/raw",
+  "content": {
+    "attestationVersion": 1,
+    "issue": "Route every DiT linear through QLinear (convrot tail linears, uniformity)",
+    "commitSha": "99033cefd71f1b2ffd67405125e62914c3da64c9",
+    "branch": "main",
+    "planVersion": 1,
+    "configChecksums": {
+      "Cargo.toml": "d9ac628e05be44f70da108d44df1b73ec077b502c7348e349a47c0a5be63a601",
+      "agent-constraints/implementation-conventions.md": "5d7196119fb8c37ec4f49646dda6390f5a56517551a94f0d2873bd30993abf5a",
+      "agent-constraints/iteration-limits.md": "c1047daa6cb475461af7fb08a5c002104ab1d600bc92b7eecb28bc0a33898012",
+      "agent-constraints/verification-controls.md": "9c48f9c338d52c336b4e339247851e310e82f5eef5114a138cb3af432b74eb21"
+    },
+    "controls": [
+      {
+        "name": "fmt",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh fmt",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 802,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "== fmt ==\n== local checks OK ==\n"
+      },
+      {
+        "name": "lint",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh clippy",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 4956,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "    Checking qwen-image-rs v0.0.0 (/Users/mag1/dev_tmp/qwen-image-rs)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.74s\n"
+      },
+      {
+        "name": "check",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh check",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 2692,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "    Checking qwen-image-rs v0.0.0 (/Users/mag1/dev_tmp/qwen-image-rs)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.58s\n"
+      },
+      {
+        "name": "test",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh test",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 5461,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "   Compiling qwen-image-rs v0.0.0 (/Users/mag1/dev_tmp/qwen-image-rs)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.35s\n     Running unittests src/lib.rs (/Users/mag1/.cache/qwen-image-rs-target/debug/deps/qwen_image_rs-453b6dfd9eeab634)\n     Running unittests src/main.rs (/Users/mag1/.cache/qwen-image-rs-target/debug/deps/qwen_image_rs-1d1276dbe20172b3)\n   Doc-tests qwen_image_rs\n"
+      }
+    ],
+    "reviews": [
+      {
+        "reviewer": "review-code",
+        "verdict": "PASS",
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 2
+      },
+      {
+        "reviewer": "review-adversarial",
+        "verdict": "PASS",
+        "critical": 0,
+        "high": 0,
+        "medium": 1,
+        "low": 1
+      }
+    ],
+    "runner": "local",
+    "producedAt": "2026-10-01T11:28:34.686Z",
+    "producedBy": "navi.aopab.art",
+    "modelVersion": "2026.09.20.2"
+  }
+}
