@@ -299,3 +299,73 @@ extern "C" int int8_gemm_dequant_cfg_launch(
       return -2;
   }
 }
+
+// ---------------------------------------------------------------------------
+// SPIKE (gemm-tiling-push): epilogue cost probes. variant 0 = stock device::Gemm
+// 128x256x64 s3, int32 row-major out; 1 = EVT store-only (acc -> bf16, no
+// scales) 128x256x64 s3; 2 = EVT store-only 128x128x64 s3.
+// ---------------------------------------------------------------------------
+using GemmRaw256 = cutlass::gemm::device::Gemm<
+    int8_t, cutlass::layout::RowMajor, int8_t, cutlass::layout::ColumnMajor, int32_t,
+    cutlass::layout::RowMajor, int32_t, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 256, 64>, cutlass::gemm::GemmShape<64, 64, 64>,
+    cutlass::gemm::GemmShape<16, 8, 32>,
+    cutlass::epilogue::thread::LinearCombination<int32_t, 128 / 32, int32_t, int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3>;
+
+namespace convrot_evt {
+template <class Cfg>
+struct EvtStoreOnly {
+  using ThreadblockShape = typename Cfg::ThreadblockShape;
+  using WarpShape = typename Cfg::WarpShape;
+  using ElementC = cutlass::bfloat16_t;
+  using OutputTileThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<
+      ThreadblockShape, WarpShape, ElementC, AlignmentC, EVTEpilogueStages>;
+  using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
+  using StoreD = cutlass::epilogue::threadblock::VisitorAuxStore<
+      OutputTileThreadMap, ElementC, cutlass::FloatRoundStyle::round_to_nearest,
+      cute::Stride<int64_t, _1, int64_t>>;
+  using EVTD = cutlass::epilogue::threadblock::Sm80EVT<StoreD, Accum>;
+  using EVTKernel = typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
+      ElementA, LayoutA, cutlass::ComplexTransform::kNone, AlignmentA, ElementB, LayoutB,
+      cutlass::ComplexTransform::kNone, AlignmentB, ElementC, LayoutC, AlignmentC,
+      ElementAccumulator, ElementCompute, OperatorClass, ArchTag, ThreadblockShape, WarpShape,
+      InstructionShape, EVTD, typename Cfg::Swz, Cfg::NumStages,
+      cutlass::arch::OpMultiplyAddSaturate, EVTEpilogueStages>::GemmKernel;
+  using DeviceGemm = cutlass::gemm::device::GemmUniversalAdapter<EVTKernel>;
+};
+}  // namespace convrot_evt
+
+template <class Cfg>
+static int spike_store_only(void* d, const int8_t* a, const int8_t* b, int m, int n, int k,
+                            cudaStream_t stream) {
+  using namespace convrot_evt;
+  using E = EvtStoreOnly<Cfg>;
+  using DeviceGemm = typename E::DeviceGemm;
+  typename E::EVTD::Arguments cb{{}, {reinterpret_cast<cutlass::bfloat16_t*>(d), {int64_t(n), _1{}, int64_t(m) * n}}};
+  typename DeviceGemm::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k}, 1, cb,
+                                      a, b, nullptr, nullptr, int64_t(m) * k, int64_t(n) * k, 0, 0,
+                                      int64_t(k), int64_t(k), 0, 0);
+  DeviceGemm gemm;
+  cutlass::Status s = gemm.can_implement(args);
+  if (s == cutlass::Status::kSuccess) s = gemm.initialize(args, nullptr, stream);
+  if (s == cutlass::Status::kSuccess) s = gemm(stream);
+  return s == cutlass::Status::kSuccess ? 0 : static_cast<int>(s);
+}
+
+extern "C" int int8_gemm_spike_launch(int variant, void* d, const int8_t* a, const int8_t* b,
+                                      int m, int n, int k, cudaStream_t stream) {
+  switch (variant) {
+    case 0: {
+      GemmRaw256 gemm;
+      typename GemmRaw256::Arguments args({m, n, k}, {a, k}, {b, k},
+                                          {static_cast<int32_t*>(d), n},
+                                          {static_cast<int32_t*>(d), n}, {1, 0});
+      cutlass::Status s = gemm(args, nullptr, stream);
+      return s == cutlass::Status::kSuccess ? 0 : static_cast<int>(s);
+    }
+    case 1: return spike_store_only<Cfg8>(d, a, b, m, n, k, stream);
+    case 2: return spike_store_only<Cfg0>(d, a, b, m, n, k, stream);
+    default: return -2;
+  }
+}

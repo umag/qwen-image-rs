@@ -1610,6 +1610,107 @@ pub fn bench_raw_s32(shapes: &[(usize, usize, usize)], iters: usize) -> Result<V
     Ok(res)
 }
 
+extern "C" {
+    fn int8_gemm_spike_launch(
+        variant: i32,
+        d: *mut std::ffi::c_void,
+        a: *const i8,
+        b: *const i8,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+}
+
+/// SPIKE (gemm-tiling-push): `iters` back-to-back launches of an epilogue
+/// probe into ONE output buffer (no per-launch allocation).
+struct SpikeOp {
+    variant: i32,
+    iters: usize,
+}
+
+impl candle_core::CustomOp2 for SpikeOp {
+    fn name(&self) -> &'static str {
+        "int8-gemm-spike"
+    }
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(
+        &self,
+        a: &CudaStorage,
+        a_l: &Layout,
+        b: &CudaStorage,
+        b_l: &Layout,
+    ) -> candle_core::Result<(CudaStorage, Shape)> {
+        let dev = a.device().clone();
+        let (m, k) = a_l.shape().dims2()?;
+        let (n, _) = b_l.shape().dims2()?;
+        let a = a.as_cuda_slice::<u8>()?;
+        let b = b.as_cuda_slice::<u8>()?;
+        let stream = dev.cuda_stream();
+        let out = unsafe { dev.alloc::<i32>(m * n)? };
+        {
+            let (ap, _ga) = a.device_ptr(&stream);
+            let (bp, _gb) = b.device_ptr(&stream);
+            let (op, _go) = out.device_ptr(&stream);
+            for _ in 0..self.iters {
+                let rc = unsafe {
+                    int8_gemm_spike_launch(
+                        self.variant,
+                        op as *mut std::ffi::c_void,
+                        ap as *const i8,
+                        bp as *const i8,
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                    )
+                };
+                if rc != 0 {
+                    candle_core::bail!("spike variant {} rc={rc}", self.variant);
+                }
+            }
+        }
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), (m, n).into()))
+    }
+}
+
+/// SPIKE: ms per launch of epilogue probe `variant` at each shape (min of 3).
+pub fn bench_spike(
+    variant: i32,
+    shapes: &[(usize, usize, usize)],
+    iters: usize,
+) -> Result<Vec<f64>> {
+    use candle_core::Device;
+    let dev = Device::new_cuda(0)?;
+    let mut res = Vec::new();
+    for &(m, n, k) in shapes {
+        let ai: Vec<u8> = (0..m * k).map(|i| ((i * 7 + 3) % 255) as u8).collect();
+        let bi: Vec<u8> = (0..n * k).map(|i| ((i * 13 + 5) % 255) as u8).collect();
+        let a = Tensor::from_vec(ai, (m, k), &dev)?;
+        let b = Tensor::from_vec(bi, (n, k), &dev)?;
+        a.apply_op2(&b, SpikeOp { variant, iters: 1 })?;
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            dev.synchronize()?;
+            let t0 = std::time::Instant::now();
+            let _o = a.apply_op2(&b, SpikeOp { variant, iters })?;
+            dev.synchronize()?;
+            best = best.min(t0.elapsed().as_secs_f64() * 1e3 / iters as f64);
+        }
+        res.push(best);
+    }
+    Ok(res)
+}
+
 /// Merged projections vs the separate linears (`qwen-image-rs-gemm-merge-tune`),
 /// byte-for-byte, at M = 133 and M = 2 (the small-tile config): q and k out
 /// of the head-interleaved q|k GEMM (through the ld = 256 row views the DiT
