@@ -91,7 +91,7 @@ impl candle_core::CustomOp2 for Int8Gemm {
             let (b_ptr, _gb) = b.device_ptr(&stream);
             let (c_ptr, _gc) = dst.device_ptr(&stream);
             let (a_ptr, b_ptr) = (a_ptr + ao, b_ptr + bo);
-            if a_ptr % 16 != 0 || b_ptr % 16 != 0 {
+            if !a_ptr.is_multiple_of(16) || !b_ptr.is_multiple_of(16) {
                 candle_core::bail!("int8-gemm: misaligned view (a {a_ptr:#x}, b {b_ptr:#x})");
             }
             let rc = unsafe {
@@ -332,7 +332,7 @@ impl candle_core::CustomOp3 for Int8GemmDequant {
         let (ap, bp, sp) = (ap + ao, bp + bo, sp + so);
         // CUTLASS 128-bit operand loads need 16-B aligned A/B; the vectorized
         // RowBroadcast of s_col needs a 32-B aligned base (see HANDOVER).
-        if ap % 16 != 0 || bp % 16 != 0 || sp % 32 != 0 {
+        if !ap.is_multiple_of(16) || !bp.is_multiple_of(16) || !sp.is_multiple_of(32) {
             candle_core::bail!(
                 "int8-gemm-dequant: misaligned view (a {ap:#x}, b {bp:#x}, scales {sp:#x})"
             );
