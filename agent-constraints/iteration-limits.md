@@ -43,3 +43,9 @@ Standing auth (2026-10-01, human: "make 5 default, and continue with 1 2 3"):
 `qwen-image-rs-fused-swiglu`, `qwen-image-rs-gemm-merge-tune` — same clean-exit
 rules as the "Gate update (2026-10-01)" paragraph above (current oracle baseline
 dit-forward --convrot 0.999898 with sage2 default). Run strictly sequentially.
+
+Reference update (2026-10-01): fused-rotate-quant accepted (human gate stance:
+"don't bother much with gates"). New dit-forward --convrot vs oracle reference on
+the default SA2 config: 0.999879 (QIR_SAGE=1: 0.999900). The oracle cosine reacts
+chaotically to tiny upstream changes — judge the whole config (all QIR_SAGE modes,
+no-convrot parity, self-tests vs f64/old path, clean images), not one number.
