@@ -25,8 +25,8 @@ End-to-end works: `generate --model <snapshot> --prompt "..." --out x.png`.
 **Fastest build: `--features convrot,sage,fusednorm,sage2`** (SageAttention2,
 dit-forward 0.999894 — FP8 P·V; `QIR_SAGE=1` in that binary = SageAttention v1,
 bit-identical to the build without `sage2`). **Most accurate fast build: `--features
-convrot,sage,fusednorm`** (0.999944) — which one is the default is a human call
-(see "SageAttention2" below). (bf16 VAE is the
+convrot,sage,fusednorm`** (0.999944). **DEFAULT (human decision 2026-10-01): the
+SA2 build** — accepted at 0.999894 for -4.8% denoise. (bf16 VAE is the
 CUDA default; `--convrot --text-gguf <gguf> --vae-tile 32`). Oracle parity held
 at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 dB.
 

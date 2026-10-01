@@ -29,3 +29,11 @@ session A/B showing no denoise regression + images look right. Keep it light.
 Standing authorization (2026-10-01): bug `qwen-image-rs-b1-off-prompt` — same
 terms as the denoise series (approve_plan, resolve_findings, attest, complete on
 a clean exit).
+
+Gate update (2026-10-01, human): SageAttention2 (FP8 P·V) ACCEPTED as the default
+fast path. Its dit-forward --convrot vs oracle baseline is 0.999894 (no-convrot
+0.999945); that is the reference for later work on the SA2 path. A change that
+does not alter the math must stay bit-identical to the prior build; one that does
+must stay within ~1e-5 of the prior build's oracle cosine and keep images clean.
+Standing auth also covers `qwen-image-rs-tail-linears-unify` and
+`qwen-image-rs-sage2-quant-fusion` (same clean-exit rules).
