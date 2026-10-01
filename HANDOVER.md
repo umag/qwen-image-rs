@@ -66,17 +66,15 @@ grid `B*S*H`, convrot/fusednorm CTA-per-row).
   sequential; knee at B=5 — B≥5 pays a growing per-image tax, B=8 +72 %). It's
   ergonomic, not faster: the GEMMs already saturate the 4090, so 8 images = ~2×
   the time of 4, same as sequential.
-- **VALIDATED by self-consistency + eyeball, NOT bit-exactness.** The fast path
-  is NOT bit-reproducible: same-seed B=1 twice = cosine **0.981** (INT8/CUTLASS
-  split-K atomics vary per run, amplified over the chaotic 20-step flow-match).
-  A batched lane also does NOT reproduce a single `--seed i` run — the GEMM
-  tiling differs by batch size, landing the trajectory in a different basin
-  (intended). What holds: batched output is **self-consistent across batch
-  sizes** (B=2 lane i vs B=4 lane i cosine **0.99996**), and each lane is a
-  clean, distinct, on-prompt image (verified: 4 red-mug seed-variations). So
-  `scripts/compare_latent.py` gates SELF-CONSISTENCY (thr 0.99), not lane-vs-
-  sequential. NOTE: B=1 with convrot at some seeds lands off-prompt where B≥2
-  lands on-prompt — a pre-existing non-determinism artifact, tracked separately.
+- **B=1 is bit-reproducible and matches lane 0 of a batch** (measured after
+  `qwen-image-rs-b1-off-prompt`, convrot,sage,fusednorm): same-seed B=1 twice
+  = cosine **1.0000000, mse 0**; B=1 vs B=2 lane 0 latent cosine **0.99997**
+  (batch-size GEMM tiling differs, so not bit-exact). The older notes here
+  ("same-seed B=1 twice = 0.981", "a lane does NOT reproduce a single run",
+  "B=1 with convrot lands off-prompt at some seeds — non-determinism
+  artifact") were TWO BUGS, not chaos: the sage partial-tile stale-smem NaN
+  (fixed in `-bf16-v-pv`) and the B=1 off-prompt offset bug (see Gotchas).
+  `scripts/compare_latent.py` (thr 0.99) gates lane self-consistency.
 
 CLI verbs (all in `src/main.rs`): `generate`, `batch` (has `--resident`,
 `--vae-tile`, `--guidance`/`--negative`, `--text-gguf`, `--quant-text`),
@@ -600,6 +598,24 @@ attn: 4096 OK). ConvRotLinear input dim K = the linear's in_features.
   NaN-poisoned smem" (fills every SM's smem with f16 NaN first).
   compute-sanitizer memcheck/initcheck do NOT catch this (shared memory, and
   initcheck only tracks global memory) — poison shared memory to test for it.
+- **Fused CUDA bridges MUST honor `Layout::start_offset`** (`qwen-image-rs-b1-off-prompt`).
+  `CudaStorage::device_ptr` is the base of the ALLOCATION, not the view. candle's
+  `contiguous()` is a no-op for any `is_contiguous` view and size-1 dims are skipped
+  in that check, so `(1,S,D).narrow(1, drop, n).contiguous()` stays a zero-copy view
+  at offset `drop*D`. generate's B=1 prompt embeds are exactly that (TE output past
+  the system prefix); the fusednorm/convrot bridges passed the base pointer, so
+  txt_in's fused RMSNorm read the SYSTEM-PROMPT rows → every B=1 image was
+  conditioned on the system prompt (clean but off-prompt: ink-wash portraits,
+  gibberish banners). B>1 `broadcast_as().contiguous()` made a fresh copy, so batches
+  were fine; dit-forward/denoise from files had offset 0, so parity never saw it.
+  It hit every B=1 build since text_norm went through `fused_rmsnorm_scale`, sage or
+  not, convrot or not. Fix: every bridge adds `crate::layout::dense_byte_offset::<T>`
+  (errors on non-dense views); the CUTLASS GEMM bridges also bail on a misaligned
+  view. Regression: `fusednorm-test` / `convrot-test` run each op on an offset view
+  vs a fresh copy (must be bit-identical; exit nonzero otherwise) + CPU unit tests in
+  `src/layout.rs`. Isolation recipe that found it: same seed B=1 vs `--batch 2` lane
+  0 (identical noise + embeds) → if they differ in CONTENT, suspect a B-dependent
+  input layout, not numerics.
 - `scripts/compare_dit.py <ours> <oracle>` = the dit-forward oracle compare
   (overall_cos, MSE, per-token cos over the last 4096 rows); run it with the
   oracle venv python.
@@ -642,6 +658,8 @@ Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-vae-bf16`, `-bshd-attention` (BSHD-native fused attention),
 `-rope-quant-fusion` (RoPE fused into the sage INT8 Q/K quantizer),
 `-bf16-v-pv` (V born f16 in the ConvRot epilogue + sage partial-tile zero-fill).
+Bugs (complete): `-b1-off-prompt` (B=1 generate ignored the prompt: fused bridges
+ignored the view offset — see Gotchas).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path
 `.contiguous()` load-bearing; see "Copy-reduction audit"); `-convrot-tail-linears`
 (complete, NEGATIVE — 0.13% of a step; see "Tail linears through ConvRot"); `-fused-dequant`

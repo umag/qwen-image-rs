@@ -19,7 +19,13 @@ Run these lifecycles strictly sequentially (shared host build dir + main branch)
 A measured negative result (lever not worth it) is a valid clean outcome.
 
 Gate update (2026-09-30, human: "don't bother much with gates"): the dit-forward
---convrot cosine is run-to-run noisy (baseline scatters 0.99942-0.99994), so a
-single reading is NOT a gate. Clean = no-convrot dit-forward bit-identical to the
+--convrot cosine USED to be run-to-run noisy (0.99942-0.99994) — that was the sage
+stale-smem NaN bug, fixed in `-bf16-v-pv`; it is now deterministic (0.999944 every
+run) and B=1 generate is bit-reproducible, so a --convrot reading below 0.99993 is
+a real regression. Clean = no-convrot dit-forward bit-identical to the
 prior build (or cosine >= 0.99999 when the math legitimately changes) + a same-
 session A/B showing no denoise regression + images look right. Keep it light.
+
+Standing authorization (2026-10-01): bug `qwen-image-rs-b1-off-prompt` — same
+terms as the denoise series (approve_plan, resolve_findings, attest, complete on
+a clean exit).
