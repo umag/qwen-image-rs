@@ -224,14 +224,14 @@ static int int8_gemm_dequant_impl(
 
 // The tile configs, by index (TB MxNxK / warp MxNxK / stages). 0 is the
 // original single config. Keep in sync with `convrot::GEMM_CONFIGS`.
-using Cfg0 = TileCfg<128, 128, 64, 64, 64, 64, 3>;
-using Cfg1 = TileCfg<128, 256, 64, 64, 64, 64, 3>;
-using Cfg2 = TileCfg<256, 128, 64, 64, 64, 64, 3>;
-using Cfg3 = TileCfg<128, 128, 64, 64, 64, 64, 4>;
-using Cfg4 = TileCfg<128, 128, 64, 64, 64, 64, 5>;
-using Cfg5 = TileCfg<256, 64, 64, 64, 64, 64, 4>;
-using Cfg6 = TileCfg<64, 128, 64, 32, 64, 64, 4>;
-using Cfg7 = TileCfg<128, 128, 128, 64, 64, 128, 3>;
+using Cfg0 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3>;
+using Cfg1 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3>;
+using Cfg2 = convrot_evt::TileCfg<256, 128, 64, 64, 64, 64, 3>;
+using Cfg3 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 4>;
+using Cfg4 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 5>;
+using Cfg5 = convrot_evt::TileCfg<256, 64, 64, 64, 64, 64, 4>;
+using Cfg6 = convrot_evt::TileCfg<64, 128, 64, 32, 64, 64, 4>;
+using Cfg7 = convrot_evt::TileCfg<128, 128, 128, 64, 64, 128, 3>;
 static constexpr int kNumCfgs = 8;
 
 template <typename ElementOutput>
