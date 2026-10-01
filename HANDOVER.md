@@ -129,8 +129,9 @@ Optimizations, each measured:
 `QLinear` gained a feature-gated `Convrot(ConvRotLinear)` variant; a runtime
 `convrot: bool` threads `QwenImageDit::load → Block → Attention/SwiGlu` (mirrors
 `quant`). When set and in-features % 256 == 0, attn q/k/v/o + SwiGlu proj/gate/out
-run rotated INT8; norm_out/proj_out/modulation/img_in/txt_in stay bf16 (they're
-plain `Linear`, untouched). The 256×256 Regular Hadamard is built once per load,
+run rotated INT8. (Since `-tail-linears-unify` every DiT linear is a `QLinear`
+and the tail linears rotate too, except img_in — see "Tail linears through
+ConvRot".) The 256×256 Regular Hadamard is built once per load,
 shared by handle clone. `--convrot` added to generate/batch/denoise/dit-forward.
 - **dit-forward --convrot vs oracle: overall cosine 0.999945** (per-token image
   mean 0.99995) — matches the bf16 baseline's 0.99996. Wiring is numerically exact.
@@ -151,8 +152,11 @@ shared by handle clone. `--convrot` added to generate/batch/denoise/dit-forward.
 
 ### Pre-quantized convrot weights (commit adds `prequantize-convrot`)
 `prequantize-convrot --weights <transformer> --out <file.safetensors>` rotates+
-INT8-quantizes the 224 convrot linears ONCE, writing `<prefix>.weight_i8` (U8) +
-`<prefix>.col_scale` (f32) beside the 73 bf16 tensors. `QwenImageDit::load`
+INT8-quantizes the convrot linears ONCE (231 since `-tail-linears-unify`: 224
+block + 7 tail; the set is `dit::is_convrot_target`, the loader's own policy),
+writing `<prefix>.weight_i8` (U8) + `<prefix>.col_scale` (f32) beside the 66
+remaining bf16 tensors. Files written before `-tail-linears-unify` still load
+(the tail layers find their bf16 `weight` and rotate at load) but regenerate them. `QwenImageDit::load`
 auto-detects `weight_i8` (`VarBuilder::contains_tensor`/`get_unchecked_dtype`,
 native dtype, no cast) → `ConvRotLinear::from_prequantized`, skipping the load-
 time rotate+quant. No new flag; point a transformer dir at the file and use
@@ -529,8 +533,50 @@ per-channel V scales and fp32+fp16 two-level accumulation (thu-ml's sm89 default
   K-sum/V-amax pre-passes into one launch would recover part of the 4.7 ms/step.
   Per-warp Q (fewer scales) is not needed — per-thread already ships.
 
-### Tail linears through ConvRot (`qwen-image-rs-convrot-tail-linears` — NEGATIVE RESULT, no code)
-Measured before building. nsys, 10-step trace, fast build (`convrot,sage,fusednorm`),
+### Tail linears through ConvRot (`qwen-image-rs-convrot-tail-linears` NEGATIVE for speed; then DONE for uniformity in `qwen-image-rs-tail-linears-unify`)
+**Now (`-tail-linears-unify`): every DiT linear is a `QLinear`.** One policy,
+`dit::linear_precision(prefix, quant, convrot)` (`BLOCK_LINEARS` + the
+`TAIL_LINEARS` table of `(prefix, K, N, rotate)`), picks Full / Q8_0 / ConvRot
+from the weight prefix (`vb.prefix()`); `prequantize-convrot` calls the same
+`is_convrot_target`, so file and loader cannot disagree. An unknown prefix is a
+load error; a policy-Full layer whose file has only `weight_i8` is a load error
+naming the layer. Q8_0 (`--quant`) stays block-only (unchanged). Load logs
+`DiT linears loaded convrot_linears=231 total_linears=232`.
+- Rotated under `--convrot`: txt_in.in_layer/out_layer, time_embed linear_1
+  (K=256) / linear_2, modulation.1 (M=2, N=16384), norm_out.linear, proj_out
+  (N=64: a partial 128-wide N tile; N%8 meets the 128-bit store alignment and
+  s_row stays 32-B aligned). **img_in stays bf16** (K=64, cannot rotate).
+  `convrot-test` checks the epilogue bit-exact vs the host ref at
+  (M,N,K) = (2,4096,256), (2,16384,4096), (37,64,4096): 0 mismatches.
+- **Accuracy:** dit-forward --convrot vs oracle **0.999894 → 0.999898**
+  (vs the no-convrot output 0.999904 → 0.999912). No-convrot dit-forward
+  byte-identical to the prior build (Full = the same candle Linear). Prequant
+  (231 linears, 66 bf16 tensors) vs on-the-fly: byte-identical.
+- **Per-layer attribution is below the noise floor — do not over-read it.**
+  Measured with a temporary knob (not shipped): each upstream tail layer ALONE
+  moves the oracle cosine by −5.3e-5 … +4.8e-5 (linear_2 0.999841, txt_in.in
+  0.999942, modulation 0.999905, txt_in.out 0.999881, linear_1 0.999888);
+  the downstream ones barely move it (norm_out 0.999894, proj_out 0.999889;
+  vs the prior output 0.999997 / 0.999990). The effects do not add: keeping
+  the two "worst" (linear_2, txt_in.out) bf16 and rotating the rest gave
+  0.999849, keeping only linear_2 bf16 0.999791, all seven 0.999898. With the
+  block linears forced bf16, each tail layer alone still scatters the cosine
+  0.999909–0.999957 around the bf16 0.999945. So any ~1e-4 perturbation
+  upstream re-rolls the SA2 INT8/FP8 and block INT8 rounding through 32
+  blocks; the per-layer delta measures that chaos, not the layer's error.
+  Decision: rotate all seven (the only tested set within 1e-5 of the
+  baseline, and it improves both references). Flip a `TAIL_LINEARS` bool to
+  keep a layer bf16.
+- **Side effect: B=1 is now bit-identical to `--batch 2` lane 0** (latent cos
+  1.0000000, mse 0; was 0.9986 on the prior build) — the remaining
+  M-dependent cuBLAS bf16 GEMMs (txt_in at M=B·txt, proj_out at M=B·S) were
+  what made batch lanes differ; the INT8 CUTLASS GEMMs are per-row invariant.
+- **Speed: flat** as predicted (same session, batch --resident, 2nd image,
+  two interleaved rounds): base 8599 / 8595 ms → new 8611 / 8601 ms =
+  0.2149 → 0.2150 s/step (+0.1%, inside the ~0.4% noise). Images: B=1 mug
+  and `--batch 2` on-prompt; new vs prior B=1 latent cos 0.99884.
+
+Original measurement (`-convrot-tail-linears`), before building: nsys, 10-step trace, fast build (`convrot,sage,fusednorm`),
 denoise GPU busy 2301 ms (= 230 ms/step). The small-M bf16 GEMMs, attributed by grid:
 - `modulation` (M=2, K=4096, N=16384): `cutlass_80_wmma..16x16_128x2` grid (8,128),
   10 inst, **168 us** each.
@@ -738,7 +784,9 @@ Bugs (complete): `-b1-off-prompt` (B=1 generate ignored the prompt: fused bridge
 ignored the view offset — see Gotchas).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path
 `.contiguous()` load-bearing; see "Copy-reduction audit"); `-convrot-tail-linears`
-(complete, NEGATIVE — 0.13% of a step; see "Tail linears through ConvRot"); `-fused-dequant`
+(complete, NEGATIVE — 0.13% of a step; see "Tail linears through ConvRot");
+`-tail-linears-unify` (complete — every DiT linear a `QLinear`, one precision
+policy, speed flat, 0.999898); `-fused-dequant`
 (closed — superseded by `-dequant-epilogue` which shipped it).
 
 ## Also-planned / future levers
