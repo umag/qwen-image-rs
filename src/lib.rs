@@ -23,6 +23,8 @@ pub mod model;
 pub mod rope;
 #[cfg(feature = "sage")]
 pub mod sage;
+#[cfg(feature = "sage2")]
+pub mod sage2;
 
 /// Crate result alias.
 pub type Result<T> = anyhow::Result<T>;

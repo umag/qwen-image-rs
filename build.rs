@@ -65,4 +65,24 @@ fn main() {
             .compile("sage_attn");
         println!("cargo:rustc-link-lib=dylib=cudart");
     }
+
+    #[cfg(feature = "sage2")]
+    {
+        // SageAttention2 sm89 (INT8-QK per-thread + FP8-PV): its own TU so the
+        // vendored sm80/sm89 kernels' PACK_SIZE_* macros never meet.
+        println!("cargo:rerun-if-changed=kernels/sage/sage2_ffi.cu");
+        println!("cargo:rerun-if-changed=kernels/sage/vendor/qattn/qk_int_sv_f8_sm89.cuh");
+        let cap = std::env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".into());
+        cc::Build::new()
+            .cuda(true)
+            .flag("-std=c++17")
+            .flag("--expt-relaxed-constexpr")
+            .flag("--expt-extended-lambda")
+            .flag(format!("-arch=sm_{cap}"))
+            .flag("-diag-suppress=177")
+            .include("kernels/sage")
+            .file("kernels/sage/sage2_ffi.cu")
+            .compile("sage2_attn");
+        println!("cargo:rustc-link-lib=dylib=cudart");
+    }
 }

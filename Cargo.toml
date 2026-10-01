@@ -37,6 +37,9 @@ flash-attn = ["cuda", "dep:candle-flash-attn"]
 convrot = ["cuda", "dep:cc", "dep:half"]
 # SageAttention INT8-QK / FP16-PV attention: compiles vendored kernels/sage/*.cu.
 sage = ["cuda", "dep:cc", "dep:half"]
+# SageAttention2 (sm89): INT8-QK per-thread + K smoothing, FP8-PV. Adds
+# kernels/sage/sage2_ffi.cu; runtime QIR_SAGE=1|2|2f32 picks v1 / SA2 (default 2).
+sage2 = ["sage"]
 # Fused LayerNorm+AdaLN kernel: compiles kernels/fusednorm/*.cu.
 fusednorm = ["cuda", "dep:cc", "dep:half"]
 

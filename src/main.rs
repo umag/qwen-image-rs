@@ -1214,8 +1214,39 @@ fn sage_test() -> Result<()> {
             rq.attn_maxabs,
             if rq_ok { "OK" } else { "MISMATCH" }
         );
+        #[cfg(feature = "sage2")]
+        let s2_ok = {
+            let r = qwen_image_rs::sage2::self_test()?;
+            println!(
+                "sage2 block-causal (txt=37, S=293, B=1,2, K bias, zero V/K channel) vs f32 ref: cosine fp16-accum = {:.6}, fp32-accum = {:.6} (v1 on same inputs {:.6}); non-finite = {} ({})",
+                r.cos_f16,
+                r.cos_f32,
+                r.cos_v1,
+                r.nonfinite,
+                if r.cos_f16 >= 0.999 && r.cos_f32 >= 0.999 && r.nonfinite == 0 { "OK" } else { "FAIL" }
+            );
+            println!(
+                "sage2 B=2 lanes vs B=1: mismatches = {}; offset views vs copies: mismatches = {}; run-twice: mismatches = {} ({})",
+                r.lane_mismatches,
+                r.offset_mismatches,
+                r.nondeterministic,
+                if r.lane_mismatches == 0 && r.offset_mismatches == 0 && r.nondeterministic == 0 { "OK" } else { "FAIL" }
+            );
+            println!(
+                "sage2 partial last K/V tile under NaN-poisoned smem (txt=21, S=293): NaN = {}, maxabs vs clean = {:.4} ({})",
+                r.poison_nan,
+                r.poison_maxabs,
+                if r.poison_nan == 0 && r.poison_maxabs == 0.0 { "OK" } else { "FAIL" }
+            );
+            r.ok()
+        };
+        #[cfg(not(feature = "sage2"))]
+        let s2_ok = true;
         if !rq_ok {
             anyhow::bail!("fused rope+quant is not bit-exact vs rope->quant");
+        }
+        if !s2_ok {
+            anyhow::bail!("sage2 self-test failed");
         }
         if !pt_ok {
             anyhow::bail!("sage partial-tile attention reads stale shared memory");

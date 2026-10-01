@@ -273,6 +273,9 @@ impl Attention {
         })
     }
 
+    // One of two cfg-selected bodies binds `out`; clippy sees only one and
+    // would ask to inline it.
+    #[allow(clippy::let_and_return)]
     fn forward(
         &self,
         x: &Tensor,
@@ -285,7 +288,7 @@ impl Attention {
         let shape = (b, s, HEADS, HEAD_DIM);
         let scale = 1.0 / (HEAD_DIM as f64).sqrt();
         #[cfg(feature = "sage")]
-        {
+        let out = {
             let _ = mask; // block-causal structure is expressed via narrows, not a mask
                           // BSHD-native: q/k/v stay (B,S,H,D). RoPE is fused into the
                           // sage INT8 quantizer (attend_bshd), so q/k are rotated and
@@ -299,10 +302,10 @@ impl Attention {
                 .forward(&self.to_k.forward(x)?.reshape(shape)?)?;
             let vv = self.to_v.forward_f16(x)?.reshape(shape)?; // (B,S,H,D) f16
             let out = self.attend_bshd(&qh, &kh, &vv, cos, sin, txt_len, scale)?; // (B,S,H,D)
-            return self.to_out.forward(&out.reshape((b, s, INNER))?);
-        }
+            self.to_out.forward(&out.reshape((b, s, INNER))?)
+        };
         #[cfg(not(feature = "sage"))]
-        {
+        let out = {
             // (B,H,S,D) for RoPE (rope_i rotates per position across heads).
             let qh = self
                 .norm_q
@@ -319,10 +322,13 @@ impl Attention {
             let kh = candle_nn::rotary_emb::rope_i(&kh, cos, sin)?;
             let out = self.attend(&qh, &kh, &vv, mask, txt_len, scale)?; // (B,S,H,D)
             self.to_out.forward(&out.reshape((b, s, INNER))?)
-        }
+        };
+        out // the cfg-selected body above (sage: BSHD-native; else BHSD)
     }
 
-    /// With `sage`: BSHD-native block-causal SageAttention (INT8-QK / FP16-PV).
+    /// With `sage`: BSHD-native block-causal SageAttention (INT8-QK / FP16-PV);
+    /// with `sage2`, SageAttention2 (`crate::sage2::attend_block_causal`, same
+    /// split) unless `QIR_SAGE=1`.
     /// `qh,kh` are PRE-rope `(B,S,H,D)`; `vf` is `(B,S,H,D)` f16; `cos,sin` are the
     /// joint-sequence `(S, D/2)` RoPE tables. Image queries attend non-causally
     /// to the whole joint sequence; the `txt_len` text queries attend causally to
@@ -351,6 +357,11 @@ impl Attention {
         // start_offset + strides.
         debug_assert_eq!(vf.dtype(), DType::F16, "attend_bshd: V must be f16");
         let sc = scale as f32;
+        // sage2 build: SageAttention2 unless QIR_SAGE=1 selects v1 (fallback / A/B).
+        #[cfg(feature = "sage2")]
+        if let crate::sage2::AttentionImpl::Sage2(accum) = crate::sage2::attention_impl()? {
+            return crate::sage2::attend_block_causal(qh, kh, vf, cos, sin, txt_len, sc, accum);
+        }
         let (ct, st) = (cos.narrow(0, 0, txt_len)?, sin.narrow(0, 0, txt_len)?);
         // text prefix: causal over [0, txt_len)
         let qt = rope_quant_bshd(&qh.narrow(1, 0, txt_len)?, &ct, &st, QkRole::Query)?;

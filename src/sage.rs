@@ -294,7 +294,7 @@ impl QuantizedQk {
 
 /// Validate a bf16 `(B, S, H, D)` operand view for the quant kernels: D=128,
 /// head_dim stride-1, and the 16-byte alignment the kernels' float4 loads need.
-fn check_qk_view(xl: &Layout, what: &str) -> candle_core::Result<(usize, usize, usize)> {
+pub(crate) fn check_qk_view(xl: &Layout, what: &str) -> candle_core::Result<(usize, usize, usize)> {
     let (b, n, h, d) = xl.shape().dims4()?;
     let st = xl.stride();
     if d != SAGE_HEAD_DIM || st[3] != 1 {
@@ -310,6 +310,29 @@ fn check_qk_view(xl: &Layout, what: &str) -> candle_core::Result<(usize, usize, 
         );
     }
     Ok((b, n, h))
+}
+
+/// Validate the `(S, D/2)` cos/sin rows for a fused rope+quant over `n`
+/// tokens: matching shapes, D/2 = 64, row-contiguous (a dim-0 narrow keeps
+/// this). Returns D/2 (the row stride the kernels take).
+pub(crate) fn check_rope_tables(
+    cl: &Layout,
+    sl: &Layout,
+    n: usize,
+    what: &str,
+) -> candle_core::Result<usize> {
+    let (cn, dhalf) = cl.shape().dims2()?;
+    if cn != n || dhalf * 2 != SAGE_HEAD_DIM || sl.shape() != cl.shape() {
+        candle_core::bail!(
+            "{what}: cos {:?} / sin {:?} vs x ({n} tokens, d {SAGE_HEAD_DIM})",
+            cl.shape(),
+            sl.shape()
+        );
+    }
+    if !cl.is_contiguous() || !sl.is_contiguous() {
+        candle_core::bail!("{what}: cos/sin must be row-contiguous (S, D/2)");
+    }
+    Ok(dhalf)
 }
 
 /// Unfused per-block INT8 quantization of a bf16 `(B,S,H,D)` view (the
@@ -401,18 +424,7 @@ impl candle_core::CustomOp3 for RopeQuantBshd {
     ) -> candle_core::Result<(CudaStorage, Shape)> {
         let dev = x.device().clone();
         let (b, n, h) = check_qk_view(xl, "sage-rope-quant-bshd")?;
-        let (cn, dhalf) = cl.shape().dims2()?;
-        if cn != n || dhalf * 2 != SAGE_HEAD_DIM || sl.shape() != cl.shape() {
-            candle_core::bail!(
-                "sage-rope-quant-bshd: cos {:?} / sin {:?} vs x ({n} tokens, d {SAGE_HEAD_DIM})",
-                cl.shape(),
-                sl.shape()
-            );
-        }
-        // Rows of D/2 contiguous bf16 (a dim-0 narrow of (S, D/2) keeps this).
-        if !cl.is_contiguous() || !sl.is_contiguous() {
-            candle_core::bail!("sage-rope-quant-bshd: cos/sin must be row-contiguous (S, D/2)");
-        }
+        let dhalf = check_rope_tables(cl, sl, n, "sage-rope-quant-bshd")?;
         let st = xl.stride();
         let x_s = x.as_cuda_slice::<half::bf16>()?;
         let cos_s = cos.as_cuda_slice::<half::bf16>()?;
@@ -723,7 +735,7 @@ pub fn self_test_bshd() -> Result<(f32, f32)> {
 /// NaN-aware element-wise comparison of two same-shape tensors on the host:
 /// returns (cosine over finite pairs, maxabs over finite pairs). Shared by the
 /// equivalence self-tests.
-fn nan_aware_compare(ours: &Tensor, refb: &Tensor) -> Result<(f32, f32)> {
+pub(crate) fn nan_aware_compare(ours: &Tensor, refb: &Tensor) -> Result<(f32, f32)> {
     // Element-wise on the host, NaN-aware. The equivalence tests prove two paths
     // feed the same kernel identically — NOT that the vendored INT8 kernel never
     // NaNs. On some synthetic randn draws that kernel
@@ -863,6 +875,19 @@ pub fn self_test_rope_quant() -> Result<RopeQuantReport> {
     Ok(rep)
 }
 
+/// Fill every SM's shared memory with f16 NaN (test helper): a kernel launched
+/// next on the same stream that reads shared memory it never wrote sees NaN.
+pub(crate) fn poison_smem(dev: &candle_core::Device) -> Result<()> {
+    let candle_core::Device::Cuda(cd) = dev else {
+        anyhow::bail!("poison_smem needs CUDA")
+    };
+    let rc = unsafe { sage_poison_smem_launch(cd.cuda_stream().cu_stream() as *mut c_void) };
+    if rc != 0 {
+        anyhow::bail!("sage_poison_smem_launch failed rc={rc}");
+    }
+    Ok(())
+}
+
 /// Regression for the partial-last-tile read: with kv_len not a multiple of
 /// the 64-key tile, the vendored kernel loads rows `>= kv_len` of K/V under a
 /// predicate. Their scores are masked to exactly 0, but a V row left holding
@@ -891,16 +916,7 @@ pub fn self_test_partial_tile() -> Result<(usize, f32)> {
             sage_attention_quantized(&qi, &kf, &v, sc, false)?,
         ))
     };
-    let poison = || -> Result<()> {
-        let Device::Cuda(cd) = &dev else {
-            anyhow::bail!("partial-tile self-test needs CUDA")
-        };
-        let rc = unsafe { sage_poison_smem_launch(cd.cuda_stream().cu_stream() as *mut c_void) };
-        if rc != 0 {
-            anyhow::bail!("sage_poison_smem_launch failed rc={rc}");
-        }
-        Ok(())
-    };
+    let poison = || poison_smem(&dev);
     let (ct, ci) = run()?;
     let mut nan = 0usize;
     let mut maxabs = 0f32;
