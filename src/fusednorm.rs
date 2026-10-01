@@ -8,7 +8,7 @@ use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{CpuStorage, CudaStorage, Layout, Shape, Tensor};
 use std::ffi::c_void;
 
-use crate::layout::dense_byte_offset;
+use crate::layout::{dense_byte_offset, dense_offset, row_strided_2d};
 use crate::Result;
 
 extern "C" {
@@ -21,12 +21,14 @@ extern "C" {
         eps: f32,
         stream: *mut c_void,
     );
+    #[allow(clippy::too_many_arguments)]
     fn fused_rmsnorm_scale_launch(
         out: *mut c_void,
         x: *const c_void,
         w: *const c_void,
         m: i32,
         n: i32,
+        ld: std::ffi::c_long,
         eps: f32,
         stream: *mut c_void,
     );
@@ -95,6 +97,7 @@ impl candle_core::CustomOp2 for FusedNormMod {
                     sp as *const c_void,
                     m as i32,
                     n as i32,
+                    ld as std::ffi::c_long,
                     self.eps,
                     stream.cu_stream() as *mut c_void,
                 );
@@ -177,7 +180,14 @@ impl candle_core::CustomOp2 for FusedRmsnormScale {
             candle_core::bail!("fused-rmsnorm-scale weight len {wn} != last dim {n}");
         }
         let m: usize = dims[..dims.len() - 1].iter().product();
-        let xo = dense_byte_offset::<half::bf16>(x_l, "fused-rmsnorm-scale x")?;
+        // 2-D x may be a row-strided view (unit inner stride, rows ld apart);
+        // any other rank must be dense.
+        let (xo, ld) = if dims.len() == 2 {
+            row_strided_2d(x_l, "fused-rmsnorm-scale x")?
+        } else {
+            (dense_offset(x_l, "fused-rmsnorm-scale x")?, n)
+        };
+        let xo = (xo * std::mem::size_of::<half::bf16>()) as u64;
         let wo = dense_byte_offset::<f32>(w_l, "fused-rmsnorm-scale w")?;
         let x = x.as_cuda_slice::<half::bf16>()?;
         let w = w.as_cuda_slice::<f32>()?;
@@ -205,9 +215,16 @@ impl candle_core::CustomOp2 for FusedRmsnormScale {
 }
 
 /// `x * rsqrt(mean(x^2)+eps) * W` fused. `x` is `(..., N)` bf16, `W` is `(N,)`
-/// f32 (the effective per-channel weight). bf16 out.
+/// f32 (the effective per-channel weight). bf16 out, dense. A 2-D `x` with
+/// unit-stride rows (e.g. the q or k half of the merged q|k projection,
+/// viewed as `(M*H, 2*D)` and column-narrowed) is read in place; anything
+/// else is made contiguous first.
 pub fn fused_rmsnorm_scale(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
-    let x = x.contiguous()?;
+    let x = if x.rank() == 2 && row_strided_2d(x.layout(), "x").is_ok() {
+        x.clone()
+    } else {
+        x.contiguous()?
+    };
     let w = w.contiguous()?;
     Ok(x.apply_op2(&w, FusedRmsnormScale { eps })?)
 }
@@ -375,12 +392,26 @@ pub fn self_test_offset_views() -> Result<Vec<(&'static str, bool)>> {
     // An offset f32 weight too: (drop+N,) narrowed to N.
     let w = Tensor::randn(1f32, 0.2f32, drop + inner, &dev)?.narrow(0, drop, inner)?;
     let wf = w.force_contiguous()?;
+    // Row-strided 2-D views (the merged q|k case): rows of 128 taken from a
+    // (drop + R, 256) matrix, both halves, with a row offset.
+    let qk = Tensor::randn(0f32, 1f32, (drop + 3 * n, 256), &dev)?
+        .to_dtype(DType::BF16)?
+        .narrow(0, drop, 3 * n)?;
+    let wh = Tensor::randn(1f32, 0.2f32, 128, &dev)?;
+    let mut strided_ok = true;
+    for off in [0usize, 128] {
+        let v = qk.narrow(1, off, 128)?;
+        strided_ok &= v.stride()[0] == 256
+            && bits(&fused_rmsnorm_scale(&v, &wh, 1e-6)?)?
+                == bits(&fused_rmsnorm_scale(&v.force_contiguous()?, &wh, 1e-6)?)?;
+    }
     Ok(vec![
         (
             "fused_rmsnorm_scale",
             bits(&fused_rmsnorm_scale(&x, &w, 1e-6)?)?
                 == bits(&fused_rmsnorm_scale(&xf, &wf, 1e-6)?)?,
         ),
+        ("fused_rmsnorm_scale (row-strided q/k halves)", strided_ok),
         (
             "fused_norm_mod",
             bits(&fused_norm_mod(&x, &s, 1e-6)?)? == bits(&fused_norm_mod(&xf, &sf, 1e-6)?)?,

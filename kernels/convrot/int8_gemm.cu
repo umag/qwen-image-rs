@@ -4,13 +4,14 @@
 // Two entry points:
 //   * int8_gemm_s32          — raw C(int32) = A(int8) @ Bᵀ(int8). Kept for the
 //                              bit-exact bridge self-test (host int reference).
-//   * int8_gemm_dequant_bf16 / int8_gemm_dequant_f16 — FUSED GEMM + per-token(row) × per-channel(col)
+//   * int8_gemm_dequant_cfg_launch — FUSED GEMM + per-token(row) × per-channel(col)
 //                              dequant in the CUTLASS epilogue, emitting bf16
 //                              directly: D = out( acc·s_row[m]·s_col[n] ), out =
 //                              bf16 or f16 (the f16 variant feeds the sage FP16
 //                              P·V with V born f16 — no separate cast kernel).
 //                              Removes the separate dequant_i32_bf16_k kernel and
-//                              the intermediate i32 tensor. Built on the SM80
+//                              the intermediate i32 tensor. Templated on a tile
+//                              config (TileCfg, picked per shape in Rust). Built on the SM80
 //                              Epilogue Visitor Tree (Sm80EVT), modeled on CUTLASS
 //                              examples/47 (ampere_gemm_universal_streamk_broadcast).
 #include <cassert>  // precede any cuda fp headers (CUDA 13 __assert_fail)
@@ -226,18 +227,13 @@ static int int8_gemm_dequant_impl(
   return s == cutlass::Status::kSuccess ? 0 : static_cast<int>(s);
 }
 
-// The tile configs, by index (TB MxNxK / warp MxNxK / stages). 0 is the
-// original single config. Keep in sync with `convrot::GEMM_CONFIGS`.
+// The tile configs, by index (TB MxNxK / warp MxNxK / stages / swizzle).
+// Keep in sync with `gemm_tiles::GEMM_CONFIGS` (selection: `gemm_config`).
 using Cfg0 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, 1>;
-using Cfg1 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, 2>;
-using Cfg2 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, 4>;
-using Cfg3 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, 8>;
-using Cfg4 = convrot_evt::TileCfg<256, 128, 64, 64, 64, 64, 3, 1>;
-using Cfg5 = convrot_evt::TileCfg<256, 128, 64, 64, 64, 64, 3, 4>;
-using Cfg6 = convrot_evt::TileCfg<64, 128, 64, 32, 64, 64, 4, 1>;
-using Cfg7 = convrot_evt::TileCfg<128, 128, 128, 64, 64, 128, 3, 4>;
-using Cfg8 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, 4>;
-static constexpr int kNumCfgs = 9;
+using Cfg1 = convrot_evt::TileCfg<128, 128, 64, 64, 64, 64, 3, 4>;
+using Cfg2 = convrot_evt::TileCfg<64, 128, 64, 32, 64, 64, 4, 1>;
+using Cfg3 = convrot_evt::TileCfg<128, 256, 64, 64, 64, 64, 3, 4>;
+static constexpr int kNumCfgs = 4;
 
 template <typename ElementOutput>
 static int int8_gemm_dequant_dispatch(
@@ -246,7 +242,7 @@ static int int8_gemm_dequant_dispatch(
 #define QIR_CFG(i) \
   case i: return int8_gemm_dequant_impl<ElementOutput, Cfg##i>(d, a, b, s_row, s_col, m, n, k, stream);
   switch (cfg) {
-    QIR_CFG(0) QIR_CFG(1) QIR_CFG(2) QIR_CFG(3) QIR_CFG(4) QIR_CFG(5) QIR_CFG(6) QIR_CFG(7) QIR_CFG(8)
+    QIR_CFG(0) QIR_CFG(1) QIR_CFG(2) QIR_CFG(3)
   }
 #undef QIR_CFG
   return -2;  // unknown config

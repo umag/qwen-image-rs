@@ -412,10 +412,28 @@ impl HeadRmsNorm {
     }
 }
 
+/// How an attention block projects q/k/v from its input.
+enum QkvProj {
+    /// Three linears (bf16, Q8_0, or ConvRot if they could not be merged).
+    Separate {
+        to_q: QLinear,
+        to_k: QLinear,
+        to_v: QLinear,
+    },
+    /// ConvRot (`qwen-image-rs-gemm-merge-tune`): `x` is rotated + quantized
+    /// once; q|k is ONE head-interleaved INT8 GEMM (`[q_h, k_h]` per head,
+    /// N = 2 * INNER) and v a second GEMM on the same quantized `x` (its own
+    /// f16 epilogue for the sage P·V). Built at load from the per-layer
+    /// weights; outputs are bit-identical to the separate linears.
+    #[cfg(feature = "convrot")]
+    Merged {
+        qk: crate::convrot::ConvRotLinear,
+        v: crate::convrot::ConvRotLinear,
+    },
+}
+
 struct Attention {
-    to_q: QLinear,
-    to_k: QLinear,
-    to_v: QLinear,
+    qkv: QkvProj,
     to_out: QLinear,
     norm_q: HeadRmsNorm,
     norm_k: HeadRmsNorm,
@@ -423,14 +441,84 @@ struct Attention {
 
 impl Attention {
     fn load(opts: LinearOpts, vb: VarBuilder) -> Result<Self> {
+        let to_q = QLinear::load(INNER, INNER, opts, vb.pp("to_q"))?;
+        let to_k = QLinear::load(INNER, INNER, opts, vb.pp("to_k"))?;
+        let to_v = QLinear::load(INNER, INNER, opts, vb.pp("to_v"))?;
+        let qkv = match (to_q, to_k, to_v) {
+            #[cfg(feature = "convrot")]
+            (QLinear::Convrot(q), QLinear::Convrot(k), QLinear::Convrot(v)) => QkvProj::Merged {
+                qk: crate::convrot::ConvRotLinear::interleave_heads(&q, &k, HEAD_DIM)?,
+                v,
+            },
+            (to_q, to_k, to_v) => QkvProj::Separate { to_q, to_k, to_v },
+        };
         Ok(Self {
-            to_q: QLinear::load(INNER, INNER, opts, vb.pp("to_q"))?,
-            to_k: QLinear::load(INNER, INNER, opts, vb.pp("to_k"))?,
-            to_v: QLinear::load(INNER, INNER, opts, vb.pp("to_v"))?,
+            qkv,
             to_out: QLinear::load(INNER, INNER, opts, vb.pp("to_out").pp("0"))?,
             norm_q: HeadRmsNorm::load(vb.pp("norm_q"))?,
             norm_k: HeadRmsNorm::load(vb.pp("norm_k"))?,
         })
+    }
+
+    /// The block's ConvRot linear count (load accounting; a merged q|k counts 2).
+    fn convrot_count(&self) -> usize {
+        let qkv = match &self.qkv {
+            QkvProj::Separate { to_q, to_k, to_v } => {
+                [to_q, to_k, to_v].iter().filter(|l| l.is_convrot()).count()
+            }
+            #[cfg(feature = "convrot")]
+            QkvProj::Merged { .. } => 3,
+        };
+        qkv + usize::from(self.to_out.is_convrot())
+    }
+
+    /// `x (B,S,INNER)` -> `(qh, kh, v)`: q and k per-head RMS-normalized,
+    /// pre-RoPE, `(B,S,H,D)` bf16; v `(B,S,H,D)`, f16 when `v_f16` (the sage
+    /// P·V operand, born f16 in the ConvRot epilogue) else bf16.
+    fn project(&self, x: &Tensor, v_f16: bool) -> Result<(Tensor, Tensor, Tensor)> {
+        let (b, s, _) = x.dims3()?;
+        let shape = (b, s, HEADS, HEAD_DIM);
+        match &self.qkv {
+            QkvProj::Separate { to_q, to_k, to_v } => {
+                let qh = self.norm_q.forward(&to_q.forward(x)?.reshape(shape)?)?;
+                let kh = self.norm_k.forward(&to_k.forward(x)?.reshape(shape)?)?;
+                #[cfg(feature = "sage")]
+                let v = if v_f16 {
+                    to_v.forward_f16(x)?
+                } else {
+                    to_v.forward(x)?
+                };
+                #[cfg(not(feature = "sage"))]
+                let v = {
+                    let _ = v_f16;
+                    to_v.forward(x)?
+                };
+                Ok((qh, kh, v.reshape(shape)?))
+            }
+            #[cfg(feature = "convrot")]
+            QkvProj::Merged { qk, v } => {
+                use crate::convrot::EpilogueOut;
+                let qa = qk.quantize(x)?;
+                let qk_out = qk.forward_quantized(&qa, EpilogueOut::Bf16)?; // (B,S,2*INNER)
+                let v_ty = if v_f16 {
+                    EpilogueOut::F16
+                } else {
+                    EpilogueOut::Bf16
+                };
+                let v = v.forward_quantized(&qa, v_ty)?.reshape(shape)?;
+                // Rows of [q_h | k_h]: q and k are ld = 2*HEAD_DIM column views.
+                let rows = qk_out.reshape((b * s * HEADS, 2 * HEAD_DIM))?;
+                let qh = self
+                    .norm_q
+                    .forward(&rows.narrow(1, 0, HEAD_DIM)?)?
+                    .reshape(shape)?;
+                let kh = self
+                    .norm_k
+                    .forward(&rows.narrow(1, HEAD_DIM, HEAD_DIM)?)?
+                    .reshape(shape)?;
+                Ok((qh, kh, v))
+            }
+        }
     }
 
     // One of two cfg-selected bodies binds `out`; clippy sees only one and
@@ -445,7 +533,6 @@ impl Attention {
         txt_len: usize,
     ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
-        let shape = (b, s, HEADS, HEAD_DIM);
         let scale = 1.0 / (HEAD_DIM as f64).sqrt();
         #[cfg(feature = "sage")]
         let out = {
@@ -454,30 +541,16 @@ impl Attention {
                           // sage INT8 quantizer (attend_bshd), so q/k are rotated and
                           // quantized in one pass — no separate rope kernel, no
                           // rotated-bf16 round trip, no transpose copies.
-            let qh = self
-                .norm_q
-                .forward(&self.to_q.forward(x)?.reshape(shape)?)?; // (B,S,H,D), pre-rope
-            let kh = self
-                .norm_k
-                .forward(&self.to_k.forward(x)?.reshape(shape)?)?;
-            let vv = self.to_v.forward_f16(x)?.reshape(shape)?; // (B,S,H,D) f16
+            let (qh, kh, vv) = self.project(x, true)?; // (B,S,H,D), pre-rope; v f16
             let out = self.attend_bshd(&qh, &kh, &vv, cos, sin, txt_len, scale)?; // (B,S,H,D)
             self.to_out.forward(&out.reshape((b, s, INNER))?)
         };
         #[cfg(not(feature = "sage"))]
         let out = {
             // (B,H,S,D) for RoPE (rope_i rotates per position across heads).
-            let qh = self
-                .norm_q
-                .forward(&self.to_q.forward(x)?.reshape(shape)?)?
-                .transpose(1, 2)?
-                .contiguous()?;
-            let kh = self
-                .norm_k
-                .forward(&self.to_k.forward(x)?.reshape(shape)?)?
-                .transpose(1, 2)?
-                .contiguous()?;
-            let vv = self.to_v.forward(x)?.reshape(shape)?; // (B,S,H,D)
+            let (qh, kh, vv) = self.project(x, false)?; // (B,S,H,D)
+            let qh = qh.transpose(1, 2)?.contiguous()?;
+            let kh = kh.transpose(1, 2)?.contiguous()?;
             let qh = candle_nn::rotary_emb::rope_i(&qh, cos, sin)?;
             let kh = candle_nn::rotary_emb::rope_i(&kh, cos, sin)?;
             let out = self.attend(&qh, &kh, &vv, mask, txt_len, scale)?; // (B,S,H,D)
@@ -599,30 +672,82 @@ impl Attention {
     }
 }
 
+/// How the SwiGLU MLP projects its gate and proj inputs.
+enum MlpIn {
+    /// Two linears (bf16, Q8_0, or unmerged ConvRot).
+    Separate { proj: QLinear, gate: QLinear },
+    /// ConvRot (`qwen-image-rs-gemm-merge-tune`): ONE INT8 GEMM with the
+    /// gate rows then the proj rows (N = 2 * 3 * INNER), one activation quant;
+    /// its two column halves feed the out linear's fused SwiGLU quantizer.
+    #[cfg(feature = "convrot")]
+    Merged(crate::convrot::ConvRotLinear),
+}
+
 struct SwiGlu {
-    proj: QLinear,
-    gate: QLinear,
+    input: MlpIn,
     out: QLinear,
 }
 impl SwiGlu {
     fn load(opts: LinearOpts, vb: VarBuilder) -> Result<Self> {
-        Ok(Self {
-            proj: QLinear::load(INNER, INNER * 3, opts, vb.pp("proj"))?,
-            gate: QLinear::load(INNER, INNER * 3, opts, vb.pp("gate_layer"))?,
-            out: QLinear::load(INNER * 3, INNER, opts, vb.pp("out"))?,
-        })
+        let proj = QLinear::load(INNER, INNER * 3, opts, vb.pp("proj"))?;
+        let gate = QLinear::load(INNER, INNER * 3, opts, vb.pp("gate_layer"))?;
+        let out = QLinear::load(INNER * 3, INNER, opts, vb.pp("out"))?;
+        let input = match (gate, proj, &out) {
+            #[cfg(feature = "convrot")]
+            (QLinear::Convrot(g), QLinear::Convrot(p), QLinear::Convrot(_)) => {
+                MlpIn::Merged(crate::convrot::ConvRotLinear::concat_out(&[&g, &p])?)
+            }
+            (gate, proj, _) => MlpIn::Separate { proj, gate },
+        };
+        Ok(Self { input, out })
     }
+
+    /// The MLP's ConvRot linear count (load accounting; merged gate|proj counts 2).
+    fn convrot_count(&self) -> usize {
+        let input = match &self.input {
+            MlpIn::Separate { proj, gate } => {
+                usize::from(proj.is_convrot()) + usize::from(gate.is_convrot())
+            }
+            #[cfg(feature = "convrot")]
+            MlpIn::Merged(_) => 2,
+        };
+        input + usize::from(self.out.is_convrot())
+    }
+
     /// `out(silu(gate(x)) * proj(x))`. Under ConvRot the out linear's
     /// activation quantizer computes `silu(g) * p` itself (f32, in registers),
-    /// so the product is never stored; otherwise the candle ops.
+    /// so the product is never stored; with the merged gate|proj GEMM, g and p
+    /// are its two column halves, read in place. Otherwise the candle ops.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "convrot")]
-        if let QLinear::Convrot(out) = &self.out {
-            let (g, p) = (self.gate.forward(x)?, self.proj.forward(x)?);
-            return out.forward_swiglu(&g, &p, crate::convrot::EpilogueOut::Bf16);
+        match &self.input {
+            #[cfg(feature = "convrot")]
+            MlpIn::Merged(gp) => {
+                let QLinear::Convrot(out) = &self.out else {
+                    anyhow::bail!("SwiGlu: merged gate|proj needs a ConvRot out linear");
+                };
+                let dims = x.dims().to_vec();
+                let m: usize = dims[..dims.len() - 1].iter().product();
+                let n = INNER * 3;
+                let y = gp.forward(x)?.reshape((m, 2 * n))?; // [gate | proj]
+                let h = out.forward_swiglu(
+                    &y.narrow(1, 0, n)?,
+                    &y.narrow(1, n, n)?,
+                    crate::convrot::EpilogueOut::Bf16,
+                )?; // (m, INNER)
+                let mut out_dims = dims[..dims.len() - 1].to_vec();
+                out_dims.push(INNER);
+                Ok(h.reshape(out_dims)?)
+            }
+            MlpIn::Separate { proj, gate } => {
+                #[cfg(feature = "convrot")]
+                if let QLinear::Convrot(out) = &self.out {
+                    let (g, p) = (gate.forward(x)?, proj.forward(x)?);
+                    return out.forward_swiglu(&g, &p, crate::convrot::EpilogueOut::Bf16);
+                }
+                let g = silu(&gate.forward(x)?)?;
+                self.out.forward(&(g * proj.forward(x)?)?)
+            }
         }
-        let g = silu(&self.gate.forward(x)?)?;
-        self.out.forward(&(g * self.proj.forward(x)?)?)
     }
 }
 
@@ -746,21 +871,12 @@ impl QwenImageDit {
             &self.norm_out_linear,
             &self.proj_out,
         ];
-        let blocks = self.blocks.iter().flat_map(|b| {
-            [
-                &b.attn.to_q,
-                &b.attn.to_k,
-                &b.attn.to_v,
-                &b.attn.to_out,
-                &b.mlp.proj,
-                &b.mlp.gate,
-                &b.mlp.out,
-            ]
-        });
-        tail.into_iter()
-            .chain(blocks)
-            .filter(|l| l.is_convrot())
-            .count()
+        let blocks: usize = self
+            .blocks
+            .iter()
+            .map(|b| b.attn.convrot_count() + b.mlp.convrot_count())
+            .sum();
+        tail.into_iter().filter(|l| l.is_convrot()).count() + blocks
     }
 
     /// Build cos/sin `(S, 32)` for interleaved RoPE, from per-token 3-axis

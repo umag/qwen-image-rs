@@ -39,25 +39,7 @@ extern "C" {
     ) -> i32;
 }
 
-/// The CUTLASS EVT tile configs (`kernels/convrot/int8_gemm.cu` `Cfg<i>`), by
-/// index: (threadblock M, N, K, warp M, N, K, stages, swizzle). Every config computes
-/// bit-identical outputs (exact INT8 accumulation, per-element epilogue).
-pub const GEMM_CONFIGS: [(u16, u16, u16, u16, u16, u16, u8, u8); 9] = [
-    (128, 128, 64, 64, 64, 64, 3, 1),
-    (128, 128, 64, 64, 64, 64, 3, 2),
-    (128, 128, 64, 64, 64, 64, 3, 4),
-    (128, 128, 64, 64, 64, 64, 3, 8),
-    (256, 128, 64, 64, 64, 64, 3, 1),
-    (256, 128, 64, 64, 64, 64, 3, 4),
-    (64, 128, 64, 32, 64, 64, 4, 1),
-    (128, 128, 128, 64, 64, 128, 3, 4),
-    (128, 256, 64, 64, 64, 64, 3, 4),
-];
-
-/// The tile config the DiT uses for an `(M, N, K)` INT8 GEMM.
-pub fn gemm_config(_m: usize, _n: usize, _k: usize) -> u8 {
-    0
-}
+pub use crate::gemm_tiles::{gemm_config, TileConfig, GEMM_CONFIGS};
 
 struct Int8Gemm;
 
@@ -638,6 +620,17 @@ impl candle_core::CustomOp3 for Int8GemmDequant {
 
 use candle_core::D;
 
+/// A rotated, per-row INT8-quantized activation `(M, K)` — the input side of
+/// a ConvRot GEMM, computed once and shared by every linear that reads the
+/// same `x` (merged q|k and v, `qwen-image-rs-gemm-merge-tune`). `lead` are
+/// the activation's leading dims (`M` = their product).
+pub struct QuantizedActivation {
+    x_i8: Tensor,      // (M, K) u8 holding int8, dense
+    row_scale: Tensor, // (M,) f32
+    lead: Vec<usize>,
+    k: usize,
+}
+
 /// A ConvRot W8A8 linear: rotated INT8 weight + per-channel scale. Forward
 /// rotates + per-token INT8-quantizes the activation, runs the INT8 GEMM, and
 /// dequantizes. Output-equivalent to `x Wᵀ` up to INT8 error.
@@ -674,6 +667,99 @@ impl ConvRotLinear {
             col_scale,
             hadamard: r.clone(),
         })
+    }
+
+    /// One linear with the output rows (channels) of `parts` stacked in order:
+    /// `W = [W_0; W_1; ...]`, `col_scale` likewise. Its output is the
+    /// column-concatenation of the parts' outputs, bit-identical per column
+    /// (exact INT8 accumulation, per-element epilogue). All parts must share K.
+    pub fn concat_out(parts: &[&ConvRotLinear]) -> Result<Self> {
+        let first = parts
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("concat_out: no parts"))?;
+        let k = first.w_i8.dim(1)?;
+        for p in parts {
+            anyhow::ensure!(
+                p.w_i8.dim(1)? == k,
+                "concat_out: K mismatch ({} vs {k})",
+                p.w_i8.dim(1)?
+            );
+        }
+        let w: Vec<&Tensor> = parts.iter().map(|p| &p.w_i8).collect();
+        let c: Vec<&Tensor> = parts.iter().map(|p| &p.col_scale).collect();
+        Ok(Self {
+            w_i8: Tensor::cat(&w, 0)?,
+            col_scale: Tensor::cat(&c, 0)?,
+            hadamard: first.hadamard.clone(),
+        })
+    }
+
+    /// Head-interleaved merge of two `(heads * head_dim)`-output linears: the
+    /// merged output row of each token is `[a_h0, b_h0, a_h1, b_h1, ...]` (one
+    /// head_dim-wide slice each), so viewing it as `(M * heads, 2 * head_dim)`
+    /// rows makes `a` and `b` uniform row-strided views (`ld = 2 * head_dim`)
+    /// — the per-head q/k RMSNorm reads them in place.
+    pub fn interleave_heads(a: &ConvRotLinear, b: &ConvRotLinear, head_dim: usize) -> Result<Self> {
+        let (n, k) = a.w_i8.dims2()?;
+        anyhow::ensure!(
+            b.w_i8.dims2()? == (n, k) && head_dim > 0 && n.is_multiple_of(head_dim),
+            "interleave_heads: shapes {:?} / {:?} with head_dim {head_dim}",
+            a.w_i8.dims(),
+            b.w_i8.dims()
+        );
+        let h = n / head_dim;
+        let w = Tensor::stack(
+            &[
+                a.w_i8.reshape((h, head_dim, k))?,
+                b.w_i8.reshape((h, head_dim, k))?,
+            ],
+            1,
+        )?
+        .reshape((2 * n, k))?;
+        let c = Tensor::stack(
+            &[
+                a.col_scale.reshape((h, head_dim))?,
+                b.col_scale.reshape((h, head_dim))?,
+            ],
+            1,
+        )?
+        .reshape(2 * n)?;
+        Ok(Self {
+            w_i8: w,
+            col_scale: c,
+            hadamard: a.hadamard.clone(),
+        })
+    }
+
+    /// Rotate + quantize `x (..., K)` bf16 once, for one or more linears of
+    /// in-features K ([`Self::forward_quantized`]).
+    pub fn quantize(&self, x: &Tensor) -> Result<QuantizedActivation> {
+        let dims = x.dims().to_vec();
+        let k = *dims.last().unwrap();
+        let m: usize = dims[..dims.len() - 1].iter().product();
+        let (x_i8, row_scale) = rotate_quantize_rows_fused(&x.reshape((m, k))?)?;
+        Ok(QuantizedActivation {
+            x_i8,
+            row_scale,
+            lead: dims[..dims.len() - 1].to_vec(),
+            k,
+        })
+    }
+
+    /// INT8 GEMM + dequant of an already-quantized activation -> `(lead..., N)`.
+    /// Same output as `forward_as(x, out_ty)` on the `x` that `qa` came from.
+    pub fn forward_quantized(
+        &self,
+        qa: &QuantizedActivation,
+        out_ty: EpilogueOut,
+    ) -> Result<Tensor> {
+        let k = self.w_i8.dim(1)?;
+        anyhow::ensure!(
+            qa.k == k,
+            "forward_quantized: activation K={} but weight K={k}",
+            qa.k
+        );
+        self.gemm_dequant(&qa.lead, &qa.x_i8, &qa.row_scale, out_ty)
     }
 
     /// The stored INT8 weight and per-column scale, for serialization.
@@ -1470,5 +1556,78 @@ pub fn bench_gemm_configs(
         }
         res.push((m, n, k, times, same));
     }
+    Ok(res)
+}
+
+/// Merged projections vs the separate linears (`qwen-image-rs-gemm-merge-tune`),
+/// byte-for-byte, at M = 133 and M = 2 (the small-tile config): q and k out
+/// of the head-interleaved q|k GEMM (through the ld = 256 row views the DiT
+/// uses), v from the shared quantized activation (f16 epilogue), and the
+/// gate / proj halves of the concatenated GEMM. Also: a K-mismatched
+/// `forward_quantized` errors. Returns `(check, ok)` per check.
+pub fn self_test_merged() -> Result<Vec<(String, bool)>> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let r = crate::model::rotation::regular_hadamard_256(&dev)?;
+    let k = 4096usize;
+    let lin = |n: usize, kk: usize| -> Result<ConvRotLinear> {
+        let w = (Tensor::randn(0f32, 1f32, (n, kk), &dev)? * 0.02)?.to_dtype(DType::BF16)?;
+        ConvRotLinear::from_weight(&w, &r)
+    };
+    let (q, kl, v) = (lin(4096, k)?, lin(4096, k)?, lin(4096, k)?);
+    let (g, p) = (lin(1024, k)?, lin(1024, k)?);
+    let qk = ConvRotLinear::interleave_heads(&q, &kl, 128)?;
+    let gp = ConvRotLinear::concat_out(&[&g, &p])?;
+    let bits = |t: &Tensor| -> Result<Vec<u16>> {
+        let t = t.flatten_all()?;
+        Ok(match t.dtype() {
+            DType::F16 => t
+                .to_vec1::<half::f16>()?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect(),
+            _ => t
+                .to_vec1::<half::bf16>()?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect(),
+        })
+    };
+    let mut res = Vec::new();
+    for m in [133usize, 2] {
+        let x = Tensor::randn(0f32, 1f32, (1, m, k), &dev)?.to_dtype(DType::BF16)?;
+        let qa = qk.quantize(&x)?;
+        let rows = qk
+            .forward_quantized(&qa, EpilogueOut::Bf16)?
+            .reshape((m * 32, 256))?;
+        let qv = rows.narrow(1, 0, 128)?.force_contiguous()?;
+        let kv = rows.narrow(1, 128, 128)?.force_contiguous()?;
+        res.push((
+            format!("merged q|k (interleaved) q == to_q, M={m}"),
+            bits(&qv)? == bits(&q.forward(&x)?)?,
+        ));
+        res.push((
+            format!("merged q|k (interleaved) k == to_k, M={m}"),
+            bits(&kv)? == bits(&kl.forward(&x)?)?,
+        ));
+        res.push((
+            format!("v on the shared quant (f16) == to_v f16, M={m}"),
+            bits(&v.forward_quantized(&qa, EpilogueOut::F16)?)?
+                == bits(&v.forward_as(&x, EpilogueOut::F16)?)?,
+        ));
+        let y = gp.forward(&x)?.reshape((m, 2048))?;
+        res.push((
+            format!("merged gate|proj halves == gate, proj, M={m}"),
+            bits(&y.narrow(1, 0, 1024)?.force_contiguous()?)? == bits(&g.forward(&x)?)?
+                && bits(&y.narrow(1, 1024, 1024)?.force_contiguous()?)? == bits(&p.forward(&x)?)?,
+        ));
+    }
+    let wide = lin(64, 12288)?;
+    let x = Tensor::randn(0f32, 1f32, (3, k), &dev)?.to_dtype(DType::BF16)?;
+    res.push((
+        "forward_quantized rejects a K mismatch".to_string(),
+        wide.forward_quantized(&qk.quantize(&x)?, EpilogueOut::Bf16)
+            .is_err(),
+    ));
     Ok(res)
 }

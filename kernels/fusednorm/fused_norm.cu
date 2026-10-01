@@ -82,18 +82,20 @@ extern "C" void fused_norm_mod_launch(void *out, const void *x,
 __global__ void
 fused_rmsnorm_scale_kernel(__nv_bfloat16 *__restrict__ out,
                            const __nv_bfloat16 *__restrict__ x,
-                           const float *__restrict__ w, int n, float eps) {
+                           const float *__restrict__ w, int n, long ld,
+                           float eps) {
   extern __shared__ float sh[]; // n floats: the row staged as f32
   __shared__ float red[THREADS];
 
   const int row = blockIdx.x;
-  const size_t base = (size_t)row * n;
+  const size_t base = (size_t)row * n;    // out: dense rows
+  const size_t xbase = (size_t)row * ld;  // x: rows ld >= n elements apart
   const int tid = threadIdx.x;
 
   // Stage the row as f32 and accumulate a partial sum of squares.
   float local = 0.f;
   for (int i = tid; i < n; i += THREADS) {
-    float v = __bfloat162float(x[base + i]);
+    float v = __bfloat162float(x[xbase + i]);
     sh[i] = v;
     local += v * v;
   }
@@ -112,13 +114,16 @@ fused_rmsnorm_scale_kernel(__nv_bfloat16 *__restrict__ out,
   }
 }
 
-// out/x are (M, N) bf16 row-major, contiguous; w is (N,) f32. M rows, N cols.
+// out is (M, N) bf16 row-major, dense; x rows are `ld` (>= N) elements apart
+// (ld = N for a dense x; ld > N for a column view such as the q or k half of
+// the head-interleaved merged q|k output); w is (N,) f32. M rows, N cols.
 extern "C" void fused_rmsnorm_scale_launch(void *out, const void *x,
                                            const void *w, int m, int n,
-                                           float eps, void *stream) {
+                                           long ld, float eps, void *stream) {
   size_t shmem = (size_t)n * sizeof(float);
   fused_rmsnorm_scale_kernel<<<m, THREADS, shmem, (cudaStream_t)stream>>>(
-      (__nv_bfloat16 *)out, (const __nv_bfloat16 *)x, (const float *)w, n, eps);
+      (__nv_bfloat16 *)out, (const __nv_bfloat16 *)x, (const float *)w, n, ld,
+      eps);
 }
 
 // Fused gated residual: out[i] = h[i] + tanh(gate[i]) * y[i], elementwise over

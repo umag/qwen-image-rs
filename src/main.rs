@@ -1228,8 +1228,8 @@ fn gemm_bench(iters: usize, batch: usize) -> Result<()> {
         ];
         for (i, c) in GEMM_CONFIGS.iter().enumerate() {
             println!(
-                "cfg {i}: TB {}x{}x{} warp {}x{}x{} stages {} swizzle {}",
-                c.0, c.1, c.2, c.3, c.4, c.5, c.6, c.7
+                "cfg {i}: TB {:?} warp {:?} stages {} swizzle {}",
+                c.tb, c.warp, c.stages, c.swizzle
             );
         }
         let mut all_same = true;
@@ -1392,6 +1392,14 @@ fn convrot_test() -> Result<()> {
                 if c > 0.9999 { "OK" } else { "TOO LOW" }
             );
             swg_ok &= c > 0.9999;
+        }
+        // Merged projections (q|k interleaved, shared quant for v, gate|proj).
+        for (what, ok) in qwen_image_rs::convrot::self_test_merged()? {
+            println!(
+                "convrot merged projection: {what}: {}",
+                if ok { "BIT-IDENTICAL" } else { "MISMATCH" }
+            );
+            swg_ok &= ok;
         }
         let (sf, su) = qwen_image_rs::convrot::bench_swiglu_quant(50)?;
         println!(

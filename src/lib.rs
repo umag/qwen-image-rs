@@ -17,6 +17,7 @@ pub mod convrot_cache;
 pub mod device;
 #[cfg(feature = "fusednorm")]
 pub mod fusednorm;
+pub mod gemm_tiles;
 pub mod layout;
 pub mod loader;
 pub mod model;
