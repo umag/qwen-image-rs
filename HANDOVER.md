@@ -24,7 +24,7 @@ reference. ~36 commits. This doc = pick-up point for a fresh session.
 End-to-end works: `generate --model <snapshot> --prompt "..." --out x.png`.
 **Fastest build: `--features convrot,sage,fusednorm,sage2`** (SageAttention2,
 dit-forward 0.999911 since `-fused-swiglu` (0.999879 after `-fused-rotate-quant`, chaos) — FP8 P·V;
-denoise 0.1703 s/step after `-gemm-merge-tune`; `QIR_SAGE=1` in that binary = SageAttention v1,
+denoise 0.1647 s/step after `-qk-norm-fusion` (same-session A/B; 0.1703 after `-gemm-merge-tune` in its session); `QIR_SAGE=1` in that binary = SageAttention v1,
 bit-identical to the build without `sage2`). **Most accurate fast build: `--features
 convrot,sage,fusednorm`** (0.999944). **DEFAULT (human decision 2026-10-01): the
 SA2 build** — accepted at 0.999894 for -4.8% denoise. (bf16 VAE is the
@@ -57,7 +57,8 @@ at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 d
 | SA2 quant fused: 10 per-layer launches → 3 (one 512-thread kernel, L2-ordered), bit-identical | sage2 | 0.2127 (A/B same session: 0.2159 → 0.2127, −1.5%) |
 | Hadamard rotation fused into the activation quantizer (f32 in registers; no bf16 rotation GEMM) | convrot | 0.1911 (A/B same session: 0.2125 → 0.1911, −10.1%; dit-forward --convrot 0.999898 → 0.999879, chaos — see section) |
 | SwiGLU `silu(g)·p` fused into the MLP-out rotate+quantize (f32; no bf16 h, no usilu/bmul passes) | convrot | 0.1746 (A/B same session: 0.1905 → 0.1746, −8.4%; dit-forward --convrot SA2 0.999879 → 0.999911, v1 0.999900 → 0.999881, chaos) |
-| q\|k (head-interleaved) and gate\|proj merged GEMMs, v on the shared activation quant, per-shape CUTLASS tile/swizzle | convrot | **0.1703** (A/B same session: 0.1750 → 0.1703, −2.7%; `--batch 2` 0.3555 → 0.3374, −5.1%; byte-identical output) |
+| q\|k (head-interleaved) and gate\|proj merged GEMMs, v on the shared activation quant, per-shape CUTLASS tile/swizzle | convrot | 0.1703 (A/B same session: 0.1750 → 0.1703, −2.7%; `--batch 2` 0.3555 → 0.3374, −5.1%; byte-identical output) |
+| per-head q/k RMSNorm: 16-lane N=128 kernel (3.1× faster) + fused into the SA2 Q/K/K-sum quant (normalized q/k never written), byte-identical | fusednorm,sage2 | **0.1647** (A/B same session: 0.1769 → 0.1647, −6.9%; `--batch 2` 0.3492 → 0.3252, −6.9%; byte-identical output) |
 
 Plus (not per-step): bf16 VAE decode 1.57×; text encoder Q8_0 GGUF (resident
 VRAM); VAE tiling (constant decode memory); true CFG (`--guidance`/`--negative`,
@@ -94,6 +95,13 @@ CLI verbs (all in `src/main.rs`): `generate`, `batch` (has `--resident`,
 `prequantize-text`.
 
 ### NEXT SESSION — remaining optimization backlog (ranked; latest nsys below)
+**Latest (after `-qk-norm-fusion`, 10-step generate, per denoise step):** INT8 GEMMs
+~100 ms (91.6 main + 8.0 second EVT config; 440–510 TOPS, near the 4090's peak) ·
+SA2 attention 18.4 ms · SwiGLU rotate+quant 9.2 ms · fused gated residual 9.0 ms
+(candidate: fuse into the following norm_mod) · Sage2QuantKernel 6.7 ms ·
+fused_norm_mod 6.6 ms · copy2d_u8 ~2.1 ms (212 launches, origin not yet traced).
+Older notes below.
+
 The denoise is now a **flat tail — no dominant kernel** (10-step trace, bf16 VAE):
 `im2col_bf16` 10.1% (VAE convs) · `ucopy_bf16` 8.4% (attention-layout copies) ·
 sage attn 8.0% · bf16 GEMMs ~11% (non-convrot linears + VAE) · our 4 fused
@@ -258,6 +266,53 @@ policy tag are unchanged, no rebuild; warm DiT load unchanged ~0.97 s):
   silu(g) and the product, so it is now ±2 / 2^-7 (the f64 bound is unchanged).
 - Not done: q|k|v as one GEMM (V's f16 epilogue; see above); split-K (no shape
   needs it at these M; determinism kept by construction).
+
+### Per-head q/k RMSNorm made cheap (DONE — `qwen-image-rs-qk-norm-fusion`, byte-identical)
+At 236db1b the per-head q/k `HeadRmsNorm` (N = 128, f32 weight) was 640 of the 650
+`fused_rmsnorm_scale_kernel` launches per 10-step trace at ~206 us each (~13 ms/step,
+~295 GB/s: CTA-per-row with 256 threads, half idle at N = 128, a barrier tree per row).
+- **Part 1 — standalone kernel** (`fused_rmsnorm128_kernel`, kernels/fusednorm/fused_norm.cu):
+  one aligned 16-lane group per row, 8 channels per lane (one 16-B load + one 16-B
+  store), 16 rows per 256-thread CTA, no shared memory, no barriers; honors the
+  row stride of the merged q|k view. The launcher picks it for N = 128 with a 16-B
+  aligned x / ld % 8 == 0, else the CTA-per-row kernel (txt_in N = 4096 keeps it).
+  **206 → 66.6 us per q/k call (3.1×)** — what the v1 (`QIR_SAGE=1`) / non-sage2 paths run.
+- **Bit-identical, by construction** (kernels/fusednorm/head_rmsnorm.cuh, shared by
+  both parts): the old tree adds element e to e+64 first (index bit 6), then bit 5 …
+  bit 0 (the s = 128 level adds exact zeros). Element bits 6..3 = lane bits 3..0 →
+  xor-shuffles 8, 4, 2, 1 in that order, then in-lane bits 2, 1, 0; squares via
+  `__fmul_rn` (no FMA contraction — the old `0.f + v*v` rounds v·v); same
+  `rsqrtf(sum / n + eps)` and `(v * rrms) * w`. No fast-math in either TU.
+- **Part 2 — fused into the SA2 quant** (SA2 selected, `sage2` + `fusednorm` build):
+  `Attention::project_raw` hands the RAW q / k (merged ConvRot: zero-copy `(B,S,H,2D)
+  .narrow(3)` views, strides `(S·8192, 8192, 256, 1)`) plus `sage2::QkNorm { wq, wk, eps }`
+  to `quant_layer`; `S2Task` gained `w` + `eps` (112 / 688 B, asserted both sides; V /
+  V-amax tasks must have `w = null`, the launcher rejects otherwise). The K-sum, K-quant
+  and Q-quant tasks run `rope_norm_pack`: load the raw pack, normalize across the
+  token's 16 lanes with the same helper and bf16 rounding, then RoPE — so every
+  quantized byte equals norm-then-quant and the normalized q/k are never written
+  or re-read. The norm is recomputed in the K-sum and K-quant tasks (cheap). The
+  text-prefix / image narrows are plain token offsets (per-token norm), so the
+  per-call scale alignment is unchanged. v1 / non-sage / non-fusednorm builds keep
+  the standalone norm (`qk_norm_fused()` is the single decision point).
+- **Measured (nsys 10-step generate, same session):** base: norm 134.1 ms (650 launches),
+  Sage2QuantKernel 63.9 ms → new: q/k norm launches gone (10 txt_in launches, 0.03 ms),
+  Sage2QuantKernel **67.1 ms (+3.2 ms for the in-register norm)** = −130.9 ms / 10 steps.
+- **Self-tests:** `fusednorm-test` new lines — 16-lane vs CTA-per-row kernel, dense
+  M = 131749 (partial last CTA), both row-strided halves of a (R, 256) q|k with a row
+  offset, row magnitudes e^-12..e^12, all-zero rows: **0 mismatches** (exits nonzero
+  otherwise); vs candle cos 0.999999 (unchanged). `sage-test` new line — fused-norm
+  `quant_layer` on raw head-interleaved q|k views vs `fused_rmsnorm_scale` + `quant_layer`:
+  six operands' payload/scale bytes + attention outputs, B=2, B=1, B=2 lane 1 (batch
+  offset), S-offset view, txt 37 / 21, fp16 + fp32 accum: **0 mismatches**.
+- **End to end:** dit-forward `--convrot` QIR_SAGE=2 (0.999911) / 2f32 (0.999890) / 1
+  (0.999881) and no-convrot (0.999945; the Separate SA2 path is fused too) all
+  `cmp`-identical to the 236db1b build; B=1 and `--batch 2` PNGs byte-identical
+  (B=1 == lane 0, md5 equal); `convrot-test` clean.
+- **Speed (same session, interleaved):** batch --resident 2nd image 7096 / 7053 →
+  6600 / 6576 ms = **0.1769 → 0.1647 s/step (−6.9%)**; `generate --batch 2` steps
+  10..19: 0.3500 / 0.3484 → 0.3251 / 0.3252 s/step (**−6.9%**).
+- Not done: `copy2d_u8` (212 launches, ~2.1 ms/step) — not investigated here.
 
 ### SwiGLU fused into the MLP-out quantizer (DONE — `qwen-image-rs-fused-swiglu`)
 `SwiGlu::forward` used to run candle `usilu_bf16` + `bmul_bf16` over `(M, 12288)`
@@ -1010,7 +1065,8 @@ Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-prequant-default` (cached prequantized DiT = default `--convrot` load; load 7.0 → 2.7 s cold),
 `-fused-rotate-quant` (Hadamard rotation fused into the activation quantizer, −10.1%),
 `-fused-swiglu` (SwiGLU silu·p fused into the MLP-out rotate+quantize, −8.4%),
-`-gemm-merge-tune` (q|k and gate|proj merged GEMMs + per-shape tile, byte-identical, −2.7% / −5.1% at B=2).
+`-gemm-merge-tune` (q|k and gate|proj merged GEMMs + per-shape tile, byte-identical, −2.7% / −5.1% at B=2),
+`-qk-norm-fusion` (16-lane q/k RMSNorm kernel + norm fused into the SA2 quant, byte-identical, −6.9% / −6.9% at B=2).
 Bugs (complete): `-b1-off-prompt` (B=1 generate ignored the prompt: fused bridges
 ignored the view offset — see Gotchas).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path

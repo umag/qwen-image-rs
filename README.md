@@ -68,7 +68,8 @@ re-checked against the oracle before the next one.
 | SA2 quant: ten per-layer quant launches → three (L2-ordered, bit-identical) | `sage2` | 0.2127 (same-session A/B 0.2159 → 0.2127, −1.5%) |
 | Hadamard rotation fused into the INT8 activation quantizer (no bf16 rotation GEMM) | `convrot` | 0.1911 (same-session A/B 0.2125 → 0.1911, −10.1%) |
 | SwiGLU `silu(g)·p` fused into the MLP-out rotate+quantize (no bf16 h, no silu/mul passes) | `convrot` | 0.1746 (same-session A/B 0.1905 → 0.1746, −8.4%) |
-| q\|k and gate\|proj merged into one INT8 GEMM each, one activation quant per input, per-shape CUTLASS tile | `convrot` | **0.1703** (same-session A/B 0.1750 → 0.1703, −2.7%; `--batch 2` −5.1%; bit-identical) |
+| q\|k and gate\|proj merged into one INT8 GEMM each, one activation quant per input, per-shape CUTLASS tile | `convrot` | 0.1703 (same-session A/B 0.1750 → 0.1703, −2.7%; `--batch 2` −5.1%; bit-identical) |
+| per-head q/k RMSNorm: 16-lane kernel + fused into the SA2 Q/K quant (normalized q/k never written) | `fusednorm`,`sage2` | **0.1647** (same-session A/B 0.1769 → 0.1647, −6.9%; `--batch 2` −6.9%; bit-identical) |
 
 Plus: bf16 VAE decode (1.57×) and tiled decode (constant memory); batched
 multi-seed generation (`generate --batch N`, B=4 sweet spot). Recommended (default)
