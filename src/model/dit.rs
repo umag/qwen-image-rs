@@ -254,7 +254,7 @@ fn silu(x: &Tensor) -> Result<Tensor> {
 }
 
 /// LayerNorm with no learnable affine (elementwise_affine=False), eps 1e-6.
-/// Used by `norm_mod`'s non-fused fallback.
+/// Used by `residual_norm_mod`'s non-fused fallback.
 #[cfg_attr(feature = "fusednorm", allow(dead_code))]
 fn norm_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
     let x32 = x.to_dtype(DType::F32)?;
@@ -265,17 +265,78 @@ fn norm_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
     Ok(normed.to_dtype(x.dtype())?)
 }
 
-/// `norm_no_affine(x) * (scale + 1)` — the DiT's AdaLN pattern. Under the
-/// `fusednorm` feature this is one fused CUDA kernel; otherwise the candle ops.
-/// `x` and `scale` share shape `(..., INNER)`.
-fn norm_mod(x: &Tensor, scale: &Tensor, eps: f64) -> Result<Tensor> {
+/// One AdaLN modulation chunk (`scale` or `gate`) for the joint sequence: the
+/// `(2, INNER)` rows — row 0 for image tokens (real timestep), row 1 for the
+/// `txt_len` text tokens (t = 0) that open every sequence; every batch lane
+/// shares the split. The fused path reads the rows by token position; the
+/// candle fallback multiplies by the per-token tensor, materialized once.
+struct Modulation {
+    #[cfg(feature = "fusednorm")]
+    rows: Tensor, // (2, INNER)
+    #[cfg(feature = "fusednorm")]
+    txt_len: usize,
+    #[cfg(not(feature = "fusednorm"))]
+    tokens: Tensor, // (B, S, INNER)
+}
+
+impl Modulation {
+    #[cfg(feature = "fusednorm")]
+    fn new(rows: Tensor, _b: usize, txt_len: usize, _img_tokens: usize) -> Result<Self> {
+        Ok(Self { rows, txt_len })
+    }
+
+    #[cfg(not(feature = "fusednorm"))]
+    fn new(rows: Tensor, b: usize, txt_len: usize, img_tokens: usize) -> Result<Self> {
+        let r = select_rows(&rows, txt_len, img_tokens)?; // (1, seq, INNER)
+        let tokens = if b > 1 {
+            r.broadcast_as((b, txt_len + img_tokens, rows.dim(1)?))?
+                .contiguous()?
+        } else {
+            r
+        };
+        Ok(Self { tokens })
+    }
+
+    #[cfg(feature = "fusednorm")]
+    fn fused(&self) -> crate::fusednorm::ModRows<'_> {
+        crate::fusednorm::ModRows {
+            rows: &self.rows,
+            txt_len: self.txt_len,
+        }
+    }
+}
+
+/// The DiT's AdaLN step on the residual stream: apply the pending gated
+/// residual `h' = h + tanh(gate) * y` (if any), then `x = LayerNorm(h') *
+/// (scale + 1)` (no-affine LayerNorm). Returns `(h', x)`: `h'` is the stream
+/// the next residual adds to, `x` the sub-layer input. Every gated residual
+/// in the DiT is consumed by exactly such a norm (the mid-block one by
+/// `scale2`, the block-final one by the next block's `scale1` or by
+/// `norm_out`), so under `fusednorm` both are one CTA-per-row kernel that never
+/// re-reads `h'` (`qwen-image-rs-residual-norm-fusion`); otherwise the candle ops.
+fn residual_norm_mod(
+    h: &Tensor,
+    residual: Option<(&Modulation, &Tensor)>,
+    scale: &Modulation,
+    eps: f64,
+) -> Result<(Tensor, Tensor)> {
     #[cfg(feature = "fusednorm")]
     {
-        crate::fusednorm::fused_norm_mod(x, scale, eps as f32)
+        crate::fusednorm::fused_residual_norm_mod(
+            h,
+            residual.map(|(g, y)| (g.fused(), y)),
+            scale.fused(),
+            eps as f32,
+        )
     }
     #[cfg(not(feature = "fusednorm"))]
     {
-        Ok(norm_no_affine(x, eps)?.broadcast_mul(&(scale + 1.0)?)?)
+        let h = match residual {
+            Some((g, y)) => (h + g.tokens.tanh()?.broadcast_mul(y)?)?,
+            None => h.clone(),
+        };
+        let x = norm_no_affine(&h, eps)?.broadcast_mul(&(&scale.tokens + 1.0)?)?;
+        Ok((h, x))
     }
 }
 
@@ -296,20 +357,6 @@ fn rmsnorm_scale(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
         let rrms = (ms + eps)?.sqrt()?.recip()?;
         let out = x32.broadcast_mul(&rrms)?.broadcast_mul(w)?;
         Ok(out.to_dtype(dt)?)
-    }
-}
-
-/// `h + tanh(gate) * y` — the DiT's gated residual (2× per block). `h`, `gate`,
-/// `y` share shape. Under `fusednorm` this is one fused elementwise kernel;
-/// otherwise the candle ops.
-fn gated_residual(h: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "fusednorm")]
-    {
-        crate::fusednorm::fused_gated_residual(h, gate, y)
-    }
-    #[cfg(not(feature = "fusednorm"))]
-    {
-        Ok((h + gate.tanh()?.broadcast_mul(y)?)?)
     }
 }
 
@@ -849,27 +896,37 @@ impl Block {
         })
     }
 
-    /// `mod1`/`mod2` are the per-token (1,S,2*INNER) selected modulation slices.
+    /// One transformer block on the residual stream `h`. `pending` is the
+    /// previous block's MLP output, whose gated residual (`gate2`) is applied
+    /// here, fused with this block's first norm. Returns `(h, mlp_out)`: the
+    /// stream after the attention residual and this block's MLP output, whose
+    /// residual the next block (or `norm_out`) applies.
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         h: &Tensor,
-        scale1: &Tensor,
-        gate1: &Tensor,
-        scale2: &Tensor,
-        gate2: &Tensor,
+        pending: Option<&Tensor>,
+        mods: &BlockMods,
         mask: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
         txt_len: usize,
-    ) -> Result<Tensor> {
-        let x = norm_mod(h, scale1, self.eps)?;
+    ) -> Result<(Tensor, Tensor)> {
+        let (h, x) =
+            residual_norm_mod(h, pending.map(|y| (&mods.gate2, y)), &mods.scale1, self.eps)?;
         let attn = self.attn.forward(&x, mask, cos, sin, txt_len)?;
-        let h = gated_residual(h, gate1, &attn)?;
-        let x = norm_mod(&h, scale2, self.eps)?;
+        let (h, x) = residual_norm_mod(&h, Some((&mods.gate1, &attn)), &mods.scale2, self.eps)?;
         let m = self.mlp.forward(&x)?;
-        gated_residual(&h, gate2, &m)
+        Ok((h, m))
     }
+}
+
+/// The modulation every block shares (one `modulation` linear per forward).
+struct BlockMods {
+    scale1: Modulation,
+    gate1: Modulation,
+    scale2: Modulation,
+    gate2: Modulation,
 }
 
 /// Full DiT.
@@ -1048,23 +1105,15 @@ impl QwenImageDit {
         // Split modulation into scale1,gate1,scale2,gate2, each (2, INNER).
         let chunk = |t: &Tensor, i: usize| -> Result<Tensor> { Ok(t.narrow(1, i * INNER, INNER)?) };
         let mods: Vec<Tensor> = (0..4).map(|i| chunk(&modhad, i)).collect::<Result<_>>()?;
-        // Per-token selection: image tokens use row 0 (real t), text row 1 (t=0).
-        // select_rows yields (1, seq, INNER); for a batch, broadcast to (b, seq,
-        // INNER) and materialize (the fused norm/gate kernels index per row and
-        // read raw pointers, so a stride-0 broadcast view won't do). B=1 keeps
-        // the (1, seq, INNER) tensor untouched.
-        let sel = |m: &Tensor| -> Result<Tensor> {
-            let r = select_rows(m, txt_len, img_tokens, &self.device)?;
-            if b > 1 {
-                Ok(r.broadcast_as((b, seq, INNER))?.contiguous()?)
-            } else {
-                Ok(r)
-            }
+        // Per-token selection (image tokens row 0 = real t, text row 1 = t=0)
+        // happens inside the AdaLN step (see `Modulation`).
+        let md = |m: &Tensor| Modulation::new(m.clone(), b, txt_len, img_tokens);
+        let mods = BlockMods {
+            scale1: md(&mods[0])?,
+            gate1: md(&mods[1])?,
+            scale2: md(&mods[2])?,
+            gate2: md(&mods[3])?,
         };
-        let scale1 = sel(&mods[0])?;
-        let gate1 = sel(&mods[1])?;
-        let scale2 = sel(&mods[2])?;
-        let gate2 = sel(&mods[3])?;
 
         // The dense block-causal mask is only needed by the naive path; the
         // flash and sage paths derive the same structure from the text/image split.
@@ -1074,22 +1123,24 @@ impl QwenImageDit {
         let mask = Tensor::zeros((1, 1, 1, 1), dtype, &self.device)?;
         let (cos, sin) = self.rope_cos_sin(txt_len, h, w, dtype)?;
 
-        let mut x = joint;
+        let mut h = joint;
+        let mut pending: Option<Tensor> = None;
         for block in &self.blocks {
-            x = block.forward(
-                &x, &scale1, &gate1, &scale2, &gate2, &mask, &cos, &sin, txt_len,
-            )?;
+            let (nh, y) = block.forward(&h, pending.as_ref(), &mods, &mask, &cos, &sin, txt_len)?;
+            h = nh;
+            pending = Some(y);
         }
 
-        // norm_out: AdaLayerNorm scale-only, then proj_out. Scale from temb rows.
+        // norm_out: AdaLayerNorm scale-only (fused with the last block's MLP
+        // residual), then proj_out. Scale from temb rows.
         let scale_out = self.norm_out_linear.forward(&silu(&temb)?)?; // (2, INNER)
-        let scale_out = select_rows(&scale_out, txt_len, img_tokens, &self.device)?; // (1,seq,INNER)
-        let scale_out = if b > 1 {
-            scale_out.broadcast_as((b, seq, INNER))?.contiguous()?
-        } else {
-            scale_out
-        };
-        let x = norm_mod(&x, &scale_out, 1e-6)?;
+        let scale_out = Modulation::new(scale_out, b, txt_len, img_tokens)?;
+        let (_, x) = residual_norm_mod(
+            &h,
+            pending.as_ref().map(|y| (&mods.gate2, y)),
+            &scale_out,
+            1e-6,
+        )?;
         let out = self.proj_out.forward(&x)?; // (1, seq, out_channels)
         let _ = seq;
         Ok(out)
@@ -1098,13 +1149,13 @@ impl QwenImageDit {
 
 /// Select modulation rows per token: `(2, INNER)` -> `(1, seq, INNER)`, image
 /// tokens take row 0 (real timestep), text tokens row 1 (t=0).
-fn select_rows(m: &Tensor, txt_len: usize, img_tokens: usize, dev: &Device) -> Result<Tensor> {
+#[cfg(not(feature = "fusednorm"))]
+fn select_rows(m: &Tensor, txt_len: usize, img_tokens: usize) -> Result<Tensor> {
     let real = m.narrow(0, 0, 1)?; // (1, INNER)
     let zero = m.narrow(0, 1, 1)?; // (1, INNER)
     let text_rows = zero.broadcast_as((txt_len, m.dim(1)?))?;
     let img_rows = real.broadcast_as((img_tokens, m.dim(1)?))?;
     let rows = Tensor::cat(&[&text_rows, &img_rows], 0)?.unsqueeze(0)?; // (1, seq, INNER)
-    let _ = dev;
     Ok(rows)
 }
 

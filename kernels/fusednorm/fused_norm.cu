@@ -1,4 +1,6 @@
 // Fused LayerNorm(no-affine) + AdaLN (scale+1) modulation for the DiT.
+// (The DiT now calls residual_norm_mod_kernel at the bottom of this file; this
+// kernel and fused_gated_residual_kernel remain as its bit-identity oracles.)
 // out[m,n] = ((x[m,n] - mean_m) * rsqrt(var_m + eps)) * (scale[m,n] + 1)
 // where mean_m/var_m are over the row (last dim, N elements). bf16 in/out,
 // f32 accumulation — mirrors `norm_no_affine(x) * (scale+1)` in src/model/dit.rs.
@@ -205,4 +207,171 @@ extern "C" void fused_gated_residual_launch(void *out, const void *h,
   fused_gated_residual_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
       (__nv_bfloat16 *)out, (const __nv_bfloat16 *)h,
       (const __nv_bfloat16 *)gate, (const __nv_bfloat16 *)y, total);
+}
+
+// Fused gated residual + LayerNorm(no-affine) + AdaLN (scale+1), one CTA per
+// row (`qwen-image-rs-residual-norm-fusion`). With a residual (HAS_RES):
+//   h_out[r,:] = bf16(h + tanh(gate) * y)                       (the new stream)
+//   x_out[r,:] = bf16(LN(float(h_out[r,:])) * (scale + 1))
+// without one, x_out = LN(h) * (scale + 1). gate/scale are the DiT's (2, n)
+// modulation rows, `gld`/`sld` elements apart: row 1 for text tokens
+// (pos < txt_len), row 0 for image tokens, pos = r % seq (B lanes share it).
+// Bit-identical to fused_gated_residual_kernel followed by
+// fused_norm_mod_kernel on the materialized per-token tensors: the same h'
+// expression (same TU and flags -> same fma contraction), and after a barrier
+// each thread sums the same strided set sh[tid + k*THREADS] in k order with the
+// same tree, so mean/var match to the bit. VEC stages 8 elements per 16-B load
+// (needs 16-B aligned pointers, n % 8 == 0, ld % 8 == 0); the reduction is
+// order-identical either way.
+template <bool HAS_RES, bool VEC>
+__global__ void __launch_bounds__(THREADS)
+residual_norm_mod_kernel(__nv_bfloat16 *__restrict__ x_out,
+                         __nv_bfloat16 *__restrict__ h_out,
+                         const __nv_bfloat16 *__restrict__ h,
+                         const __nv_bfloat16 *__restrict__ gate, long gld,
+                         const __nv_bfloat16 *__restrict__ y,
+                         const __nv_bfloat16 *__restrict__ scale, long sld,
+                         int n, int seq, int txt_len, float eps) {
+  extern __shared__ float sh[]; // n floats: the (rounded) row staged as f32
+  __shared__ float red[THREADS];
+
+  const int row = blockIdx.x;
+  const size_t base = (size_t)row * n;
+  const int tid = threadIdx.x;
+  const long sel = (row % seq) < txt_len ? 1 : 0;
+  const __nv_bfloat16 *g = gate + sel * gld; // unused without a residual
+  const __nv_bfloat16 *sc = scale + sel * sld;
+
+  // Stage h' (or h) as f32; write h' as the next residual stream.
+  if (VEC) {
+    for (int c = tid; c < n / 8; c += THREADS) {
+      const int i = c * 8;
+      __nv_bfloat16 hb[8];
+      float v[8];
+      *(uint4 *)hb = *(const uint4 *)(h + base + i);
+      if (HAS_RES) {
+        __nv_bfloat16 gb[8], yb[8], ob[8];
+        *(uint4 *)gb = *(const uint4 *)(g + i);
+        *(uint4 *)yb = *(const uint4 *)(y + base + i);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          float hv = __bfloat162float(hb[j]);
+          float gv = __bfloat162float(gb[j]);
+          float yv = __bfloat162float(yb[j]);
+          ob[j] = __float2bfloat16(hv + tanhf(gv) * yv);
+          v[j] = __bfloat162float(ob[j]);
+        }
+        *(uint4 *)(h_out + base + i) = *(const uint4 *)ob;
+      } else {
+#pragma unroll
+        for (int j = 0; j < 8; j++) v[j] = __bfloat162float(hb[j]);
+      }
+      *(float4 *)(sh + i) = *(const float4 *)v;
+      *(float4 *)(sh + i + 4) = *(const float4 *)(v + 4);
+    }
+  } else {
+    for (int i = tid; i < n; i += THREADS) {
+      float v = __bfloat162float(h[base + i]);
+      if (HAS_RES) {
+        float gv = __bfloat162float(g[i]);
+        float yv = __bfloat162float(y[base + i]);
+        __nv_bfloat16 o = __float2bfloat16(v + tanhf(gv) * yv);
+        h_out[base + i] = o;
+        v = __bfloat162float(o);
+      }
+      sh[i] = v;
+    }
+  }
+  __syncthreads();
+
+  // Mean: per-thread strided sum in fused_norm_mod_kernel's order, same tree.
+  float local = 0.f;
+  for (int i = tid; i < n; i += THREADS) local += sh[i];
+  red[tid] = local;
+  __syncthreads();
+  for (int s = THREADS / 2; s > 0; s >>= 1) {
+    if (tid < s) red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  const float mean = red[0] / (float)n;
+  __syncthreads();
+
+  // Variance.
+  local = 0.f;
+  for (int i = tid; i < n; i += THREADS) {
+    float d = sh[i] - mean;
+    local += d * d;
+  }
+  red[tid] = local;
+  __syncthreads();
+  for (int s = THREADS / 2; s > 0; s >>= 1) {
+    if (tid < s) red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  const float rstd = rsqrtf(red[0] / (float)n + eps);
+
+  // Normalize + AdaLN affine (scale + 1). Elementwise: any mapping is exact.
+  if (VEC) {
+    for (int c = tid; c < n / 8; c += THREADS) {
+      const int i = c * 8;
+      __nv_bfloat16 sb[8], ob[8];
+      float v[8];
+      *(uint4 *)sb = *(const uint4 *)(sc + i);
+      *(float4 *)v = *(const float4 *)(sh + i);
+      *(float4 *)(v + 4) = *(const float4 *)(sh + i + 4);
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        float normed = (v[j] - mean) * rstd;
+        float s = __bfloat162float(sb[j]) + 1.0f;
+        ob[j] = __float2bfloat16(normed * s);
+      }
+      *(uint4 *)(x_out + base + i) = *(const uint4 *)ob;
+    }
+  } else {
+    for (int i = tid; i < n; i += THREADS) {
+      float normed = (sh[i] - mean) * rstd;
+      float s = __bfloat162float(sc[i]) + 1.0f;
+      x_out[base + i] = __float2bfloat16(normed * s);
+    }
+  }
+}
+
+template <bool HAS_RES, bool VEC>
+static void residual_norm_mod(void *x_out, void *h_out, const void *h,
+                              const void *gate, long gld, const void *y,
+                              const void *scale, long sld, int m, int n,
+                              int seq, int txt_len, float eps, cudaStream_t st) {
+  size_t shmem = (size_t)n * sizeof(float);
+  residual_norm_mod_kernel<HAS_RES, VEC><<<m, THREADS, shmem, st>>>(
+      (__nv_bfloat16 *)x_out, (__nv_bfloat16 *)h_out,
+      (const __nv_bfloat16 *)h, (const __nv_bfloat16 *)gate, gld,
+      (const __nv_bfloat16 *)y, (const __nv_bfloat16 *)scale, sld, n, seq,
+      txt_len, eps);
+}
+
+static bool al16(const void *p) { return (uintptr_t)p % 16 == 0; }
+
+// x_out (and h_out when y != null) are (m, n) bf16 dense; h, y are (m, n) bf16
+// dense; gate/scale point at modulation row 0 with row 1 `gld`/`sld` elements
+// further. y == null: no residual (gate and h_out unused). m rows = B * seq.
+// `scalar` forces the scalar staging path (bit-identity test). Returns the
+// launch's cudaError (0 on success).
+extern "C" int fused_residual_norm_mod_launch(
+    void *x_out, void *h_out, const void *h, const void *gate, long gld,
+    const void *y, const void *scale, long sld, int m, int n, int seq,
+    int txt_len, float eps, int scalar, void *stream) {
+  cudaStream_t st = (cudaStream_t)stream;
+  const bool res = y != nullptr;
+  bool vec = !scalar && n % 8 == 0 && sld % 8 == 0 && al16(x_out) && al16(h) &&
+             al16(scale);
+  if (res) vec = vec && gld % 8 == 0 && al16(h_out) && al16(gate) && al16(y);
+  if (res && vec)
+    residual_norm_mod<true, true>(x_out, h_out, h, gate, gld, y, scale, sld, m, n, seq, txt_len, eps, st);
+  else if (res)
+    residual_norm_mod<true, false>(x_out, h_out, h, gate, gld, y, scale, sld, m, n, seq, txt_len, eps, st);
+  else if (vec)
+    residual_norm_mod<false, true>(x_out, h_out, h, gate, gld, y, scale, sld, m, n, seq, txt_len, eps, st);
+  else
+    residual_norm_mod<false, false>(x_out, h_out, h, gate, gld, y, scale, sld, m, n, seq, txt_len, eps, st);
+  return (int)cudaGetLastError();
 }

@@ -51,6 +51,24 @@ extern "C" {
         total: usize,
         stream: *mut c_void,
     );
+    #[allow(clippy::too_many_arguments)]
+    fn fused_residual_norm_mod_launch(
+        x_out: *mut c_void,
+        h_out: *mut c_void,
+        h: *const c_void,
+        gate: *const c_void,
+        gld: std::ffi::c_long,
+        y: *const c_void,
+        scale: *const c_void,
+        sld: std::ffi::c_long,
+        m: i32,
+        n: i32,
+        seq: i32,
+        txt_len: i32,
+        eps: f32,
+        scalar: i32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 struct FusedNormMod {
@@ -444,7 +462,138 @@ pub fn self_test_offset_views() -> Result<Vec<(&'static str, bool)>> {
             bits(&fused_gated_residual(&x, &g, &s)?)?
                 == bits(&fused_gated_residual(&xf, &gf, &sf)?)?,
         ),
+        (
+            "fused_residual_norm_mod (h, y, gate/scale rows offset)",
+            residual_norm_mod_offset_ok(&x, &s, drop, &dev)?,
+        ),
     ])
+}
+
+fn mr(rows: &Tensor, txt_len: usize) -> ModRows<'_> {
+    ModRows { rows, txt_len }
+}
+
+/// [`self_test_offset_views`] case for [`fused_residual_norm_mod`]: `h`, `y`
+/// are S-axis offset views; the gate / scale rows are row- and column-offset
+/// views of a wider modulation matrix (row stride 3N). Both outputs, with and
+/// without a residual, must match the fresh-copy run bit for bit.
+fn residual_norm_mod_offset_ok(
+    h: &Tensor,
+    y: &Tensor,
+    drop: usize,
+    dev: &candle_core::Device,
+) -> Result<bool> {
+    use candle_core::DType;
+    let n = h.dim(2)?;
+    let wide = Tensor::randn(0f32, 1f32, (drop + 2, 3 * n), dev)?.to_dtype(DType::BF16)?;
+    let (g, sc) = (
+        wide.narrow(0, drop, 2)?.narrow(1, n, n)?,
+        wide.narrow(0, drop, 2)?.narrow(1, 2 * n, n)?,
+    );
+    let (gf, sf) = (g.force_contiguous()?, sc.force_contiguous()?);
+    let txt = 5;
+    let both = |o: (Tensor, Tensor)| -> Result<Vec<u16>> {
+        let cat = Tensor::cat(&[o.0, o.1], 0)?;
+        Ok(cat
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect())
+    };
+    let (hf, yf) = (h.force_contiguous()?, y.force_contiguous()?);
+    let res = both(fused_residual_norm_mod(
+        h,
+        Some((mr(&g, txt), y)),
+        mr(&sc, txt),
+        1e-6,
+    )?)? == both(fused_residual_norm_mod(
+        &hf,
+        Some((mr(&gf, txt), &yf)),
+        mr(&sf, txt),
+        1e-6,
+    )?)?;
+    let plain = both(fused_residual_norm_mod(h, None, mr(&sc, txt), 1e-6)?)?
+        == both(fused_residual_norm_mod(&hf, None, mr(&sf, txt), 1e-6)?)?;
+    Ok(res && plain)
+}
+
+/// Bit-identity of [`fused_residual_norm_mod`] (`qwen-image-rs-residual-norm-fusion`)
+/// vs what it replaces: [`fused_gated_residual`] then [`fused_norm_mod`] on the
+/// materialized per-token modulation tensors. Cases cover B = 1 and 2, the
+/// real DiT shape, text splits 0 / S, the vector and the scalar staging paths
+/// (forced, and natural via a row width with n % 8 != 0), and the no-residual
+/// variant. Gate rows have a wide spread (tanh saturation), h large values
+/// (bf16 rounding of h' matters). Returns `(case, mismatched elements)`.
+pub fn self_test_residual_norm_mod_bits() -> Result<Vec<(String, usize)>> {
+    use candle_core::{DType, Device};
+    let dev = Device::new_cuda(0)?;
+    let eps = 1e-6f32;
+    let bits = |t: &Tensor| -> Result<Vec<u16>> {
+        Ok(t.flatten_all()?
+            .to_vec1::<half::bf16>()?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect())
+    };
+    let diff = |a: &Tensor, b: &Tensor| -> Result<usize> {
+        let (a, b) = (bits(a)?, bits(b)?);
+        Ok(a.iter().zip(&b).filter(|(p, q)| p != q).count() + a.len().abs_diff(b.len()))
+    };
+    // (B, S, N) per-token tensor from (2, N) rows: text tokens row 1, image row 0.
+    let tokens = |rows: &Tensor, b: usize, s: usize, txt: usize| -> Result<Tensor> {
+        let n = rows.dim(1)?;
+        let mut parts = Vec::new();
+        if txt > 0 {
+            parts.push(rows.narrow(0, 1, 1)?.broadcast_as((txt, n))?.contiguous()?);
+        }
+        if s > txt {
+            parts.push(
+                rows.narrow(0, 0, 1)?
+                    .broadcast_as((s - txt, n))?
+                    .contiguous()?,
+            );
+        }
+        Ok(Tensor::cat(&parts, 0)?
+            .unsqueeze(0)?
+            .broadcast_as((b, s, n))?
+            .contiguous()?)
+    };
+    let mut out = Vec::new();
+    // (B, S, txt_len, N, forced scalar)
+    let cases = [
+        (1usize, 4117usize, 21usize, 4096usize, false),
+        (1, 4117, 21, 4096, true),
+        (2, 533, 21, 4096, false),
+        (2, 533, 0, 4096, false),
+        (1, 77, 77, 4096, false),
+        (2, 61, 9, 1004, false),
+    ];
+    for (b, s, txt, n, scalar) in cases {
+        // Modulation like the DiT: a (2, 4N) matrix, gate / scale its column chunks.
+        let gsrc = Tensor::randn(0f32, 1.5f32, (2, 4 * n), &dev)?.to_dtype(DType::BF16)?;
+        let ssrc = Tensor::randn(0f32, 0.5f32, (2, 4 * n), &dev)?.to_dtype(DType::BF16)?;
+        let (g, sc) = (gsrc.narrow(1, n, n)?, ssrc.narrow(1, 2 * n, n)?);
+        let h = Tensor::randn(0f32, 8f32, (b, s, n), &dev)?.to_dtype(DType::BF16)?;
+        let y = Tensor::randn(0f32, 2f32, (b, s, n), &dev)?.to_dtype(DType::BF16)?;
+        let (gt, st) = (tokens(&g, b, s, txt)?, tokens(&sc, b, s, txt)?);
+        let tag = format!(
+            "B={b} S={s} txt={txt} N={n}{}",
+            if scalar { " scalar" } else { "" }
+        );
+
+        let h_ref = fused_gated_residual(&h, &gt, &y)?;
+        let x_ref = fused_norm_mod(&h_ref, &st, eps)?;
+        let (h2, x2) =
+            residual_norm_mod_impl(&h, Some((mr(&g, txt), &y)), mr(&sc, txt), eps, scalar)?;
+        out.push((format!("{tag} residual: h'"), diff(&h2, &h_ref)?));
+        out.push((format!("{tag} residual: x"), diff(&x2, &x_ref)?));
+
+        let x_ref = fused_norm_mod(&h, &st, eps)?;
+        let (_, x2) = residual_norm_mod_impl(&h, None, mr(&sc, txt), eps, scalar)?;
+        out.push((format!("{tag} plain: x"), diff(&x2, &x_ref)?));
+    }
+    Ok(out)
 }
 
 /// Bit-identity of the N = 128 16-lane RMSNorm kernel (`qwen-image-rs-qk-norm-fusion`)
@@ -496,4 +645,186 @@ pub fn self_test_rmsnorm128_bits() -> Result<Vec<(String, usize)>> {
         ("magnitudes e^-12..e^12".into(), cmp(&extreme, &w)?),
         ("all-zero rows".into(), cmp(&zeros, &w)?),
     ])
+}
+
+/// The DiT's AdaLN parameters for one modulation chunk (`scale` or `gate`):
+/// a `(2, N)` bf16 row view — row 0 for image tokens (real timestep), row 1
+/// for the `txt_len` text tokens (t = 0) that open every sequence. Rows may sit
+/// any `ld >= N` apart (a column narrow of the `(2, 4N)` modulation output).
+/// Every batch lane shares `txt_len` (one prompt broadcast to B).
+#[derive(Clone, Copy)]
+pub struct ModRows<'a> {
+    pub rows: &'a Tensor,
+    pub txt_len: usize,
+}
+
+/// `(h', LayerNorm(h') * (scale + 1))` with `h' = h + tanh(gate) * y` when a
+/// residual `(gate, y)` is given, else `(h, LayerNorm(h) * (scale + 1))` — one
+/// CTA-per-row kernel (`qwen-image-rs-residual-norm-fusion`). `h`, `y` are
+/// `(B, S, N)` bf16; `gate`/`scale` are [`ModRows`] selected per token
+/// position. Bit-identical to [`fused_gated_residual`] then [`fused_norm_mod`]
+/// on the materialized per-token tensors. Both outputs are fresh dense tensors
+/// (`h'` is `h` itself without a residual).
+pub fn fused_residual_norm_mod(
+    h: &Tensor,
+    residual: Option<(ModRows, &Tensor)>,
+    scale: ModRows,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    residual_norm_mod_impl(h, residual, scale, eps, false)
+}
+
+fn residual_norm_mod_impl(
+    h: &Tensor,
+    residual: Option<(ModRows, &Tensor)>,
+    scale: ModRows,
+    eps: f32,
+    scalar: bool,
+) -> Result<(Tensor, Tensor)> {
+    use candle_core::cuda_backend::cudarc::driver::CudaSlice;
+    use candle_core::op::BackpropOp;
+    use candle_core::{DType, Storage};
+    const WHAT: &str = "fused-residual-norm-mod";
+    let (b, seq, n) = h.dims3()?;
+    let m = b * seq;
+    let check_rows = |r: &ModRows, what: &str| -> Result<()> {
+        anyhow::ensure!(
+            r.rows.dtype() == DType::BF16 && r.rows.dims() == [2, n],
+            "{WHAT}: {what} rows must be bf16 (2, {n}), got {:?} {:?}",
+            r.rows.dtype(),
+            r.rows.dims()
+        );
+        anyhow::ensure!(
+            r.txt_len <= seq,
+            "{WHAT}: {what} txt_len {} > seq {seq}",
+            r.txt_len
+        );
+        Ok(())
+    };
+    anyhow::ensure!(
+        h.dtype() == DType::BF16,
+        "{WHAT}: h must be bf16, got {:?}",
+        h.dtype()
+    );
+    check_rows(&scale, "scale")?;
+    if let Some((g, y)) = &residual {
+        check_rows(g, "gate")?;
+        anyhow::ensure!(
+            g.txt_len == scale.txt_len,
+            "{WHAT}: gate txt_len {} != scale txt_len {}",
+            g.txt_len,
+            scale.txt_len
+        );
+        anyhow::ensure!(
+            y.dtype() == DType::BF16 && y.dims() == h.dims(),
+            "{WHAT}: y must be bf16 {:?}, got {:?} {:?}",
+            h.dims(),
+            y.dtype(),
+            y.dims()
+        );
+    }
+    // The row is staged in shared memory as f32 (48 KiB without an opt-in).
+    anyhow::ensure!(
+        n * 4 <= 48 * 1024,
+        "{WHAT}: row width {n} exceeds the smem stage"
+    );
+    let i32_of = |v: usize, what: &str| -> Result<i32> {
+        i32::try_from(v).map_err(|_| anyhow::anyhow!("{WHAT}: {what} {v} overflows i32"))
+    };
+    let (m32, n32, s32, t32) = (
+        i32_of(m, "rows")?,
+        i32_of(n, "width")?,
+        i32_of(seq, "seq")?,
+        i32_of(scale.txt_len, "txt_len")?,
+    );
+
+    let h = h.contiguous()?;
+    let y = residual.map(|(_, y)| y.contiguous()).transpose()?;
+    let bf = std::mem::size_of::<half::bf16>();
+    let (hs, hl) = h.storage_and_layout();
+    let (ss, sl) = scale.rows.storage_and_layout();
+    let ho = dense_byte_offset::<half::bf16>(hl, "fused-residual-norm-mod h")?;
+    let (so, sld) = row_strided_2d(sl, "fused-residual-norm-mod scale rows")?;
+    let hc = match &*hs {
+        Storage::Cuda(c) => c,
+        _ => anyhow::bail!("{WHAT}: h must be on CUDA"),
+    };
+    let sc = match &*ss {
+        Storage::Cuda(c) => c,
+        _ => anyhow::bail!("{WHAT}: scale rows must be on CUDA"),
+    };
+    let dev = hc.device().clone();
+    let stream = dev.cuda_stream();
+    let x_out: CudaSlice<half::bf16> = unsafe { dev.alloc::<half::bf16>(m * n)? };
+    let h_out: Option<CudaSlice<half::bf16>> = match residual {
+        Some(_) => Some(unsafe { dev.alloc::<half::bf16>(m * n)? }),
+        None => None,
+    };
+    let rc = {
+        let (hp, _g0) = hc.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
+        let (sp, _g1) = sc.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
+        let (xp, _g2) = x_out.device_ptr(&stream);
+        // Residual operands; their read guards live until the launch is enqueued.
+        let gy = match (&residual, &y) {
+            (Some((g, _)), Some(y)) => Some((g.rows.storage_and_layout(), y.storage_and_layout())),
+            _ => None,
+        };
+        let mut _guards = Vec::with_capacity(3);
+        let (op, gp, gld, yp) = match (&gy, &h_out) {
+            (Some(((gs, gl), (ys, yl))), Some(ho_)) => {
+                let (go, gld) = row_strided_2d(gl, "fused-residual-norm-mod gate rows")?;
+                let yo = dense_byte_offset::<half::bf16>(yl, "fused-residual-norm-mod y")?;
+                let (gc, yc) = match (&**gs, &**ys) {
+                    (Storage::Cuda(g), Storage::Cuda(y)) => (g, y),
+                    _ => anyhow::bail!("{WHAT}: gate rows and y must be on CUDA"),
+                };
+                let (p_g, g_g) = gc.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
+                let (p_y, g_y) = yc.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
+                let (p_o, g_o) = ho_.device_ptr(&stream);
+                _guards.extend([g_g, g_y, g_o]);
+                (
+                    p_o as *mut c_void,
+                    (p_g + (go * bf) as u64) as *const c_void,
+                    gld,
+                    (p_y + yo) as *const c_void,
+                )
+            }
+            _ => (std::ptr::null_mut(), std::ptr::null(), 0, std::ptr::null()),
+        };
+        unsafe {
+            fused_residual_norm_mod_launch(
+                xp as *mut c_void,
+                op,
+                (hp + ho) as *const c_void,
+                gp,
+                gld as std::ffi::c_long,
+                yp,
+                (sp + (so * bf) as u64) as *const c_void,
+                sld as std::ffi::c_long,
+                m32,
+                n32,
+                s32,
+                t32,
+                eps,
+                i32::from(scalar),
+                stream.cu_stream() as *mut c_void,
+            )
+        }
+    };
+    anyhow::ensure!(rc == 0, "{WHAT}: CUDA launch failed (cudaError {rc})");
+    drop((hs, ss));
+    let wrap = |o: CudaSlice<half::bf16>| -> Tensor {
+        Tensor::from_storage(
+            Storage::Cuda(CudaStorage::wrap_cuda_slice(o, dev.clone())),
+            (b, seq, n),
+            BackpropOp::none(),
+            false,
+        )
+    };
+    let x = wrap(x_out);
+    let h_new = match h_out {
+        Some(o) => wrap(o),
+        None => h,
+    };
+    Ok((h_new, x))
 }

@@ -1572,6 +1572,18 @@ fn fusednorm_test() -> Result<()> {
         if !bad.is_empty() {
             anyhow::bail!("fusednorm: N=128 RMSNorm kernel not bit-identical: {bad:?}");
         }
+        for (case, diff) in qwen_image_rs::fusednorm::self_test_residual_norm_mod_bits()? {
+            println!(
+                "residual+norm_mod fused vs gated_residual -> norm_mod, {case}: {diff} mismatches ({})",
+                if diff == 0 { "OK" } else { "FAIL" }
+            );
+            if diff != 0 {
+                bad.push(case);
+            }
+        }
+        if !bad.is_empty() {
+            anyhow::bail!("fusednorm: fused residual+norm_mod not bit-identical: {bad:?}");
+        }
         report_offset_views(
             "fusednorm",
             qwen_image_rs::fusednorm::self_test_offset_views()?,
