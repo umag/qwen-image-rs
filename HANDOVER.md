@@ -24,7 +24,7 @@ reference. ~36 commits. This doc = pick-up point for a fresh session.
 End-to-end works: `generate --model <snapshot> --prompt "..." --out x.png`.
 **Fastest build: `--features convrot,sage,fusednorm,sage2`** (SageAttention2,
 dit-forward 0.999911 since `-fused-swiglu` (0.999879 after `-fused-rotate-quant`, chaos) — FP8 P·V;
-denoise 0.1746 s/step after `-fused-swiglu`; `QIR_SAGE=1` in that binary = SageAttention v1,
+denoise 0.1703 s/step after `-gemm-merge-tune`; `QIR_SAGE=1` in that binary = SageAttention v1,
 bit-identical to the build without `sage2`). **Most accurate fast build: `--features
 convrot,sage,fusednorm`** (0.999944). **DEFAULT (human decision 2026-10-01): the
 SA2 build** — accepted at 0.999894 for -4.8% denoise. (bf16 VAE is the
@@ -56,7 +56,8 @@ at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 d
 | every DiT linear a `QLinear`, tail linears via ConvRot (uniformity) | convrot | 0.2150 (flat, as predicted; dit-forward --convrot 0.999894 → 0.999898) |
 | SA2 quant fused: 10 per-layer launches → 3 (one 512-thread kernel, L2-ordered), bit-identical | sage2 | 0.2127 (A/B same session: 0.2159 → 0.2127, −1.5%) |
 | Hadamard rotation fused into the activation quantizer (f32 in registers; no bf16 rotation GEMM) | convrot | 0.1911 (A/B same session: 0.2125 → 0.1911, −10.1%; dit-forward --convrot 0.999898 → 0.999879, chaos — see section) |
-| SwiGLU `silu(g)·p` fused into the MLP-out rotate+quantize (f32; no bf16 h, no usilu/bmul passes) | convrot | **0.1746** (A/B same session: 0.1905 → 0.1746, −8.4%; dit-forward --convrot SA2 0.999879 → 0.999911, v1 0.999900 → 0.999881, chaos) |
+| SwiGLU `silu(g)·p` fused into the MLP-out rotate+quantize (f32; no bf16 h, no usilu/bmul passes) | convrot | 0.1746 (A/B same session: 0.1905 → 0.1746, −8.4%; dit-forward --convrot SA2 0.999879 → 0.999911, v1 0.999900 → 0.999881, chaos) |
+| q\|k (head-interleaved) and gate\|proj merged GEMMs, v on the shared activation quant, per-shape CUTLASS tile/swizzle | convrot | **0.1703** (A/B same session: 0.1750 → 0.1703, −2.7%; `--batch 2` 0.3555 → 0.3374, −5.1%; byte-identical output) |
 
 Plus (not per-step): bf16 VAE decode 1.57×; text encoder Q8_0 GGUF (resident
 VRAM); VAE tiling (constant decode memory); true CFG (`--guidance`/`--negative`,
@@ -89,7 +90,7 @@ grid `B*S*H`, convrot/fusednorm CTA-per-row).
 CLI verbs (all in `src/main.rs`): `generate`, `batch` (has `--resident`,
 `--vae-tile`, `--guidance`/`--negative`, `--text-gguf`, `--quant-text`),
 `denoise`, `dit-forward`, `text-encode`, `vae-decode` (`--bf16`), `smoke`,
-`bench`, `convrot-test`, `sage-test`, `fusednorm-test`, `prequantize-convrot`,
+`bench`, `gemm-bench`, `convrot-test`, `sage-test`, `fusednorm-test`, `prequantize-convrot`,
 `prequantize-text`.
 
 ### NEXT SESSION — remaining optimization backlog (ranked; latest nsys below)
@@ -191,6 +192,72 @@ convrot cache stay valid. The old rotate + quantize path is
   nsys 10-step generate: rotation GEMM gone; `rotate_quantize_rows_k` 119.5 ms
   total (<2> 1980× 35 us, <6> 320× 154 us ≈ 1 TB/s) vs 323.7 ms for
   GEMM + quant before.
+
+### GEMM merge + tile tuning (DONE — `qwen-image-rs-gemm-merge-tune`, byte-identical)
+Every block used to quantize the same `x` three times (to_q/to_k/to_v) and the MLP
+input twice (gate/proj), one INT8 GEMM each. Now (all under ConvRot, built at LOAD
+from the per-layer weights — the prequant cache format / `PREQUANT_FORMAT` /
+policy tag are unchanged, no rebuild; warm DiT load unchanged ~0.97 s):
+- `Attention.qkv = QkvProj::Merged { qk, v }`: `x` is rotated + quantized ONCE
+  (`ConvRotLinear::quantize` → `QuantizedActivation` VO); `qk` is ONE GEMM
+  (N = 8192) whose weight rows are **head-interleaved** (`interleave_heads`: per
+  token `[q_h0, k_h0, q_h1, ...]`), so viewing the output as `(M·32, 256)` rows
+  makes q and k uniform `ld = 256` column views that the per-head RMSNorm reads in
+  place (`fused_rmsnorm_scale` gained a row stride; 2-D row-strided views are read
+  as-is, everything else made contiguous as before). `v` is its own GEMM on the
+  same quantized `x` (`forward_quantized`) because it needs the f16 epilogue
+  (sage P·V); a full q|k|v GEMM would need a bf16→f16 cast (more than it saves).
+  `Attention::project(x, v_f16)` serves the sage / flash / naive bodies.
+- `SwiGlu.input = MlpIn::Merged(gate|proj)` (`concat_out`, N = 24576): one quant,
+  one GEMM; its two column halves (ld = 24576) go straight into the fused SwiGLU
+  quantizer (`forward_swiglu`, `-fused-swiglu`'s row-strided loader).
+- Non-ConvRot (bf16 / Q8) keeps `Separate` (unchanged code path).
+- **EVT GEMM templated on a tile config** (`TileCfg<TB, warp, stages, swizzle>`,
+  `int8_gemm_dequant_cfg_launch(out_kind, cfg, ...)` replaces the two fixed
+  entry points); the table is `src/gemm_tiles.rs` (CPU unit-tested):
+  M ≤ 64 or N ≤ 64 → 64x128x64 s4; M ≥ 8192 and K ≥ 8192 → 128x256x64 s3 swizzle 4;
+  M ≥ 8192 → 128x128x64 s3 swizzle 4; else the original 128x128x64 s3. Every config
+  is byte-identical (exact INT8 accumulation, per-element epilogue; no split-K).
+  `gemm-bench [--batch N]` times every config per DiT shape (min of 3 interleaved
+  rounds — single sweeps drift ~4% with clocks) and checks bit-identity.
+- **Spike (9 configs measured):** at B=1 the original 128x128x64 s3 is best or
+  within noise for every large shape (256x128, 128x256, TBK=128, 4/5 stages,
+  swizzle 2/4/8 all ±1%); the GEMMs already run at 440–510 INT8 TOPS of the
+  4090's ~660 peak. Swizzle pays at M = 8234 (B=2), where A (50–100 MB) exceeds the
+  72 MB L2 and the identity raster re-reads it per N-column wave.
+- **GEMM ms per shape (gemm-bench, bf16 out, before = cfg0 → after = selected):**
+
+  | shape (M, N, K) | before | after |
+  |---|---|---|
+  | 4117, 4096, 4096 (×3 → q\|k + v) | 0.328 | 0.328 |
+  | 4117, 8192, 4096 (merged q\|k) | 2 × 0.328 = 0.656 | 0.607 |
+  | 4117, 24576, 4096 (merged gate\|proj) | 2 × 0.868 = 1.736 | 1.713 |
+  | 4117, 4096, 12288 (mlp out) | 0.816 | 0.816 |
+  | 4117, 64, 4096 (proj_out) | 0.0299 | 0.0174 |
+  | 2, 16384, 4096 (modulation) | 0.0295 | 0.0199 |
+  | 2, 4096, 4096 (norm_out, temb) | 0.0289 | 0.0168 |
+  | 8234, 4096, 4096 | 0.600 | 0.590 |
+  | 8234, 8192, 4096 (merged q\|k) | 2 × 0.600 = 1.199 | 1.132 |
+  | 8234, 24576, 4096 (merged gate\|proj) | 2 × 1.674 = 3.348 | 3.359 |
+  | 8234, 4096, 12288 | 1.676 | 1.518 |
+
+- **nsys (10-step generate, B=1):** INT8 GEMM launches 1990 → 1280, time 919.6 →
+  905.2 ms; `rotate_quantize_rows_k<2>` 1980 → 1020 launches, 68.6 → 20.6 ms;
+  per-head `fused_rmsnorm_scale` 200 → 206 us/launch (strided reads).
+- **Byte-identical:** convrot-test merged q|k (q, k via the strided views), v on the
+  shared quant (f16), gate|proj halves == the separate linears at M = 133 and 2;
+  strided RMSNorm == dense copy; dit-forward no-convrot / QIR_SAGE=2 / 1 / 2f32
+  `cmp`-identical to the `-fused-swiglu` build; B=1 and `--batch 2` PNGs identical;
+  B=1 == lane 0. Non-sage build (`convrot,fusednorm`, naive attention, merged
+  path with bf16 V): dit-forward --convrot 0.999879 vs oracle.
+- **Speed (same session):** batch --resident 2nd image, two interleaved rounds:
+  7005 / 6995 → 6800 / 6821 ms = **0.1750 → 0.1703 s/step (−2.7%)**; `generate
+  --batch 2` (steps 10..19): **0.3555 → 0.3374 s/step (−5.1%)**.
+- Also fixed: the `-fused-swiglu` self-test bound vs the candle path was the
+  single-rounding one (±1, 2^-8) and failed on a random draw; the candle path rounds
+  silu(g) and the product, so it is now ±2 / 2^-7 (the f64 bound is unchanged).
+- Not done: q|k|v as one GEMM (V's f16 epilogue; see above); split-K (no shape
+  needs it at these M; determinism kept by construction).
 
 ### SwiGLU fused into the MLP-out quantizer (DONE — `qwen-image-rs-fused-swiglu`)
 `SwiGlu::forward` used to run candle `usilu_bf16` + `bmul_bf16` over `(M, 12288)`
@@ -942,7 +1009,8 @@ Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-sage2-quant-fusion` (SA2 quant: 10 launches/layer → 3, bit-identical, −1.5%),
 `-prequant-default` (cached prequantized DiT = default `--convrot` load; load 7.0 → 2.7 s cold),
 `-fused-rotate-quant` (Hadamard rotation fused into the activation quantizer, −10.1%),
-`-fused-swiglu` (SwiGLU silu·p fused into the MLP-out rotate+quantize, −8.4%).
+`-fused-swiglu` (SwiGLU silu·p fused into the MLP-out rotate+quantize, −8.4%),
+`-gemm-merge-tune` (q|k and gate|proj merged GEMMs + per-shape tile, byte-identical, −2.7% / −5.1% at B=2).
 Bugs (complete): `-b1-off-prompt` (B=1 generate ignored the prompt: fused bridges
 ignored the view offset — see Gotchas).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path
