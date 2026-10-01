@@ -1,0 +1,103 @@
+{
+  "id": "19c0c05d-e45e-4e68-bf05-035c9c6b53c1",
+  "name": "18da81dd5171e394b4d52837e0d6694621c38e26",
+  "modelId": "ec57fba8-8cc9-4080-b47f-ecd3b7524e7a",
+  "modelName": "qwen-image-rs-residual-norm-fusion",
+  "modelType": "@magistr/issue-lifecycle",
+  "version": 1,
+  "contentType": "application/json",
+  "lifetime": "infinite",
+  "garbageCollection": 20,
+  "streaming": false,
+  "tags": {
+    "type": "resource",
+    "specName": "attestation",
+    "modelName": "qwen-image-rs-residual-norm-fusion",
+    "initiatedBy": "user:magistr"
+  },
+  "ownerDefinition": {
+    "ownerType": "model-method",
+    "ownerRef": "ec57fba8-8cc9-4080-b47f-ecd3b7524e7a"
+  },
+  "createdAt": "2026-10-01T19:58:53.896Z",
+  "size": 2484,
+  "checksum": "83c8a0f8a923d67eac7e3cbcc7ea09f4bf43f39688955c91739e6892076dd56e",
+  "contentPath": "../../.swamp/repos/c8eb7040-ad64-4e9e-9c47-e2d30504659e/dev-tmp-swamp/data/@magistr/issue-lifecycle/ec57fba8-8cc9-4080-b47f-ecd3b7524e7a/18da81dd5171e394b4d52837e0d6694621c38e26/1/raw",
+  "content": {
+    "attestationVersion": 1,
+    "issue": "Fuse the gated residual into the LayerNorm+AdaLN (norm_mod) that consumes it",
+    "commitSha": "18da81dd5171e394b4d52837e0d6694621c38e26",
+    "branch": "main",
+    "planVersion": 1,
+    "configChecksums": {
+      "Cargo.toml": "c994711a8b8e57b13afaface39455f61ad62c1645a0c4ca1333dd4ebfbdd59fc",
+      "agent-constraints/implementation-conventions.md": "5d7196119fb8c37ec4f49646dda6390f5a56517551a94f0d2873bd30993abf5a",
+      "agent-constraints/iteration-limits.md": "30b571660e94059d3c4036eaf8cc050058e3dcc19978e9579816db80c53237f9",
+      "agent-constraints/verification-controls.md": "9c48f9c338d52c336b4e339247851e310e82f5eef5114a138cb3af432b74eb21"
+    },
+    "controls": [
+      {
+        "name": "fmt",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh fmt",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 424,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "== fmt ==\n== local checks OK ==\n"
+      },
+      {
+        "name": "lint",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh clippy",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 630,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.45s\n"
+      },
+      {
+        "name": "check",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh check",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 508,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.39s\n"
+      },
+      {
+        "name": "test",
+        "command": "bash -c export PATH=$HOME/.cargo/bin:$PATH; export QIR_LOCAL_TARGET_DIR=$HOME/.cache/qwen-image-rs-target; scripts/check.sh test",
+        "status": "pass",
+        "exitCode": 0,
+        "durationMs": 789,
+        "runner": "local",
+        "required": true,
+        "stderrTail": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.33s\n     Running unittests src/lib.rs (/Users/mag1/.cache/qwen-image-rs-target/debug/deps/qwen_image_rs-a8488a9f861909c8)\n     Running unittests src/main.rs (/Users/mag1/.cache/qwen-image-rs-target/debug/deps/qwen_image_rs-a51df39266a840ad)\n   Doc-tests qwen_image_rs\n"
+      }
+    ],
+    "reviews": [
+      {
+        "reviewer": "review-code",
+        "verdict": "PASS",
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 2
+      },
+      {
+        "reviewer": "review-adversarial",
+        "verdict": "PASS",
+        "critical": 0,
+        "high": 0,
+        "medium": 1,
+        "low": 2
+      }
+    ],
+    "runner": "local",
+    "producedAt": "2026-10-01T19:58:53.889Z",
+    "producedBy": "navi.aopab.art",
+    "modelVersion": "2026.09.20.2"
+  }
+}
