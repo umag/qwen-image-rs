@@ -11,8 +11,12 @@ This product includes and builds upon third-party work:
   Qwen Research License (research-only) and must be obtained separately.
 
 - SageAttention (thu-ml), Apache License 2.0. The sm80 INT8-QK/FP16-PV fused
-  attention kernel and its headers are vendored under kernels/sage/vendor/
-  (the torch bindings were stripped). Upstream:
+  attention kernel, the sm89 SageAttention2 INT8-QK/FP8-PV kernel
+  (vendor/qattn/qk_int_sv_f8_sm89.cuh, from commit d1a57a5) and their headers
+  are vendored under kernels/sage/vendor/ (the torch bindings were stripped;
+  vendor/qattn/attn_utils.cuh carries one marked LOCAL PATCH, kNoFill ->
+  kFillZero). kernels/sage/sage2_ffi.cu reimplements upstream's per-thread
+  quantization (Triton) and FP8 V transpose/permute/quant in CUDA. Upstream:
   https://github.com/thu-ml/SageAttention
 
 - NVIDIA CUTLASS, used (not vendored) for the INT8 GEMM and its epilogue.

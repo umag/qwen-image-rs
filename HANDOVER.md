@@ -22,7 +22,11 @@ reference. ~36 commits. This doc = pick-up point for a fresh session.
 
 ## Status: DONE + heavily optimized (all accuracy-neutral vs oracle)
 End-to-end works: `generate --model <snapshot> --prompt "..." --out x.png`.
-**Recommended fast build: `--features convrot,sage,fusednorm`** (bf16 VAE is the
+**Fastest build: `--features convrot,sage,fusednorm,sage2`** (SageAttention2,
+dit-forward 0.999894 — FP8 P·V; `QIR_SAGE=1` in that binary = SageAttention v1,
+bit-identical to the build without `sage2`). **Most accurate fast build: `--features
+convrot,sage,fusednorm`** (0.999944) — which one is the default is a human call
+(see "SageAttention2" below). (bf16 VAE is the
 CUDA default; `--convrot --text-gguf <gguf> --vae-tile 32`). Oracle parity held
 at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 dB.
 
@@ -46,7 +50,8 @@ at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 d
 | fused RMSNorm×weight + gated residual | fusednorm | 0.27 |
 | BSHD-native attention (no transpose copies) | sage | 0.247 |
 | RoPE fused into the INT8 Q/K quantizer | sage | 0.2295 (A/B same session: 0.2336 → 0.2295, −1.8%) |
-| V born f16 in the ConvRot epilogue (no V cast) + sage partial-tile zero-fill | convrot,sage | **0.2266** (A/B same session: 0.2292 → 0.2266, −1.1%) |
+| V born f16 in the ConvRot epilogue (no V cast) + sage partial-tile zero-fill | convrot,sage | 0.2266 (A/B same session: 0.2292 → 0.2266, −1.1%) |
+| SageAttention2 sm89: INT8-QK per-thread + K smoothing, FP8-PV (fp32+fp16 accum) | sage2 | **0.2149** (A/B same binary/session, `QIR_SAGE=1` vs `2`: 0.2259 → 0.2149, −4.8%; dit-forward --convrot 0.999944 → 0.999894) |
 
 Plus (not per-step): bf16 VAE decode 1.57×; text encoder Q8_0 GGUF (resident
 VRAM); VAE tiling (constant decode memory); true CFG (`--guidance`/`--negative`,
@@ -97,7 +102,9 @@ impact/effort:
    (`qwen-image-rs-bf16-v-pv`, −1.1%: to_v's ConvRot epilogue stores f16).
 2. **VAE conv algorithm** (`im2col_bf16` ~10%). bf16 already; further needs
    implicit-GEMM / Winograd convs or a fused decoder — large.
-3. **Per-warp sage quant** (accuracy/speed refinement) + **SageAttention on
+3. ~~**Per-warp sage quant**~~ **DONE as SageAttention2** (`-sageattention2`,
+   per-thread INT8 + K smoothing + FP8 P·V, −4.8%; its 5 quant passes cost
+   ~4.7 ms/step — next attention-side lever). **SageAttention on
    attention-heavier configs** (condition images / higher res) where S² matters
    more — sage's win grows there.
 4. ~~**Convrot the remaining ≥256-dim bf16 linears**~~ **NEGATIVE — not worth it**
@@ -457,6 +464,71 @@ block, every step. nsys (10 steps): `cast_bf16_f16` 320 inst × 76 us = 24.4 ms 
   room). This is the known "convrot B=1 lands off-prompt at some seeds" issue;
   not caused by this change, still open.
 
+### SageAttention2 sm89 (DONE — `qwen-image-rs-sageattention2`, feature `sage2`)
+INT8 Q·K with **per-thread** scales + **K smoothing**, **FP8 e4m3 P·V** with
+per-channel V scales and fp32+fp16 two-level accumulation (thu-ml's sm89 default).
+- **Feature + runtime switch:** `sage2` (implies `sage`) compiles
+  `kernels/sage/sage2_ffi.cu` (own TU — the sm80/sm89 vendored kernels share
+  `PACK_SIZE_*` macro names). In a `sage2` build `QIR_SAGE` picks the attention
+  at run time: `2` (default) SA2 fp16-accum, `2f32` SA2 fp32-accum, `1` v1.
+  Parsed once in `sage2::attention_impl()` (unknown value = hard error), logged
+  once at info (`attention implementation attention=Sage2(F16)`). Why a runtime
+  switch on top of the feature: same-binary, same-session A/B with no rebuild,
+  and v1 stays a zero-cost fallback (`QIR_SAGE=1` output is BIT-IDENTICAL to
+  the pre-change build, convrot and not).
+- **Vendored:** only `vendor/qattn/qk_int_sv_f8_sm89.cuh` (upstream
+  `csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh` @ d1a57a5, torch include stripped). It
+  reuses the already-vendored `attn_utils.cuh`, so the **kFillZero LOCAL PATCH
+  covers its predicated Q/K loads**. Its V loads are UNPREDICATED (upstream
+  assumes padded V) — our V quant writes every padded column as 0, so no
+  stale/uninitialized bytes are ever read.
+- **Ours (upstream does these in Triton/torch):** `Sage2KSumPartialKernel`
+  (RoPE + per-256-token channel sums, fixed-order reduce → deterministic) →
+  `Sage2RopeQuantKernel<Key>` (RoPE − the call's key mean → per-thread INT8;
+  4 scales / 64-key block, group `(tok%8)/2`); `Sage2RopeQuantKernel<Query>`
+  (RoPE → per-thread INT8; 8 scales / 32-query warp block, group `tok%8`; grid
+  padded to `ceil(n/128)*4` blocks so every scale the kernel reads is written);
+  `Sage2VAmaxPartialKernel` + `Sage2VQuantKernel` (per-channel amax → FP8,
+  transposed to `(B,H,D,Lpad64)` with upstream's 16-token fp8-mma permute
+  `0,1,4,5,8,9,12,13,2,3,…`; amax floored at 1e-7 — upstream's MeanScaleKernel
+  NaNs on an all-zero channel). Group mappings are derived from the mma fragment
+  layout (rows `lane/4+8j`, cols `2*(lane%4)+8j`) = upstream `quant_per_thread.py`.
+- **Rust (`src/sage2.rs`):** VOs `Sage2Qk` (int8 + per-thread scales + Key
+  scratch, one U8 alloc) and `Sage2V` (fp8 + per-channel scales + scratch,
+  **carries its `PvAccum`** — the attention takes the accumulation mode from V,
+  so V's scale_max (2.25 fp16-accum / 448 fp32) can never mismatch the kernel).
+  Scratch lives in the result allocation (outlives the async kernels). Every
+  launcher returns `cudaGetLastError`; every op honors `start_offset` + strides.
+  `attend_block_causal` keeps v1's per-narrow structure (text causal on
+  `[0,txt)`, image queries over full k/v), so K is smoothed with each call's
+  own key mean. `dit.rs::attend_bshd` dispatches on `attention_impl()`.
+- **sage-test (new lines, exits nonzero on failure):** block-causal txt=37/S=293,
+  B=1,2, real-RoPE angles, per-channel K bias ×4, zeroed V channel + K head-dim:
+  vs f32 ref **cos 0.999373 (fp16 accum) / 0.999363 (fp32)** (v1 on the same
+  inputs 0.999615 — random Gaussian scores are diffuse, FP8 P dominates);
+  non-finite 0. B=2 lanes vs B=1 (lane 1 = nonzero batch offset) 0 mismatches;
+  S-offset views vs copies 0 (bytes + outputs); run-twice 0; NaN-poisoned smem
+  partial tile (txt=21) NaN 0, maxabs 0.
+- **dit-forward vs oracle:** `QIR_SAGE=2` --convrot **0.999894** (v1 0.999944),
+  no-convrot 0.999945 (v1 0.999965); `2f32` 0.999901 / 0.999943. vs the prior
+  build's output: SA2 0.999911 (convrot) / 0.999966 (no-convrot). Below the
+  0.99993 standing gate, above the ~0.9995 stop line → shipped behind the
+  feature/selector; default-path choice left to the human.
+- **Speed (batch --resident, 2 prompts × 40 steps, 2nd image, SAME binary, two
+  interleaved rounds):** v1 9031 / 9041 ms → SA2 8590 / 8605 ms = **0.2259 →
+  0.2149 s/step (−4.8%)**; `2f32` 8761 ms (−3.0%). nsys (10 steps): image
+  attention kernel **1.035 → 0.553 ms/call (1.87×), 331 → 177 ms**; quant side
+  v1 `RopeQuantInt8Kernel` 34 ms → SA2 five kernels 81 ms (K-sum 16.5, K-quant
+  15.7, Q-quant 16.4, V-amax 16.1, V-quant 16.6) — the extra ~4.7 ms/step of
+  bandwidth-bound passes eats a third of the attention win.
+- **Images:** B=1 mug (seed 42) and `--batch 2` both on-prompt; B=1 vs B=2 lane 0
+  latent cos 0.99963; SA2 vs v1 B=1 latent 0.99894, PSNR 32.0 dB (same image,
+  fine-detail drift). Lighthouse A/B image clean.
+- **Follow-ons:** the five quant passes are each ~50 us/layer at ~650 GB/s;
+  folding V-amax into the to_v ConvRot epilogue (per-column max) or merging the
+  K-sum/V-amax pre-passes into one launch would recover part of the 4.7 ms/step.
+  Per-warp Q (fewer scales) is not needed — per-thread already ships.
+
 ### Tail linears through ConvRot (`qwen-image-rs-convrot-tail-linears` — NEGATIVE RESULT, no code)
 Measured before building. nsys, 10-step trace, fast build (`convrot,sage,fusednorm`),
 denoise GPU busy 2301 ms (= 230 ms/step). The small-M bf16 GEMMs, attributed by grid:
@@ -598,6 +670,9 @@ attn: 4096 OK). ConvRotLinear input dim K = the linear's in_features.
   NaN-poisoned smem" (fills every SM's smem with f16 NaN first).
   compute-sanitizer memcheck/initcheck do NOT catch this (shared memory, and
   initcheck only tracks global memory) — poison shared memory to test for it.
+- **SA2 sm89 kernel loads V UNPREDICATED** (upstream assumes V padded to 64
+  tokens): whatever produces the FP8 V buffer must write every padded column
+  (ours writes 0). Q/K go through the patched `load_global_to_share` (kFillZero).
 - **Fused CUDA bridges MUST honor `Layout::start_offset`** (`qwen-image-rs-b1-off-prompt`).
   `CudaStorage::device_ptr` is the base of the ALLOCATION, not the view. candle's
   `contiguous()` is a no-op for any `is_contiguous` view and size-1 dims are skipped
@@ -657,7 +732,8 @@ Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-dequant-epilogue` (CUTLASS EVT), `-fused-rmsnorm-gate` (RMSNorm+gated residual),
 `-vae-bf16`, `-bshd-attention` (BSHD-native fused attention),
 `-rope-quant-fusion` (RoPE fused into the sage INT8 Q/K quantizer),
-`-bf16-v-pv` (V born f16 in the ConvRot epilogue + sage partial-tile zero-fill).
+`-bf16-v-pv` (V born f16 in the ConvRot epilogue + sage partial-tile zero-fill),
+`-sageattention2` (SA2 sm89 behind `sage2` + `QIR_SAGE`).
 Bugs (complete): `-b1-off-prompt` (B=1 generate ignored the prompt: fused bridges
 ignored the view offset — see Gotchas).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path

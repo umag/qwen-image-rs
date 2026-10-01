@@ -62,11 +62,17 @@ re-checked against the oracle before the next one.
 | Fused activation quantizer | `convrot` | 0.38 |
 | Dequant → CUTLASS EVT epilogue | `convrot` | 0.34 |
 | Fused RMSNorm×weight + gated residual | `fusednorm` | 0.27 |
-| BSHD-native attention (no transpose copies) | `sage` | **0.247** |
+| BSHD-native attention (no transpose copies) | `sage` | 0.247 |
+| RoPE fused into INT8 quant; V born f16 | `sage`,`convrot` | 0.2266 |
+| SageAttention2: INT8-QK per-thread + K smoothing / FP8-PV | `sage2` | **0.2149** (same-session A/B 0.2259 → 0.2149, −4.8%) |
 
 Plus: bf16 VAE decode (1.57×) and tiled decode (constant memory); batched
-multi-seed generation (`generate --batch N`, B=4 sweet spot). Recommended fast
-build: `--features convrot,sage,fusednorm`. Resident batch ≈ 11 s/image.
+multi-seed generation (`generate --batch N`, B=4 sweet spot). Most accurate fast
+build: `--features convrot,sage,fusednorm` (dit-forward vs oracle 0.999944).
+Fastest: add `sage2` (`convrot,sage,fusednorm,sage2`, dit-forward 0.999894 — FP8
+P·V); in a `sage2` build `QIR_SAGE=1` selects SageAttention v1 (bit-identical to
+the build without `sage2`), `QIR_SAGE=2f32` SA2 with fp32 P·V accumulation.
+Resident batch ≈ 11 s/image.
 
 See `docs/generate_standalone.png` and `docs/batch/` for samples.
 
@@ -83,7 +89,7 @@ qwen-image-rs generate --model <snapshot> \
   --prompt "a red ceramic coffee mug on a wooden table, soft morning light" \
   --steps 40 --seed 42 --out out.png
 ```
-Features: `cuda`, `cudnn`, `flash-attn`, `convrot`, `sage`, `fusednorm`. Default
+Features: `cuda`, `cudnn`, `flash-attn`, `convrot`, `sage`, `sage2`, `fusednorm`. Default
 build is CPU-only (macOS-safe).
 
 ## Weights
