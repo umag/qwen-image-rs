@@ -36,7 +36,7 @@ impl QLinear {
         #[cfg(feature = "convrot")]
         if convrot {
             if let Some(r) = rot {
-                if in_c % crate::model::rotation::GROUP == 0 {
+                if in_c.is_multiple_of(crate::model::rotation::GROUP) {
                     // Pre-quantized weights on disk (from `prequantize-convrot`):
                     // load the rotated INT8 weight + col scale directly, skipping
                     // the load-time rotate+quant. Detected by `weight_i8` next to
