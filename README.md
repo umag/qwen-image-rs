@@ -6,8 +6,8 @@ three model components are ported from scratch and validated against a diffusers
 oracle. The speed comes from a stack of custom CUDA kernels, each one chosen
 from an `nsys` profile and gated against that oracle before the next.
 
-**Denoise: 0.62 → 0.152 s/step (~4.1×) at 1024². VAE decode: 1.15 → 0.27 s.
-A resident pipeline renders a 1024² image every ~6.4 s.**
+**Denoise: 0.62 → 0.148 s/step (~4.2×) at 1024². VAE decode: 1.15 → 0.27 s.
+A resident pipeline renders a 1024² image every ~6.2 s.**
 
 Research build only. This repo ships **no weights**. The Qwen-Image-2.1 weights
 are under the **Qwen Research License** (research-only); see
@@ -27,7 +27,7 @@ guidance 1. Recommended build (`--features convrot,sage,fusednorm,sage2,cudnn`).
 | `generate`, 1 image, warm file cache | 18.1 s | 18.1 s | 13.8 GB |
 | `generate`, 1 image, cold file cache | 27.0 s | 27.0 s | 13.8 GB |
 | `generate --batch 4` (4 seeds, one denoise) | 38.2 s | 9.6 s | 13.8 GB |
-| `batch --resident`, 4 prompts | 38.3 s | **6.4 s steady** | 21.3 GB |
+| `batch --resident`, 4 prompts | 38.3 s | **6.2 s steady** (6.4 s before `-gemm-tiling-push`) | 21.3 GB |
 
 Where a warm single `generate` spends its 18.1 s:
 
@@ -35,22 +35,23 @@ Where a warm single `generate` spends its 18.1 s:
 |---|---|
 | process start + tokenizer + text encoder (8 GB Q8_0 GGUF) load + encode | 10.4 s |
 | DiT load (from the prequantized ConvRot cache) | 0.7 s |
-| denoise, 40 steps × 0.152 s | 6.1 s |
+| denoise, 40 steps × 0.148 s | 5.9 s |
 | VAE load + decode (incl. ~0.2 s first-call cuDNN warm-up) | 0.7 s |
 
 `batch --resident` keeps all three models loaded. Each image then costs encode
-24 ms + denoise 6.09 s + decode 0.27 s. Model loading is paid once.
+24 ms + denoise 5.91 s + decode 0.27 s (6.20 s; same-session A/B before the GEMM
+tiling push: 6.39 s). Model loading is paid once.
 
 `generate --batch N` is **throughput-neutral**: 0.616 s/step for 4 lanes is
 0.154 s/step per image, the same as one image. The INT8 GEMMs already saturate
 the GPU at B=1. Batching saves the per-process load and gives an SDXL-style seed
 grid. B=4 is the efficient limit on 24 GB; from B=5 each image costs more.
 
-### Inside one denoise step (~152 ms, `nsys`, B=1)
+### Inside one denoise step (~148 ms, `nsys`, B=1)
 
 | Kernel | ms/step | Share | Note |
 |---|---|---|---|
-| INT8 GEMMs (CUTLASS, dequant in the epilogue) | ~100 | 66% | 440–510 of ~660 INT8 TOPS — near the roofline |
+| INT8 GEMMs (CUTLASS, dequant in the epilogue) | 95.6 | 65% | 580–610 of ~660 INT8 TOPS kernel time; row-split plans (`-gemm-tiling-push`, was 100.5) |
 | SageAttention2 (INT8 Q·K, FP8 P·V) | 18.7 | 12% | |
 | SwiGLU `silu(g)·p` + rotate + INT8 quant | 9.3 | 6% | one fused kernel |
 | gated residual + LayerNorm×(scale+1) | 7.8 | 5% | one fused kernel |
@@ -199,7 +200,8 @@ same-session A/B because absolute timings drift between sessions.
 | SwiGLU fused into the MLP-out rotate+quant | `convrot` | 0.1746 |
 | q\|k and gate\|proj merged GEMMs; per-shape CUTLASS tiles (bit-identical) | `convrot` | 0.1703 |
 | per-head q/k RMSNorm fused into the SA2 quant (bit-identical) | `fusednorm`,`sage2` | 0.1647 |
-| gated residual fused into the next LayerNorm+AdaLN (bit-identical) | `fusednorm` | **0.1522** |
+| gated residual fused into the next LayerNorm+AdaLN (bit-identical) | `fusednorm` | 0.1522 |
+| INT8 GEMM row-split plans: text rows past the 4096 image rows in their own small launch, 128x256 tiles (bit-identical) | `convrot` | **0.1477** (A/B 0.1524 → 0.1477, −3.1%; `--batch 2` −1.7%) |
 
 VAE decode (1024², bf16):
 
@@ -239,7 +241,9 @@ is in [HANDOVER.md](HANDOVER.md).
 | distilled / lightweight VAE decoder | ~4–6× decode | lossy; needs distillation for this 64-ch RGBA VAE |
 | CUDA graphs | launch overhead | blocked: candle 0.11 has no stream-capture hook |
 
-The INT8 GEMMs (66% of a step) and SageAttention2 are close to the 4090's limits.
+The INT8 GEMMs (65% of a step, ~90% of the INT8 peak in kernel time) and
+SageAttention2 are close to the 4090's limits. cuBLASLt IMMA is no faster at
+these shapes and cannot fuse the per-row × per-col dequant (see HANDOVER "GEMM tiling push").
 From here, denoise gains come in single-digit percent.
 
 ---

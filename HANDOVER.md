@@ -60,7 +60,8 @@ at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 d
 | SwiGLU `silu(g)·p` fused into the MLP-out rotate+quantize (f32; no bf16 h, no usilu/bmul passes) | convrot | 0.1746 (A/B same session: 0.1905 → 0.1746, −8.4%; dit-forward --convrot SA2 0.999879 → 0.999911, v1 0.999900 → 0.999881, chaos) |
 | q\|k (head-interleaved) and gate\|proj merged GEMMs, v on the shared activation quant, per-shape CUTLASS tile/swizzle | convrot | 0.1703 (A/B same session: 0.1750 → 0.1703, −2.7%; `--batch 2` 0.3555 → 0.3374, −5.1%; byte-identical output) |
 | per-head q/k RMSNorm: 16-lane N=128 kernel (3.1× faster) + fused into the SA2 Q/K/K-sum quant (normalized q/k never written), byte-identical | fusednorm,sage2 | 0.1647 (A/B same session: 0.1769 → 0.1647, −6.9%; `--batch 2` 0.3492 → 0.3252, −6.9%; byte-identical output) |
-| gated residual fused into the following LayerNorm+AdaLN (one CTA-per-row kernel writes h' and x), gate/scale read as the 2 modulation rows, byte-identical | fusednorm | **0.1522** (A/B same session: 0.1587 → 0.1522, −4.1%; `--batch 2` 0.3161 → 0.3021, −4.5%; byte-identical output) |
+| gated residual fused into the following LayerNorm+AdaLN (one CTA-per-row kernel writes h' and x), gate/scale read as the 2 modulation rows, byte-identical | fusednorm | 0.1522 (A/B same session: 0.1587 → 0.1522, −4.1%; `--batch 2` 0.3161 → 0.3021, −4.5%; byte-identical output) |
+| INT8 GEMM row-split launch plans (text rows past the 4096 image rows in a small 64x64 launch; 128x256 heads / gate\|proj), byte-identical | convrot | **0.1477** (A/B same session: 0.1524 → 0.1477, −3.1%; `--batch 2` 0.3034 → 0.2983, −1.7%; INT8 GEMM 100.5 → 95.6 ms/step nsys) |
 
 Plus (not per-step): bf16 VAE decode 1.57×; text encoder Q8_0 GGUF (resident
 VRAM); VAE tiling (constant decode memory); true CFG (`--guidance`/`--negative`,
@@ -114,7 +115,8 @@ once per image) is now ~16 % of a 40-step image. Ranked levers:
    kernel writes h' + per-row (mean, rstd), a NormModRow loader rebuilds x in registers
    → ~1.9 ms x write + ~0.7 ms PlainRow L2 loss ≈ 2.6 ms/step (~1.7 %); needs a lazy
    "normed activation" through Attention::project and SwiGlu (see section).
-4. INT8 GEMMs / SA2 attention are at the 4090 roofline (440–510 TOPS); Sage2Quant 6.8 ms.
+4. INT8 GEMMs / SA2 attention are at the 4090 roofline (580–610 INT8 TOPS kernel time after
+   `-gemm-tiling-push`, 95.6 ms/step; stream-K, split-K, cuBLASLt rejected there); Sage2Quant 6.8 ms.
 
 **Previous (after `-qk-norm-fusion`):**
 **Latest (after `-qk-norm-fusion`, 10-step generate, per denoise step):** INT8 GEMMs
@@ -288,6 +290,76 @@ policy tag are unchanged, no rebuild; warm DiT load unchanged ~0.97 s):
   silu(g) and the product, so it is now ±2 / 2^-7 (the f64 bound is unchanged).
 - Not done: q|k|v as one GEMM (V's f16 epilogue; see above); split-K (no shape
   needs it at these M; determinism kept by construction).
+
+### GEMM tiling push (DONE — `qwen-image-rs-gemm-tiling-push`, byte-identical)
+The INT8 EVT GEMMs were 100.5 ms of a ~152 ms step (nsys GPU time). The loss was
+**wave quantization from the text rows**: M = txt + 4096, so a 128-row tiling has
+a 33rd, nearly empty M-tile row (4117 = 32·128 + 21). For N = 4096 that is
+33·32 = 1056 CTAs = 4.125 waves on 128 SMs × 2 CTAs — one extra partial wave
+(~20% of the kernel) for ≤ 1% of the rows.
+- **Fix: a launch plan** (`src/gemm_tiles.rs`: `GemmPlan { main, tail }`,
+  `segments(m)`, `gemm_plan(M, N, K)`). The bridge (`Int8GemmDequant`) runs each
+  segment as its own launch over a row range (pointer offsets on A, s_row, D;
+  same per-element math). N = 4096-class GEMMs (to_v f16, to_out, MLP out
+  K = 12288) run the full 128-row tiles on **128x256 swizzle 4** (exact waves:
+  32·16 = 512 CTAs, 1 CTA/SM) and the < 128 text rows on **64x64 6-stage**.
+  gate|proj (N = 24576) does NOT split (the tail launch re-reads the 100 MB
+  weight, measured a loss): **128x256 4-stage** at B = 1, swizzle 4 at B ≥ 2.
+  q|k (N = 8192): 128x128 swizzle 4 (every config within ~1%). Tails (M = 2,
+  N = 64): 64x64 6-stage (≥ the old 64x128). Below M = 4096 the original
+  128x128 stays (unmeasured domain). 5 compiled configs (was 4).
+- **GPU time per step (nsys, 10-step generate, B = 1, M = 4117):**
+
+  | GEMM (M=4117) | n/step | before µs | after µs (head + tail) | TOPS after |
+  |---|---|---|---|---|
+  | gate\|proj N=24576 K=4096 | 32 | 1389 | 1359 | 610 |
+  | q\|k N=8192 K=4096 | 32 | 479 | 468 | 590 |
+  | to_out + MLP out N=4096 (K=4096 / 12288, avg) | 64 | 506 | 424 + 32 | — |
+  | to_v N=4096 f16 | 32 | 254 | 226 + 13 | 579 |
+  | total INT8 GEMM | | **100.5 ms/step** | **95.6 ms/step** (−4.9%) | |
+
+- **Speed (same session, interleaved, 2 rounds):** `batch --resident`, 4 prompts,
+  40 steps, steady images 1..3: denoise **6097 → 5909 ms (0.1524 → 0.1477 s/step,
+  −3.1%)**, per image (enc + denoise + decode) **6392 → 6202 ms**; `generate
+  --batch 2` steps 10..39: **0.3034 → 0.2983 s/step (−1.7%)**.
+- **Byte-identical:** dit-forward `cmp` identical to the prior build for
+  QIR_SAGE=2 / 2f32 / 1 and no-convrot (0.999911 / 0.999890 / 0.999881 /
+  0.999945); B = 1 and `--batch 2` PNG md5 identical; B = 1 == lane 0.
+  `convrot-test` checks split vs single launch at M = 4117 / 4160 / 4223 / 8234
+  (tails 21 / 64 / 127 / 42 rows), bf16 and f16; `gemm-bench` checks every plan.
+- **`gemm-bench --txt N [--batch B]`** now times launch plans (every config
+  alone + `a+2` = config a with the tail split to config 2) at the real M. Its
+  numbers are WALL time (host launch + candle alloc + power cap): ~10–15% above
+  nsys kernel time, rank-preserving. Use nsys for absolute numbers.
+- **Tried and rejected (measured):**
+  - **Stream-K** (`ThreadblockSwizzleStreamK` with the EVT, CUTLASS's
+    `GemmWithEpilogueVisitorStreamk`): deterministic here — the default
+    `kMixed` strategy fixes up partials in a turnstile order and int32 partial
+    sums are exact anyway — but slower in every shape (128x128 SK 0.337 vs DP
+    0.313 ms at N = 4096; 128x256 SK 1.712 vs 1.591 at N = 24576).
+  - **Split-K serial:** the Sm80 EVT kernel asserts it unsupported
+    (`gemm_universal_with_visitor.h`); the K = 12288 GEMM gets its gain from the
+    row split instead (0.795 → 0.733 ms wall).
+  - 256x128 (s3/s4, raster 1/2), 128x256 raster 1/2, 128x128 s4, 2 epilogue
+    stages: all within ~1% of the chosen configs (or worse).
+  - **cuBLASLt IMMA** (`cublasLtMatmul`, s8·s8 → s32, heuristic top algos,
+    random data, cudaEvent GPU time; tool `gtp_cublaslt.cu`, not committed):
+    M = 4117 i32 out: N=4096 0.296, q|k 0.518, gate|proj 1.585, K=12288 0.775 ms
+    (heuristic picks 256x128 tile, 64x3 stages, no split-K). i8 out (1-byte
+    store) 0.278 / 0.489 / 1.357 / 0.757. **No bf16/f16 output for IMMA**
+    (heuristic returns NOT_SUPPORTED) and no per-row × per-col scale fusion, so
+    a switch would bring back the i32 intermediate + a dequant pass. Our
+    kernel time (in-model nsys: 1359 / 468 / ~456 µs) is below its i32 times on
+    every shape.
+  - **cutlass_profiler** (built for sm89 with only
+    `cutlass_tensorop_i16832gemm_s8_*_tn_align16`, 16 kernels, swizzle 1/2/4/8,
+    s32 col-major out): best at M = 4096 in our layout is 128x256_64x3 /
+    256x128_64x3 (N=4096 0.239, N=24576 1.611 ms) — the same tile family we
+    picked; the stock s32 epilogue writes 2× our bytes. The profiler only has
+    column-major-C int8 kernels and needs M aligned to 4 (M = 4117 → no rows).
+  - Power: the 4090 is SW-power-capped (480 W, ~2460 MHz) under sustained
+    INT8 GEMM; short bursts (profiler / cuBLAS events) run ~3–5% faster than a
+    sustained bench. Compare like with like (interleaved, same duration).
 
 ### Gated residual fused into the following LayerNorm+AdaLN (DONE — `qwen-image-rs-residual-norm-fusion`, byte-identical)
 Every gated residual `h' = h + tanh(gate)·y` in the DiT (2 per block) is consumed by a
@@ -1143,7 +1215,8 @@ Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-fused-swiglu` (SwiGLU silu·p fused into the MLP-out rotate+quantize, −8.4%),
 `-gemm-merge-tune` (q|k and gate|proj merged GEMMs + per-shape tile, byte-identical, −2.7% / −5.1% at B=2),
 `-qk-norm-fusion` (16-lane q/k RMSNorm kernel + norm fused into the SA2 quant, byte-identical, −6.9% / −6.9% at B=2),
-`-residual-norm-fusion` (gated residual fused into the following LayerNorm+AdaLN, modulation as 2 rows, byte-identical, −4.1% / −4.5% at B=2).
+`-residual-norm-fusion` (gated residual fused into the following LayerNorm+AdaLN, modulation as 2 rows, byte-identical, −4.1% / −4.5% at B=2),
+`-gemm-tiling-push` (INT8 GEMM row-split launch plans + 128x256 tiles, byte-identical, −3.1% / −1.7% at B=2; stream-K / split-K / cuBLASLt measured and rejected).
 Bugs (complete): `-b1-off-prompt` (B=1 generate ignored the prompt: fused bridges
 ignored the view offset — see Gotchas).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path
