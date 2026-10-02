@@ -185,7 +185,7 @@ Main `generate` / `batch` flags:
 | `--prompt` / `--prompts <file>` | — | one prompt / one prompt per line |
 | `--size` | 1024 | output side in pixels (multiple of 16) |
 | `--steps` | 40 | flow-match Euler steps |
-| `--seed` | 42 | noise seed; with `--batch N`, lanes use seed … seed+N−1 |
+| `--seed N\|random` | 42 (`generate`), random (`batch`) | `N`: image/lane i uses N+i. `random`: a fresh 64-bit seed per image. Every seed is logged and written to `<out-dir>/seeds.tsv` (file, seed, prompt); rerun with `--seed <n>` to reproduce an image byte for byte |
 | `--batch N` | 1 | N images in one batched denoise (`generate`); needs `--out-dir` when N>1 |
 | `--guidance` / `--negative` | 1.0 / "" | true CFG when > 1 (two DiT forwards per step) |
 | `--convrot` | off | INT8 DiT (ConvRot W8A8); loads/creates the prequantized cache |
