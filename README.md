@@ -7,7 +7,7 @@ oracle. The speed comes from a stack of custom CUDA kernels, each one chosen
 from an `nsys` profile and gated against that oracle before the next.
 
 **Denoise: 0.62 → 0.148 s/step (~4.2×) at 1024². VAE decode: 1.15 → 0.13 s
-(ComfyUI: 0.20 s). A resident pipeline renders a 1024² image every ~6.05 s.**
+(ComfyUI: 0.20 s). A resident pipeline renders a 1024² image every ~6.1 s.**
 
 Research build only. This repo ships **no weights**. The Qwen-Image-2.1 weights
 are under the **Qwen Research License** (research-only); see
@@ -17,34 +17,38 @@ are under the **Qwen Research License** (research-only); see
 
 ## Performance
 
-Measured 2026-10-02 on HEAD, RTX 4090 24 GB, WSL2, CUDA 13.3, 1024², 40 steps,
-guidance 1. Recommended build (`--features convrot,sage,fusednorm,sage2,cudnn`).
+Measured 2026-10-02 on HEAD (`65e5e7f`), RTX 4090 24 GB, WSL2, CUDA 13.3, 1024²,
+40 steps, guidance 1. Recommended build
+(`--features convrot,sage,fusednorm,sage2,cudnn`).
 
 ### End to end
 
-| Mode | Wall time | Per image | Peak VRAM |
+| Mode | Wall time | Per image | Peak VRAM* |
 |---|---|---|---|
-| `generate`, 1 image, warm file cache | 18.1 s | 18.1 s | 13.8 GB |
-| `generate`, 1 image, cold file cache | 27.0 s | 27.0 s | 13.8 GB |
-| `generate --batch 4` (4 seeds, one denoise) | 38.2 s | 9.6 s | 13.8 GB |
-| `batch --resident`, 4 prompts | 38.3 s (before `-vae-nhwc`) | **6.05 s steady** (6.35 s before `-vae-nhwc`, same session) | 21.3 GB |
+| **`batch --resident`, 4 prompts (intended mode)** | 37.4 s | **6.07 s steady** | 20.2 GB |
+| `generate --batch 4` (4 seeds, one denoise) | 36.6 s | 9.2 s | 12.9 GB |
+| `generate`, 1 image, warm file cache | 18.3–18.7 s | 18.3 s | 12.9 GB |
+| `generate`, 1 image, cold file cache | 27.0 s† | 27.0 s | — |
 
-Where a warm single `generate` spends its 18.1 s:
+\*nvidia-smi peak, including ~0.6 GB idle desktop. †Measured before
+`-vae-nhwc`; a cold start is dominated by reading ~15 GB of weights from disk.
+
+`batch --resident` keeps all three models loaded. A steady image costs
+**encode 22 ms + denoise 5.92 s + decode 0.135 s**: the GPU is busy ~97% of it,
+95% of that in the denoise. Model loading (~12 s, mostly the 8 GB text-encoder
+GGUF) is paid once.
+
+Where a warm single `generate` spends its ~18.3 s:
 
 | Phase | Time |
 |---|---|
-| process start + tokenizer + text encoder (8 GB Q8_0 GGUF) load + encode | 10.4 s |
-| DiT load (from the prequantized ConvRot cache) | 0.7 s |
+| process start + tokenizer + text encoder (8 GB Q8_0 GGUF) load + encode | ~11 s |
+| DiT load (from the prequantized ConvRot cache) | 0.8 s |
 | denoise, 40 steps × 0.148 s | 5.9 s |
-| VAE load + decode (decode 0.24 s incl. first-call cuDNN warm-up; 0.46 s before `-vae-nhwc`) | ~0.5 s |
+| VAE load + decode (decode 0.23 s incl. first-call cuDNN warm-up) | ~0.5 s |
 
-`batch --resident` keeps all three models loaded. Each image then costs encode
-24 ms + denoise 5.89 s + decode 0.14 s (6.05 s; same-session A/B before
-`-vae-nhwc`: 25 ms + 6.03 s + 0.28 s = 6.35 s — the denoise gain is the retained
-CUDA memory pool, see below). Model loading is paid once.
-
-`generate --batch N` is **throughput-neutral**: 0.616 s/step for 4 lanes is
-0.154 s/step per image, the same as one image. The INT8 GEMMs already saturate
+`generate --batch N` is **throughput-neutral**: 0.593 s/step for 4 lanes is
+0.148 s/step per image, the same as one image. The INT8 GEMMs already saturate
 the GPU at B=1. Batching saves the per-process load and gives an SDXL-style seed
 grid. B=4 is the efficient limit on 24 GB; from B=5 each image costs more.
 
@@ -101,7 +105,8 @@ and caveats: [docs/TENSORRT.md](docs/TENSORRT.md).
 
 | Stack | s/step | per image | GPU memory | vs ours (step / image) |
 |---|---|---|---|---|
-| **qwen-image-rs** `batch --resident` | **0.147** | **6.20 s** | 19.2 GB | 1.00× |
+| **qwen-image-rs** HEAD (`-vae-nhwc`, measured later on the same host) | **0.148** | **6.07 s** | 19.6 GB | — |
+| qwen-image-rs `batch --resident`, same session as ComfyUI (before `-vae-nhwc`) | 0.147 | 6.20 s | 19.2 GB | 1.00× |
 | ComfyUI INT8 ConvRot + `--use-sage-attention --fast --disable-dynamic-vram` (best) | 0.156 | 6.94 s | 21.4 GB | 1.06× / 1.12× slower |
 | ComfyUI INT8 ConvRot + `--use-sage-attention` | 0.156 | 7.24 s | 16.3 GB | 1.06× / 1.17× |
 | ComfyUI official template (INT8 ConvRot, SDPA) | 0.182 | 8.25 s | 16.3 GB | 1.24× / 1.33× |
@@ -111,12 +116,13 @@ and caveats: [docs/TENSORRT.md](docs/TENSORRT.md).
 | *ComfyUI Viggle turbo, 6 steps (distilled; not comparable)* | *0.144* | *1.84 s* | *17.0 GB* | |
 
 ComfyUI runs the same INT8 ConvRot recipe in NVIDIA's comfy-kitchen kernels
-and comes within 6% per step. Our per-image lead is mostly text encode (25 ms
-vs ~200 ms). ComfyUI decoded the VAE faster in this table (0.20 vs 0.27 s);
-since `-vae-nhwc` our decode is 0.13 s (resident 0.14 s, per image 6.05 s), so
-ComfyUI's lead there is gone. ComfyUI uses less VRAM in its default mode. `--fast` does nothing for this model. Eager fp8 is
-cast back to bf16. `torch.compile` fails on the INT8 path. No NVIDIA FP8 or
-Nunchaku 2.1 checkpoint runs in ComfyUI. Method and caveats:
+and comes within 6% per step. Per image, current HEAD is **1.14× faster** than
+ComfyUI's best (6.07 vs 6.94 s): text encode 22 ms vs ~200 ms, VAE decode
+0.135 vs 0.20 s (ComfyUI was ahead on the VAE until `-vae-nhwc`), plus less
+executor overhead. ComfyUI uses less VRAM in its default mode (16.3 GB) and can
+stream weights from RAM (DynamicVRAM). `--fast` does nothing for this model.
+Eager fp8 is cast back to bf16. `torch.compile` fails on the INT8 path. No
+NVIDIA FP8 or Nunchaku 2.1 checkpoint runs in ComfyUI on Ada. Method and caveats:
 [docs/COMFYUI.md](docs/COMFYUI.md).
 
 ---
@@ -147,7 +153,7 @@ qwen-image-rs generate --model weights/qwen-image-2.1 --prompt "..." \
   --convrot --text-gguf weights/qwen-image-2.1/qir/qir-text.gguf \
   --batch 4 --seed 42 --out-dir grid/          # writes 000.png..003.png (seeds 42..45)
 
-# 7. many prompts, models loaded once (~6.4 s/image)
+# 7. many prompts, models loaded once (~6.1 s/image)
 qwen-image-rs batch --model weights/qwen-image-2.1 --prompts prompts.txt \
   --resident --convrot --text-gguf weights/qwen-image-2.1/qir/qir-text.gguf \
   --out-dir out/
@@ -280,16 +286,19 @@ is in [HANDOVER.md](HANDOVER.md).
 
 | Lever | Expected gain | Note |
 |---|---|---|
-| text encoder load (single-shot `generate`) | up to ~8 s per process | 10.4 s of an 18 s run is loading the 8 GB GGUF; resident mode already avoids it |
+| text encoder load (single-shot `generate` only) | up to ~8 s per process | ~11 s of an ~18 s run is loading the 8 GB GGUF; resident mode (the intended one) already avoids it |
 | SwiGLU in the gate\|proj GEMM epilogue | ~3% denoise | large CUTLASS epilogue work |
 | LayerNorm folded into the activation quant loader | ~1.7% denoise | plumbing through three code paths |
-| distilled / lightweight VAE decoder | ~4–6× decode | lossy; needs distillation for this 64-ch RGBA VAE |
+| distilled / lightweight VAE decoder | ≤ ~2% per image | decode is now 0.135 s of a 6.07 s image; lossy, needs distillation for this 64-ch RGBA VAE |
 | CUDA graphs | launch overhead | blocked: candle 0.11 has no stream-capture hook |
 
 The INT8 GEMMs (65% of a step, ~90% of the INT8 peak in kernel time) and
 SageAttention2 are close to the 4090's limits. cuBLASLt IMMA is no faster at
 these shapes and cannot fuse the per-row × per-col dequant (see HANDOVER "GEMM tiling push").
-From here, denoise gains come in single-digit percent.
+From here, denoise gains come in single-digit percent. In resident mode a 1024²
+image is ~97% GPU-busy and ~97% of that is the 40-step denoise, so the remaining
+big multipliers change the model or its numerics: 4-bit W4A4 GEMMs (Ada's INT4
+tensor cores, ~2× the INT8 peak) or fewer steps (a distilled few-step model).
 
 ---
 
