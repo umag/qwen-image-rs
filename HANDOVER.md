@@ -34,7 +34,8 @@ at **dit-forward cos 0.999935** through every optimization; VAE decode 53–55 d
 ### Speed today (1024², RTX 4090, measured 2026-09-21)
 - **Denoise: 0.247 s/step** (was bf16+flash 0.62) — **~2.5×**. VAE tiled bf16
   decode **1.19 s** (was f32 1.84). [2026-10-01 VAE series: decode 0.27 s resident
-  (cuDNN + fused norm + auto whole-image) — see the last three sections.]
+  (cuDNN + fused norm + auto whole-image); 2026-10-02 `-vae-nhwc`: **0.133 s** whole,
+  0.136 s resident (ComfyUI 0.20 s) — see the last four sections.]
 - **Single `generate` (loads all 3 models each run): ~25 s** (40 steps); the
   ~14 s beyond compute is one-time model load (8 GB text GGUF mmap + DiT + VAE).
 - **`batch --resident` (models loaded once): ~11.1 s/image @40 steps** (enc
@@ -1218,6 +1219,8 @@ Optimizations (complete): `-fused-adaln` (LayerNorm+AdaLN), `-fused-actquant`,
 `-qk-norm-fusion` (16-lane q/k RMSNorm kernel + norm fused into the SA2 quant, byte-identical, −6.9% / −6.9% at B=2),
 `-residual-norm-fusion` (gated residual fused into the following LayerNorm+AdaLN, modulation as 2 rows, byte-identical, −4.1% / −4.5% at B=2),
 `-gemm-tiling-push` (INT8 GEMM row-split launch plans + 128x256 tiles, byte-identical, −3.1% / −1.7% at B=2; stream-K / split-K / cuBLASLt measured and rejected).
+VAE series (complete): `-vae-cudnn`, `-vae-fused-norm`, `-vae-untiled`, `-vae-nhwc` (NHWC decoder +
+retained CUDA pool: decode 0.28 → 0.133 s, resident 0.28 → 0.136 s, 65 dB vs prior, oracle unchanged).
 Bugs (complete): `-b1-off-prompt` (B=1 generate ignored the prompt: fused bridges
 ignored the view offset — see Gotchas).
 Non-code outcomes: `-reduce-copies` (complete, NEGATIVE — all fast-path
@@ -1319,3 +1322,60 @@ Each decode logs `vae decode (auto) need_mib free_mib mode`; generate now logs d
 - Bigger images (≥ ~1200² resident, 2048² anywhere near the models) fall back to tiles
   automatically; f32 / non-cudnn builds tile in resident mode (unit-tested decision).
 - Pixel-identical to the prior build at a fixed policy (`vae-decode` md5, dit-forward cmp).
+
+### VAE decoder NHWC end to end + retained CUDA pool (DONE — `qwen-image-rs-vae-nhwc`)
+Measured first (nsys, steady `vae-decode` iter, 1024² whole, HEAD 39c1454): wall 281 ms, GPU
+busy 228 ms. **85 ms of CPU time was `cuMemAllocAsync`** (267 calls, ~318 µs each): the default
+CUDA mempool has release threshold 0, so every stream sync hands freed memory back and each
+decode re-maps its multi-GB working set; the GPU idled ~53 ms waiting. GPU/iter: conv 115,
+cuDNN nchw↔nhwc transforms 30.5, candle `badd_bf16` (conv bias, strided-index kernel) 28.5,
+ucopy 23 (DupUp + attention transposes), upsample 10, norm 14, bias_residual 6.
+- **Pool retention (`src/device.rs`):** `retain_pool(dev, extra)` sets
+  `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = USED_MEM_CURRENT + extra` (only raised; `decode()` passes
+  its working-set estimate). The threshold counts ALL reserved memory — a first version set it
+  to the estimate alone and resident decodes stayed slow (282 → 180 ms) because the resident
+  weights already exceeded it. `pool_slack()` = RESERVED − USED, added to cuMemGetInfo free in
+  `decode_auto` (retained memory is reusable but not "free" to the driver). `QIR_POOL_RETAIN=0`
+  opts out. Side effect: the resident denoise also got faster (6.03 → 5.89 s/image same session)
+  because the DiT's per-step allocations now reuse retained memory.
+- **NHWC decoder (`ActLayout`, chosen at load: CUDA + bf16 + `cudnn` + `fusednorm`, none of
+  `QIR_CUDNN=0` / `QIR_VAE_FUSED=0` / `QIR_VAE_NHWC=0`):** conv filters reordered once to KRSC at
+  load; `cudnn_conv::conv2d_bf16_nhwc` uses NHWC tensor + filter descriptors (no transform
+  kernels; algo cache keyed by layout too). `decode()` permutes the tiny latent once and returns
+  a zero-copy `(B,4,H,W)` view of NHWC storage; `to_rgba_u8` permutes to HWC first so that view
+  needs no transpose copy. One forward per module — `Conv` / `RmsNorm` / helpers dispatch on the
+  layout. The NCHW path is byte-identical to before (md5) and stays the fallback.
+- **Every conv bias folded into the next fused kernel** (`kernels/fusednorm/vae_nhwc.cu`, same
+  bf16 roundings as candle): conv1's bias into norm2 (`vae_nhwc_rmsnorm_k<.., BIAS>`), conv2's
+  into the residual epilogue (with the shortcut conv's own pending bias: `bf16(bf16(y+b2) +
+  bf16(s+bsc))`), the upsampler conv's into a DupUp3D *gather* epilogue (no DupUp tensor; source
+  channel `((o*ft+ft-1)*2+i)*2+j) / repeats`, CPU-tested against `dup_up`), plain bias for the
+  rest. cudnnConvolutionBiasActivationForward was not used: it rounds once (changes math) and the
+  bias is free in kernels that read the tensor anyway.
+- **NHWC norm, byte-identical:** warp per pixel, 16-B loads. Split candle's leaf index
+  k = [g | j]: t = brev(j)·G + brev(g), so chunk g = channels with t mod G = brev(g), G = 32·VEC.
+  Lane L holds residues VEC·L+e; in-lane compile-time pairwise tree over j, then xor-16..1
+  butterfly (lane bits = the tree's lowest g levels), then the e bits high→low. CPU unit test
+  simulates this association vs candle's fast_sum for C ∈ {144…2048, odd} — bit-equal.
+- **Tests:** `vae-fused-test` now 123 cases, all bit-identical (NHWC norm ± bias ± SiLU, 4
+  epilogue modes, upsample, DupUp gather, offset views); `cudnn-test` NHWC vs NCHW bridge
+  bit-identical on 10 shapes incl. the VAE's 1x1 qkv/proj and 3x3 at 64². Host clippy clean.
+- **Results (same session, A/B vs HEAD binary):** `vae-decode` whole **265–300 → 133 ms** (00/01/02,
+  2.0–2.2×); tiled 32 **380 → 225 ms**; resident `batch` (4 prompts) decode **282 → 136 ms**
+  steady (first image 445 → 223), per image **6.35 → 6.05 s**; `generate` B=1 decode 455 → 244 ms;
+  `--batch 2` lane 0 937 → 285, lane 1 277 → 136. ComfyUI's decoder on the same card: 203 ms.
+- **GPU after (132 ms busy / 134 ms wall):** conv 110.5 · norm 9.4 · bias epilogues 8.4 ·
+  attention GEMMs+softmax 2.6 · upsample 1.5 · copies 1.4; cuMemAllocAsync 85 → 7.5 ms CPU.
+- **Quality:** vs oracle 00 56.39 / 01 51.79 / 02 56.09 dB (unchanged to 0.01), tiled 48.50;
+  vs the prior build 65.0 / 65.1 / 65.4 dB (maxabs 1–2 of 255; tiled 61.7) — in the decode
+  trace the mid-block attention's 1x1 convs run cuDNN's xmma implicit GEMM in NHWC where NCHW
+  ran a CUTLASS GEMM (`s16816gemm_relu`), a different f32 accumulation order; all norms,
+  epilogues, upsample and the 3x3 convs are bit-identical. Deterministic (md5 stable).
+  `QIR_VAE_NHWC=0`, `QIR_VAE_FUSED=0`, `QIR_CUDNN=0` md5-identical to the prior build.
+  dit-forward `--convrot` cmp-identical. Images clean (4 resident prompts, B=2, B=1, tiled).
+- **VRAM:** whole-decode peak above idle 4594 → 4210 MiB; resident peak 20.3 GB both;
+  `decode_bytes_per_pixel` left at 5 KiB (conservative); resident auto still picks whole
+  (need 5120 MiB vs free+slack 6.6–7.4 GB).
+- Left in the decoder: the conv math itself (~110 ms, already NHWC tensor-core implicit GEMM);
+  only a lighter/distilled decoder moves it.
+

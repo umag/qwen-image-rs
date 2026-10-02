@@ -6,8 +6,8 @@ three model components are ported from scratch and validated against a diffusers
 oracle. The speed comes from a stack of custom CUDA kernels, each one chosen
 from an `nsys` profile and gated against that oracle before the next.
 
-**Denoise: 0.62 → 0.148 s/step (~4.2×) at 1024². VAE decode: 1.15 → 0.27 s.
-A resident pipeline renders a 1024² image every ~6.2 s.**
+**Denoise: 0.62 → 0.148 s/step (~4.2×) at 1024². VAE decode: 1.15 → 0.13 s
+(ComfyUI: 0.20 s). A resident pipeline renders a 1024² image every ~6.05 s.**
 
 Research build only. This repo ships **no weights**. The Qwen-Image-2.1 weights
 are under the **Qwen Research License** (research-only); see
@@ -27,7 +27,7 @@ guidance 1. Recommended build (`--features convrot,sage,fusednorm,sage2,cudnn`).
 | `generate`, 1 image, warm file cache | 18.1 s | 18.1 s | 13.8 GB |
 | `generate`, 1 image, cold file cache | 27.0 s | 27.0 s | 13.8 GB |
 | `generate --batch 4` (4 seeds, one denoise) | 38.2 s | 9.6 s | 13.8 GB |
-| `batch --resident`, 4 prompts | 38.3 s | **6.2 s steady** (6.4 s before `-gemm-tiling-push`) | 21.3 GB |
+| `batch --resident`, 4 prompts | 38.3 s (before `-vae-nhwc`) | **6.05 s steady** (6.35 s before `-vae-nhwc`, same session) | 21.3 GB |
 
 Where a warm single `generate` spends its 18.1 s:
 
@@ -36,11 +36,12 @@ Where a warm single `generate` spends its 18.1 s:
 | process start + tokenizer + text encoder (8 GB Q8_0 GGUF) load + encode | 10.4 s |
 | DiT load (from the prequantized ConvRot cache) | 0.7 s |
 | denoise, 40 steps × 0.148 s | 5.9 s |
-| VAE load + decode (incl. ~0.2 s first-call cuDNN warm-up) | 0.7 s |
+| VAE load + decode (decode 0.24 s incl. first-call cuDNN warm-up; 0.46 s before `-vae-nhwc`) | ~0.5 s |
 
 `batch --resident` keeps all three models loaded. Each image then costs encode
-24 ms + denoise 5.91 s + decode 0.27 s (6.20 s; same-session A/B before the GEMM
-tiling push: 6.39 s). Model loading is paid once.
+24 ms + denoise 5.89 s + decode 0.14 s (6.05 s; same-session A/B before
+`-vae-nhwc`: 25 ms + 6.03 s + 0.28 s = 6.35 s — the denoise gain is the retained
+CUDA memory pool, see below). Model loading is paid once.
 
 `generate --batch N` is **throughput-neutral**: 0.616 s/step for 4 lanes is
 0.154 s/step per image, the same as one image. The INT8 GEMMs already saturate
@@ -59,11 +60,15 @@ grid. B=4 is the efficient limit on 24 GB; from B=5 each image costs more.
 | activation rotate + INT8 quant | 2.8 | 2% | |
 | copies / misc | ~6 | 4% | |
 
-### Inside one VAE decode (~0.27 s, 1024², bf16, whole image)
+### Inside one VAE decode (~0.133 s, 1024², bf16, whole image)
 
-cuDNN implicit-GEMM conv 108 ms · cuDNN NCHW↔NHWC transforms 31 ms · bias adds
-27 ms · fused channel RmsNorm(+SiLU) ~9 ms · fused bias+residual 6 ms · upsample
-9 ms · copies.
+The decoder runs channels-last (NHWC) end to end; GPU busy 132 ms of 134 ms wall:
+cuDNN implicit-GEMM conv 110 ms · fused channel RmsNorm(+SiLU, + the previous
+conv's bias) 9.4 ms · fused conv bias (+ residual / shortcut-conv bias / DupUp3D
+gather) 8.4 ms · attention (2 GEMMs + softmax) 2.6 ms · nearest 2x upsample
+1.5 ms · copies 1.4 ms. Before (0.28 s): conv 115 · cuDNN NCHW↔NHWC transforms
+31 · candle bias adds 28 · copies 23 · upsample 10 · norm 14 · bias+residual 6,
+and the GPU idled ~50 ms while the CPU re-mapped memory in `cuMemAllocAsync`.
 
 ### Quality (vs the diffusers bf16 oracle)
 
@@ -107,8 +112,9 @@ and caveats: [docs/TENSORRT.md](docs/TENSORRT.md).
 
 ComfyUI runs the same INT8 ConvRot recipe in NVIDIA's comfy-kitchen kernels
 and comes within 6% per step. Our per-image lead is mostly text encode (25 ms
-vs ~200 ms). ComfyUI decodes the VAE faster (0.20 vs 0.27 s) and uses less
-VRAM in its default mode. `--fast` does nothing for this model. Eager fp8 is
+vs ~200 ms). ComfyUI decoded the VAE faster in this table (0.20 vs 0.27 s);
+since `-vae-nhwc` our decode is 0.13 s (resident 0.14 s, per image 6.05 s), so
+ComfyUI's lead there is gone. ComfyUI uses less VRAM in its default mode. `--fast` does nothing for this model. Eager fp8 is
 cast back to bf16. `torch.compile` fails on the INT8 path. No NVIDIA FP8 or
 Nunchaku 2.1 checkpoint runs in ComfyUI. Method and caveats:
 [docs/COMFYUI.md](docs/COMFYUI.md).
@@ -193,6 +199,8 @@ Environment:
 | `QIR_CUDNN=0` | disable the cuDNN VAE conv (old im2col path, byte-identical to a non-`cudnn` build) |
 | `QIR_CUDNN_LIB` | cuDNN 9 lib dir at build time (default: the user-space wheel from `setup-host.sh`) |
 | `QIR_CONVROT_CACHE` | INT8 DiT cache root (default `$XDG_CACHE_HOME` or `~/.cache/qwen-image-rs/convrot`) |
+| `QIR_VAE_NHWC=0` | VAE decoder in NCHW (the pre-`-vae-nhwc` path, byte-identical to it) |
+| `QIR_POOL_RETAIN=0` | do not keep freed CUDA pool memory across syncs (slower VAE decodes) |
 | `QIR_VAE_FUSED`, `QIR_CUDNN_ALGO`, `QIR_CUDNN_DEBUG` | diagnostics |
 
 ### Cargo features
@@ -248,7 +256,8 @@ VAE decode (1024², bf16):
 | bf16 decoder | — | 0.95 s | 1.15 s (tiled) |
 | cuDNN tensor-core implicit-GEMM conv (no im2col buffer; peak 15.7 → 8.9 GB) | `cudnn` | 0.51 s | 0.68 s |
 | fused channel RmsNorm×γ(+SiLU), bias+residual in one pass (byte-identical) | `fusednorm` | **0.27 s** | 0.38 s |
-| `--vae-tile auto`: whole-image decode when it fits (no seams, 48.5 → 56.4 dB) | — | — | **0.27 s** |
+| `--vae-tile auto`: whole-image decode when it fits (no seams, 48.5 → 56.4 dB) | — | — | 0.27 s |
+| NHWC end to end (no cuDNN layout transforms; conv bias folded into the next fused kernel) + CUDA pool keeps freed memory across syncs (65 dB vs prior; oracle 56.4 dB unchanged) | `cudnn`,`fusednorm` | **0.133 s** (tiled 32: 0.38 → 0.225 s) | **0.136 s** |
 
 Other wins: text encoder as Q8_0 GGUF (resident VRAM), prequantized INT8 DiT
 cache (DiT load 7.0 → 2.7 s cold), batched multi-seed generation, true CFG.
@@ -274,7 +283,6 @@ is in [HANDOVER.md](HANDOVER.md).
 | text encoder load (single-shot `generate`) | up to ~8 s per process | 10.4 s of an 18 s run is loading the 8 GB GGUF; resident mode already avoids it |
 | SwiGLU in the gate\|proj GEMM epilogue | ~3% denoise | large CUTLASS epilogue work |
 | LayerNorm folded into the activation quant loader | ~1.7% denoise | plumbing through three code paths |
-| NHWC end to end in the VAE | ~50 ms/decode | removes cuDNN layout transforms, lets cuDNN fuse the bias |
 | distilled / lightweight VAE decoder | ~4–6× decode | lossy; needs distillation for this 64-ch RGBA VAE |
 | CUDA graphs | launch overhead | blocked: candle 0.11 has no stream-capture hook |
 

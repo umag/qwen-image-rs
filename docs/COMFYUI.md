@@ -110,7 +110,10 @@ ComfyUI node).
   from 0.37 to 0.20 s and its decode from 0.24 to 0.20 s. The remaining 0.74 s
   breaks down as: sampler node 6.35 s vs our denoise 5.89 s (+0.46 s), text
   encode 0.195 s vs 0.025 s (+0.17 s), executor/PNG overhead (~+0.18 s).
-  **ComfyUI wins the VAE decode**: 0.20 s against our 0.27 s (−0.07 s).
+  **ComfyUI won the VAE decode** here: 0.20 s against our 0.27 s (−0.07 s).
+  Since `qwen-image-rs-vae-nhwc` (after this table was measured) ours decodes
+  in **0.13 s** (resident 0.14 s, per image 6.35 → 6.05 s same session), so
+  the decode is now ours by 0.07 s. See "VAE decode" below.
 - **`--fast` does nothing for this model.** It enables fp16 accumulation,
   fp8 matmul, cuBLAS ops and autotune. INT8: 0.1561 → 0.1562 s/step. fp8:
   0.4186 → 0.4188.
@@ -167,8 +170,27 @@ not measure quality.
 - **~8–15× faster text encode** per prompt (25 ms vs 195–370 ms).
 - One static binary: no Python, no server. Same seed, byte-identical image.
 
-ComfyUI wins on: VAE decode (0.20 vs 0.27 s), VRAM in its default mode
-(16.3 vs 19.2 GB), the prefix cache, and features.
+ComfyUI wins on: VRAM in its default mode (16.3 vs 19.2 GB), the prefix
+cache, and features. (It won the VAE decode, 0.20 vs 0.27 s, until
+`-vae-nhwc`: ours is now 0.13 s.)
+
+### VAE decode (same 4090, 1024² latent, bf16, after `-vae-nhwc`)
+
+ComfyUI's decoder called directly (`first_stage_model.decode` on a resident
+GPU latent, 5 runs) against `vae-decode --iters 4`, both steady state:
+
+| | wall | GPU busy | conv | layout transforms | elementwise / other |
+|---|---|---|---|---|---|
+| ComfyUI (PyTorch 2, cuDNN 9.24) | 203 ms | 198 ms | 131 ms | 17 ms (cuDNN NCHW↔NHWC) | ~48 ms (F.normalize, SiLU, adds, upsample) |
+| qwen-image-rs, NHWC | **133 ms** | 132 ms | 110 ms | 0 | ~22 ms (fused norm, fused bias epilogues, upsample, attention) |
+
+ComfyUI does **not** run channels-last: its Qwen-Image-2.1 VAE
+(`comfy/ldm/wan/vae2_2.py`) calls `torch.cudnn_convolution` on NCHW tensors,
+so cuDNN wraps each conv in transform kernels, and runs each ResidualBlock in
+spatial strips (`strip_apply`, halo 2) to bound memory (1.98 GB peak
+allocated). Its edge was PyTorch's caching allocator: no time lost mapping
+memory. Ours lost ~50 ms per decode to `cuMemAllocAsync` until the CUDA pool
+was told to keep freed memory.
 
 ## Method
 
