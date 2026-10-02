@@ -75,3 +75,8 @@ Standing auth (2026-10-02, human: "push for better tiling, try optimisators"):
 `qwen-image-rs-gemm-tiling-push` — INT8 accumulation is exact, so every GEMM
 config change must be byte-identical (cmp dit-forward in all QIR_SAGE modes, PNG
 md5). Determinism required (no atomic / non-deterministic split-K reductions).
+
+Standing auth (2026-10-02, human: "lets do nhwc"): `qwen-image-rs-vae-nhwc` —
+VAE decode series gate applies (PSNR vs oracle >= ~50 dB, vs prior build >= ~50 dB
+when conv algorithms/accumulation change, byte-identical where math is unchanged,
+images clean, DiT path cmp-identical). Target: beat ComfyUI's 0.20 s decode.
