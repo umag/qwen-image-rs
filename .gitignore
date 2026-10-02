@@ -18,3 +18,10 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# TensorRT bench artifacts (bench/tensorrt) live on the GPU host only.
+*.onnx
+*.onnx_data
+*.plan
+*.engine
+timing.cache

@@ -76,6 +76,22 @@ cuDNN implicit-GEMM conv 108 ms · cuDNN NCHW↔NHWC transforms 31 ms · bias ad
 | VAE decode | PSNR 56.4 dB |
 | Determinism | same seed → byte-identical image; `--batch` lane 0 == the single image |
 
+### vs TensorRT / PyTorch (one DiT forward, 1024², B=1, same session)
+
+| Engine | s/forward | vs ours | cosine vs oracle |
+|---|---|---|---|
+| **qwen-image-rs** (INT8 ConvRot + SageAttention2) | **0.148** | 1.00× | 0.999911 |
+| TensorRT 11.3 INT8 SmoothQuant (ModelOpt, α=0.8) | 0.216 | 1.46× slower | 0.998214 |
+| TensorRT FP8 linears + FP8 attention (ModelOpt) | 0.253 | 1.72× | 0.999624 |
+| TensorRT FP8 linears | 0.265 | 1.80× | 0.999699 |
+| TensorRT bf16 | 0.428 | 2.90× | 0.999988 |
+| `torch.compile` max-autotune, bf16 | 0.428 | 2.90× | 0.999983 |
+| diffusers eager, bf16 | 0.506 | 3.43× | 1.000000 |
+
+TensorRT on Ada refuses our INT8-GEMM + FP8-attention mix, and its static
+per-tensor INT8 loses quality that ConvRot keeps. Method, per-kernel breakdown
+and caveats: [docs/TENSORRT.md](docs/TENSORRT.md).
+
 ---
 
 ## Quick start
