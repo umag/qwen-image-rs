@@ -92,6 +92,27 @@ TensorRT on Ada refuses our INT8-GEMM + FP8-attention mix, and its static
 per-tensor INT8 loses quality that ConvRot keeps. Method, per-kernel breakdown
 and caveats: [docs/TENSORRT.md](docs/TENSORRT.md).
 
+### vs ComfyUI (full t2i, 1024², 40 steps, cfg 1, models resident, same session)
+
+| Stack | s/step | per image | GPU memory | vs ours (step / image) |
+|---|---|---|---|---|
+| **qwen-image-rs** `batch --resident` | **0.147** | **6.20 s** | 19.2 GB | 1.00× |
+| ComfyUI INT8 ConvRot + `--use-sage-attention --fast --disable-dynamic-vram` (best) | 0.156 | 6.94 s | 21.4 GB | 1.06× / 1.12× slower |
+| ComfyUI INT8 ConvRot + `--use-sage-attention` | 0.156 | 7.24 s | 16.3 GB | 1.06× / 1.17× |
+| ComfyUI official template (INT8 ConvRot, SDPA) | 0.182 | 8.25 s | 16.3 GB | 1.24× / 1.33× |
+| ComfyUI fp8 + sage + `--fast` + `TorchCompileModel` | 0.243 | 10.62 s | 22.3 GB | 1.65× / 1.71× |
+| ComfyUI fp8 + sage + `--fast` (eager) | 0.419 | 17.79 s | 16.8 GB | 2.85× / 2.87× |
+| ComfyUI stock bf16 | 0.419 | 19.54 s | 21.8 GB | 2.85× / 3.15× |
+| *ComfyUI Viggle turbo, 6 steps (distilled; not comparable)* | *0.144* | *1.84 s* | *17.0 GB* | |
+
+ComfyUI runs the same INT8 ConvRot recipe in NVIDIA's comfy-kitchen kernels
+and comes within 6% per step. Our per-image lead is mostly text encode (25 ms
+vs ~200 ms). ComfyUI decodes the VAE faster (0.20 vs 0.27 s) and uses less
+VRAM in its default mode. `--fast` does nothing for this model. Eager fp8 is
+cast back to bf16. `torch.compile` fails on the INT8 path. No NVIDIA FP8 or
+Nunchaku 2.1 checkpoint runs in ComfyUI. Method and caveats:
+[docs/COMFYUI.md](docs/COMFYUI.md).
+
 ---
 
 ## Quick start
