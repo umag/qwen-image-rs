@@ -100,8 +100,10 @@ enum Command {
         size: usize,
         #[arg(long, default_value_t = 40)]
         steps: usize,
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
+        /// Noise seed: a number (with --batch N, lanes use seed..seed+N-1) or
+        /// `random` (a fresh seed per image, printed + written to seeds.tsv).
+        #[arg(long, default_value = "42")]
+        seed: qwen_image_rs::seed::Seed,
         /// Quantize the DiT block linears to Q8_0 (GGUF) — lower VRAM.
         #[arg(long)]
         quant: bool,
@@ -161,8 +163,10 @@ enum Command {
         size: usize,
         #[arg(long, default_value_t = 40)]
         steps: usize,
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
+        /// Noise seed: `random` (default — a fresh seed per prompt, printed and
+        /// written to <out-dir>/seeds.tsv) or a number (prompt i uses seed+i).
+        #[arg(long, default_value = "random")]
+        seed: qwen_image_rs::seed::Seed,
         #[arg(long)]
         quant: bool,
         /// ConvRot W8A8 INT8 for the DiT attn/MLP linears (`convrot` feature).
@@ -531,7 +535,7 @@ fn generate(
     prompt: &str,
     size: usize,
     steps: usize,
-    seed: u64,
+    seed: qwen_image_rs::seed::Seed,
     quant: bool,
     convrot: bool,
     cache: &qwen_image_rs::convrot_cache::CacheSpec,
@@ -563,6 +567,11 @@ fn generate(
     if batch > 1 && out.is_some() {
         tracing::warn!("--out ignored for --batch > 1 (writing --out-dir/NNN.png)");
     }
+    // One concrete seed per lane (`--seed N` -> N, N+1, ...; `--seed random` ->
+    // a fresh seed each), reported per image and in seeds.tsv for --batch > 1.
+    let seeds = seed.resolve(batch);
+    let mut manifest: Vec<(String, u64, String)> = Vec::with_capacity(batch);
+    tracing::info!(seed = %seed, ?seeds, "seeds");
     use qwen_image_rs::model::dit::QwenImageDit;
     use qwen_image_rs::model::scheduler::{FlowConfig, FlowMatchEuler};
     use qwen_image_rs::model::text_encoder::prompt as tmpl;
@@ -656,8 +665,8 @@ fn generate(
         // GEMM tiling); that divergence is intended (see HANDOVER). Do NOT
         // collapse this into a single set_seed + N draws.
         let mut lanes = Vec::with_capacity(batch);
-        for i in 0..batch {
-            dev.set_seed(seed.wrapping_add(i as u64))?;
+        for &lane_seed in &seeds {
+            dev.set_seed(lane_seed)?;
             lanes.push(Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?);
         }
         let mut latents = Tensor::cat(&lanes, 0)?.to_dtype(DType::F32)?; // (batch, img, 64)
@@ -702,7 +711,7 @@ fn generate(
             std::fs::create_dir_all(d)?;
         }
     }
-    for i in 0..batch {
+    for (i, &lane_seed) in seeds.iter().enumerate() {
         let li = latent.narrow(0, i, 1)?; // (1, img, 64)
         let z = vae::unpack_latents(&li, 64)?;
         let t_dec = std::time::Instant::now();
@@ -727,11 +736,18 @@ fn generate(
             m.insert("latent".to_string(), li.contiguous()?);
             candle_core::safetensors::save(&m, &lp)?;
         }
-        println!(
-            "wrote {} (seed {}, {w}x{h})",
-            path.display(),
-            seed.wrapping_add(i as u64)
-        );
+        println!("wrote {} (seed {}, {w}x{h})", path.display(), lane_seed);
+        manifest.push((
+            path.file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            lane_seed,
+            prompt.to_string(),
+        ));
+    }
+    if let (true, Some(d)) = (batch > 1, out_dir) {
+        let m = qwen_image_rs::seed::write_manifest(d, &manifest)?;
+        println!("seeds -> {}", m.display());
     }
     Ok(())
 }
@@ -745,7 +761,7 @@ fn batch(
     prompts_path: &std::path::Path,
     size: usize,
     steps: usize,
-    seed: u64,
+    seed: qwen_image_rs::seed::Seed,
     quant: bool,
     convrot: bool,
     cache: &qwen_image_rs::convrot_cache::CacheSpec,
@@ -785,6 +801,17 @@ fn batch(
         .filter(|l| !l.is_empty())
         .collect();
     tracing::info!(n = prompts.len(), "batch prompts");
+    // One concrete seed per prompt (`--seed random`, the default, draws a fresh
+    // one each); written to <out-dir>/seeds.tsv so any image can be reproduced.
+    let seeds = seed.resolve(prompts.len());
+    std::fs::create_dir_all(out_dir)?;
+    let manifest: Vec<(String, u64, String)> = prompts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (format!("{i:03}.png"), seeds[i], p.clone()))
+        .collect();
+    let manifest_path = qwen_image_rs::seed::write_manifest(out_dir, &manifest)?;
+    tracing::info!(seed = %seed, path = %manifest_path.display(), "seeds");
 
     let tok = Tokenizer::from_file(model.join("processor/tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
@@ -865,7 +892,7 @@ fn batch(
             dev.synchronize()?;
             let enc_ms = t_enc.elapsed().as_millis();
             let t_dn = std::time::Instant::now();
-            dev.set_seed(seed + i as u64)?;
+            dev.set_seed(seeds[i])?;
             let mut latents =
                 Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?.to_dtype(DType::F32)?;
             for (si, t) in sched.timesteps().iter().enumerate() {
@@ -892,6 +919,7 @@ fn batch(
             save_png(&img, out_dir.join(format!("{i:03}.png")))?;
             tracing::info!(
                 image = i,
+                seed = seeds[i],
                 enc_ms,
                 denoise_ms = dn_ms,
                 decode_ms = dec_ms,
@@ -899,9 +927,10 @@ fn batch(
             );
         }
         println!(
-            "wrote {} images to {} (resident)",
+            "wrote {} images to {} (resident; seeds in {})",
             prompts.len(),
-            out_dir.display()
+            out_dir.display(),
+            manifest_path.display()
         );
         return Ok(());
     }
@@ -943,7 +972,7 @@ fn batch(
         )?;
         let sched = FlowMatchEuler::new(&FlowConfig::default(), steps, img_seq);
         for (i, emb) in embeds_list.iter().enumerate() {
-            dev.set_seed(seed + i as u64)?;
+            dev.set_seed(seeds[i])?;
             let mut latents =
                 Tensor::randn(0f32, 1f32, (1, img_seq, 64), &dev)?.to_dtype(DType::F32)?;
             for (si, t) in sched.timesteps().iter().enumerate() {
@@ -976,8 +1005,14 @@ fn batch(
         let z = vae::unpack_latents(lat, 64)?;
         let img = vmodel.decode_auto(&z, vae_tile)?;
         save_png(&img, out_dir.join(format!("{i:03}.png")))?;
+        tracing::info!(image = i, seed = seeds[i], "decoded");
     }
-    println!("wrote {} images to {}", prompts.len(), out_dir.display());
+    println!(
+        "wrote {} images to {} (seeds in {})",
+        prompts.len(),
+        out_dir.display(),
+        manifest_path.display()
+    );
     Ok(())
 }
 

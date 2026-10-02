@@ -29,6 +29,7 @@ pub mod rope;
 pub mod sage;
 #[cfg(feature = "sage2")]
 pub mod sage2;
+pub mod seed;
 #[cfg(feature = "fusednorm")]
 pub mod vae_fused;
 
