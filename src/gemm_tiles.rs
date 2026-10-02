@@ -31,11 +31,11 @@ const fn cfg(tb: (u16, u16, u16), warp: (u16, u16, u16), stages: u8, swizzle: u8
 pub const GEMM_CONFIGS: [TileConfig; 5] = [
     // 0: the original config; kept for shapes outside the measured domain.
     cfg((128, 128, 64), (64, 64, 64), 3, 1),
-    // 1: swizzled 128x128: merged q|k (N = 8192) at every B.
+    // 1: swizzled 128x128: merged q|k (N = 8192) at B <= 2.
     cfg((128, 128, 64), (64, 64, 64), 3, 4),
     // 2: small tiles: tail linears (M = 2 / txt, N = 64) and split tails.
     cfg((64, 64, 64), (32, 32, 64), 6, 1),
-    // 3: 128x256 swizzled: N = 4096 heads, and N >= 16384 at B >= 2.
+    // 3: 128x256 swizzled: N = 4096 heads, N >= 16384 at B >= 2, q|k at B >= 3.
     cfg((128, 256, 64), (64, 64, 64), 3, 4),
     // 4: 128x256 4-stage: N >= 16384 (merged gate|proj) at B = 1.
     cfg((128, 256, 64), (64, 64, 64), 4, 1),
@@ -79,6 +79,8 @@ const SMALL: usize = 64;
 const TUNED_M: usize = 4096;
 /// From this M on (B >= 2 at 1024²) swizzle 4 wins for the widest GEMMs.
 const LARGE_M: usize = 8192;
+/// From this M on (B >= 3) 128x256 also wins for the merged q|k.
+const HUGE_M: usize = 12288;
 
 /// The launch plan for an `(M, N, K)` INT8 GEMM, from `gemm-bench` (RTX
 /// 4090, min of 3 interleaved rounds at txt = 21 / 60 / 120 and B = 1 / 2;
@@ -86,7 +88,8 @@ const LARGE_M: usize = 8192;
 /// - small M or N -> 64x64 6-stage;
 /// - N >= 16384 (gate|proj) -> 128x256, 4-stage at B = 1, swizzle 4 at
 ///   B >= 2; no split (the tail launch would re-read the 100 MB weight);
-/// - N >= 8192 (q|k) -> 128x128 swizzle 4 (every config within ~1%);
+/// - N >= 8192 (q|k) -> 128x128 swizzle 4 at B <= 2 (every config within
+///   ~1%), 128x256 swizzle 4 from B = 3 (-2% at B = 3, -9% at B = 4);
 /// - N <= 4096-class (to_v / to_out / MLP out, K = 4096 and 12288) ->
 ///   128x256 swizzle 4 over the full 128-row tiles + the < 128 tail rows
 ///   on 64x64 (-5..-8%: exact waves for the head).
@@ -98,7 +101,7 @@ pub fn gemm_plan(m: usize, n: usize, _k: usize) -> GemmPlan {
     } else if n >= 16384 {
         GemmPlan::single(if m >= LARGE_M { 3 } else { 4 })
     } else if n >= 8192 {
-        GemmPlan::single(1)
+        GemmPlan::single(if m >= HUGE_M { 3 } else { 1 })
     } else {
         GemmPlan {
             main: 3,
@@ -129,9 +132,9 @@ mod tests {
 
     #[test]
     fn batched_dit_shapes() {
-        for m in [8234usize, 16468] {
+        for (m, qk) in [(8234usize, 1u8), (12351, 3), (16468, 3)] {
             assert_eq!(gemm_plan(m, 4096, 4096), SPLIT);
-            assert_eq!(gemm_plan(m, 8192, 4096), GemmPlan::single(1));
+            assert_eq!(gemm_plan(m, 8192, 4096), GemmPlan::single(qk));
             assert_eq!(gemm_plan(m, 24576, 4096), GemmPlan::single(3));
             assert_eq!(gemm_plan(m, 4096, 12288), SPLIT);
         }

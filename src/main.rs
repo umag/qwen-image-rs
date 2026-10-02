@@ -1297,10 +1297,14 @@ fn gemm_bench(iters: usize, batch: usize, txt: usize) -> Result<()> {
                     label(&gemm_plan(m, n, k)),
                     cells.join(" ")
                 );
-                all_same &= same;
+                // A plan that cannot launch (n/a) is a failure, not a vacuous match.
+                all_same &= same && times.iter().all(Option::is_some);
             }
         }
-        anyhow::ensure!(all_same, "launch plans disagree (must be bit-identical)");
+        anyhow::ensure!(
+            all_same,
+            "launch plans disagree or failed to launch (must all run, bit-identical)"
+        );
         Ok(())
     }
     #[cfg(not(feature = "convrot"))]

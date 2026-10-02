@@ -305,7 +305,8 @@ a 33rd, nearly empty M-tile row (4117 = 32·128 + 21). For N = 4096 that is
   32·16 = 512 CTAs, 1 CTA/SM) and the < 128 text rows on **64x64 6-stage**.
   gate|proj (N = 24576) does NOT split (the tail launch re-reads the 100 MB
   weight, measured a loss): **128x256 4-stage** at B = 1, swizzle 4 at B ≥ 2.
-  q|k (N = 8192): 128x128 swizzle 4 (every config within ~1%). Tails (M = 2,
+  q|k (N = 8192): 128x128 swizzle 4 at B ≤ 2 (every config within ~1%), 128x256
+  swizzle 4 from B = 3 (wall 1.580 → 1.546 ms at B = 3, 2.216 → 2.025 at B = 4). Tails (M = 2,
   N = 64): 64x64 6-stage (≥ the old 64x128). Below M = 4096 the original
   128x128 stays (unmeasured domain). 5 compiled configs (was 4).
 - **GPU time per step (nsys, 10-step generate, B = 1, M = 4117):**
